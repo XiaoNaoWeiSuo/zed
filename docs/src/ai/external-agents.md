@@ -40,7 +40,7 @@ For company-specific setup paths, including Claude, Codex, Gemini, OpenCode, Cop
 
 Use Claude Agent when you want Claude running as an ACP-integrated External Agent in Lin.
 
-Install Claude Agent from the [ACP Registry](#registry), then start a Claude Agent thread from the Agent Panel or Threads Sidebar. Claude Agent owns its own authentication and billing. An Anthropic API key configured for [Lin Agent](./lin-agent.md) does not automatically configure Claude Agent.
+Install Claude Agent from the [ACP Registry](#registry), then start a Claude Agent thread from the Agent Panel or Threads Sidebar. Claude Agent owns its own authentication and billing. An Anthropic API key configured for [Agent](./agent.md) does not automatically configure Claude Agent.
 
 To choose your billing method, open a Claude Agent thread, run `/login`, and authenticate with an API key or with Claude Code where supported. Claude-specific files such as `CLAUDE.md` may be read by Claude Agent directly.
 
@@ -48,7 +48,7 @@ To choose your billing method, open a Claude Agent thread, run `/login`, and aut
 
 Use Codex when you want Codex running as an ACP-integrated External Agent in Lin.
 
-Install Codex from the [ACP Registry](#registry), then start a Codex thread from the Agent Panel or Threads Sidebar. Codex owns its own authentication and billing. An OpenAI API key configured for [Lin Agent](./lin-agent.md) does not automatically configure Codex.
+Install Codex from the [ACP Registry](#registry), then start a Codex thread from the Agent Panel or Threads Sidebar. Codex owns its own authentication and billing. An OpenAI API key configured for [Agent](./agent.md) does not automatically configure Codex.
 
 Codex may support ChatGPT login, Codex API keys, OpenAI API keys, or Codex-native configuration depending on the installed version and environment. To change authentication, use the Codex thread's native login/logout flow.
 
@@ -64,13 +64,13 @@ If `GEMINI_API_KEY` or `GOOGLE_AI_API_KEY` is available to the agent process, Ge
 
 Use OpenCode when you want OpenCode running as an ACP-integrated External Agent in Lin.
 
-Install OpenCode from the [ACP Registry](#registry), then start an OpenCode thread from the Agent Panel or Threads Sidebar. OpenCode owns its own auth, model selection, and subscription behavior. To use OpenCode models in Lin Agent instead, configure [OpenCode API access](./use-api-access.md#opencode).
+Install OpenCode from the [ACP Registry](#registry), then start an OpenCode thread from the Agent Panel or Threads Sidebar. OpenCode owns its own auth, model selection, and subscription behavior. To use OpenCode models in Agent instead, configure [OpenCode API access](./use-api-access.md#opencode).
 
 ## Copilot {#copilot}
 
 Use Copilot External Agents where available when you want Copilot running as an ACP-integrated External Agent in Lin.
 
-Copilot agent auth is owned by the Copilot integration. To use Copilot Chat models in Lin Agent or Copilot for edit prediction, see Use an Existing Subscription.
+Copilot agent auth is owned by the Copilot integration. To use Copilot Chat models in Agent or Copilot for edit prediction, see Use an Existing Subscription.
 
 ## Cursor {#cursor}
 
@@ -128,14 +128,14 @@ External Agents run as separate processes that communicate with Lin over ACP. Th
 | ----------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Model/provider config                     | Usually owned by the External Agent                                                        |
 | Auth/API keys/subscriptions               | Usually owned by the External Agent                                                        |
-| [Lin Agent profiles](./agent-profiles.md) | Do not apply unless the integration says otherwise                                         |
+| [Agent profiles](./agent-profiles.md) | Do not apply unless the integration says otherwise                                         |
 | Lin Skills                                | Do not apply as Lin Skills                                                                 |
 | Native agent skills/instructions          | Depends on the agent                                                                       |
 | Lin MCP servers                           | May be forwarded over ACP                                                                  |
 | Native MCP config                         | May also be read by the agent                                                              |
 | Tool permissions                          | Lin ACP/tool forwarding permissions may apply; native tool permissions depend on the agent |
 
-For Lin's native agent configuration, see [Lin Agent](./lin-agent.md).
+For the native agent configuration, see [Agent](./agent.md).
 
 ## Agent-Specific Auth and Config {#agent-auth-config}
 

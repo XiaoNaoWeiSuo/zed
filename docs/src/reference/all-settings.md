@@ -6099,7 +6099,7 @@ Visit [AI Quick Start](../ai/quick-start.md) under the AI section to learn more 
 
 ### Subagent Model {#agent-subagent-model}
 
-- Description: The model, reasoning, and speed settings for new Lin Agent subagents. This setting does not configure external agents. See [Subagent Models](../ai/agent-settings.md#subagent-models).
+- Description: The model, reasoning, and speed settings for new Agent subagents. This setting does not configure external agents. See [Subagent Models](../ai/agent-settings.md#subagent-models).
 - Setting: `agent.subagent_model`
 
 ## Collaboration Panel

@@ -7,15 +7,15 @@ description: Choose the right AI setup path for agents, models, subscriptions, l
 
 Use this page to choose the right AI setup path in Lin. If you already know the company, subscription, model provider, agent, or CLI you want to use, start with [AI by Company](./by-company.md).
 
-## Use the Lin Agent {#lin-agent}
+## Use the Agent {#lin-agent}
 
-Use [Lin Agent](./lin-agent.md) when you want Lin's native agent to read, edit, search, and run code in your project.
+Use [Agent](./agent.md) when you want the native agent to read, edit, search, and run code in your project.
 
-Lin Agent uses Lin-configured models from [LLM Providers](./llm-providers.md). It also uses Lin's built-in tools, [Agent Profiles](./agent-profiles.md), [Skills](./skills.md), [Instructions](./instructions.md), and [MCP servers](./mcp.md).
+Agent uses Lin-configured models from [LLM Providers](./llm-providers.md). It also uses Lin's built-in tools, [Agent Profiles](./agent-profiles.md), [Skills](./skills.md), [Instructions](./instructions.md), and [MCP servers](./mcp.md).
 
 Start in the [Agent Panel](./agent-panel.md) to prompt the agent, add context, review changes, and manage threads.
 
-### Configure the Lin Agent {#configure-lin-agent}
+### Configure the Agent {#configure-lin-agent}
 
 | If you want to...                         | Use                                       |
 | ----------------------------------------- | ----------------------------------------- |
@@ -36,9 +36,9 @@ Use this path for Claude, Codex, OpenCode, Copilot, Cursor, Pi Coding Agent, Gem
 
 External Agents and Terminal Threads usually own their own auth, model configuration, subscriptions, tools, instructions, and MCP configuration.
 
-## Choose Which Models the Lin Agent Uses {#model-access}
+## Choose Which Models the Agent Uses {#model-access}
 
-The Lin Agent and other model-backed AI features use models configured through [LLM Providers](./llm-providers.md).
+The Agent and other model-backed AI features use models configured through [LLM Providers](./llm-providers.md).
 
 | If you want to...                                                             | Use                                                               |
 | ----------------------------------------------------------------------------- | ----------------------------------------------------------------- |

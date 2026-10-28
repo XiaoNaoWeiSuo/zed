@@ -3772,7 +3772,7 @@ impl ConversationView {
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
-        // For native agent (Lin Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
+        // For native agent (Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
         // This provides better clarity about what refused the request
         if self.as_native_connection(cx).is_some() {
@@ -9840,7 +9840,7 @@ pub(crate) mod tests {
         C: 'static + AgentConnection + Send + Clone,
     {
         fn logo(&self) -> ui::IconName {
-            ui::IconName::ZedAgent
+            ui::IconName::Agent
         }
 
         fn agent_id(&self) -> AgentId {
@@ -9916,7 +9916,7 @@ pub(crate) mod tests {
 
     impl AgentServer for FlakyAgentServer {
         fn logo(&self) -> ui::IconName {
-            ui::IconName::ZedAgent
+            ui::IconName::Agent
         }
 
         fn agent_id(&self) -> AgentId {
@@ -10063,7 +10063,7 @@ pub(crate) mod tests {
 
     impl AgentServer for SessionCreationRequestElicitationServer {
         fn logo(&self) -> ui::IconName {
-            ui::IconName::ZedAgent
+            ui::IconName::Agent
         }
 
         fn agent_id(&self) -> AgentId {
@@ -10195,7 +10195,7 @@ pub(crate) mod tests {
 
     impl AgentServer for ReleaseRequestElicitationServer {
         fn logo(&self) -> ui::IconName {
-            ui::IconName::ZedAgent
+            ui::IconName::Agent
         }
 
         fn agent_id(&self) -> AgentId {

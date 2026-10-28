@@ -1,11 +1,11 @@
 ---
 title: Agent Instructions - Lin
-description: Configure always-on personal and project instructions for Lin Agent with AGENTS.md and compatible project instruction files.
+description: Configure always-on personal and project instructions for Agent with AGENTS.md and compatible project instruction files.
 ---
 
 # Instructions
 
-Instructions are always-on context for the Lin Agent. Use instructions for persistent guidance that should apply to every relevant agent interaction.
+Instructions are always-on context for the Agent. Use instructions for persistent guidance that should apply to every relevant agent interaction.
 
 Use [Skills](./skills.md) instead when you want reusable task instructions that can be invoked by name.
 
@@ -13,7 +13,7 @@ Lin supports [`AGENTS.md`](https://agents.md/) as the primary instruction file f
 
 ## Personal Instructions {#personal-instructions}
 
-Personal instructions apply to every project you open with the Lin Agent.
+Personal instructions apply to every project you open with the Agent.
 
 Create or edit:
 
@@ -41,12 +41,12 @@ Project instructions override personal `AGENTS.md` when they conflict.
 
 ## Instruction File Support {#support}
 
-| File                              | [Lin Agent](./lin-agent.md)                            | [External Agents](./external-agents.md) | Terminal Threads                 |
+| File                              | [Agent](./agent.md)                            | [External Agents](./external-agents.md) | Terminal Threads                 |
 | --------------------------------- | ------------------------------------------------------ | --------------------------------------- | -------------------------------- |
 | `~/.config/lin/AGENTS.md`         | Loaded as personal instructions                        | Not generally used                      | Not used unless the CLI reads it |
 | Project `AGENTS.md`               | Loaded as project instructions                         | Depends on the agent                    | Depends on the CLI               |
-| `CLAUDE.md`                       | Loaded as compatible project instructions by Lin Agent | Claude reads natively                   | Claude Code CLI reads natively   |
-| `.github/copilot-instructions.md` | Loaded as compatible project instructions by Lin Agent | Depends on the agent                    | Depends on the CLI               |
+| `CLAUDE.md`                       | Loaded as compatible project instructions by Agent | Claude reads natively                   | Claude Code CLI reads natively   |
+| `.github/copilot-instructions.md` | Loaded as compatible project instructions by Agent | Depends on the agent                    | Depends on the CLI               |
 
 External Agents and [Terminal Threads](./terminal-threads.md) may read their own native instruction files directly. Do not assume Lin's instruction loader controls those agents.
 

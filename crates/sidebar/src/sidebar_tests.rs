@@ -1524,7 +1524,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
                 archived: false,
                 remote_connection: None,
             },
-            icon: IconName::ZedAgent,
+            icon: IconName::Agent,
             icon_from_external_svg: None,
             status: AgentThreadStatus::Completed,
             workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -1616,7 +1616,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     remote_connection: None,
                 },
-                icon: IconName::ZedAgent,
+                icon: IconName::Agent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -1643,7 +1643,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     remote_connection: None,
                 },
-                icon: IconName::ZedAgent,
+                icon: IconName::Agent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Running,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -1670,7 +1670,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     remote_connection: None,
                 },
-                icon: IconName::ZedAgent,
+                icon: IconName::Agent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Error,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -1698,7 +1698,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     remote_connection: None,
                 },
-                icon: IconName::ZedAgent,
+                icon: IconName::Agent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::WaitingForConfirmation,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -1726,7 +1726,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     remote_connection: None,
                 },
-                icon: IconName::ZedAgent,
+                icon: IconName::Agent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
@@ -2335,7 +2335,7 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     // placeholder row, so the header reports having threads.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  New Zed Agent Thread"]
+        vec!["v [my-project]", "  New Agent Thread"]
     );
     assert_project_header_has_threads(&sidebar, "my-project", true, cx);
 

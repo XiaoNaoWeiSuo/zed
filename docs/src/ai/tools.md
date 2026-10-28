@@ -13,9 +13,9 @@ You can configure permissions for tool actions, including situations where they 
 
 To add custom tools beyond these built-in ones, see [MCP servers](./mcp.md).
 
-To choose which built-in tools and MCP tools are available in a Lin Agent thread, use [Agent Profiles](./agent-profiles.md). Profiles control tool availability; tool permissions control allow, deny, and confirm behavior.
+To choose which built-in tools and MCP tools are available in a Agent thread, use [Agent Profiles](./agent-profiles.md). Profiles control tool availability; tool permissions control allow, deny, and confirm behavior.
 
-The terminal tool can also run with additional OS-level restrictions when [Lin Agent sandboxing](./sandboxing.md) is enabled.
+The terminal tool can also run with additional OS-level restrictions when [Agent sandboxing](./sandboxing.md) is enabled.
 
 ## Read & Search Tools
 

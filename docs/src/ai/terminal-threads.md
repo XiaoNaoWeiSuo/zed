@@ -28,7 +28,7 @@ The CLI or TUI running inside the terminal owns its own:
 - skills and instruction files
 - MCP configuration
 
-[Lin Agent profiles](./agent-profiles.md), Lin Agent tool permissions, Lin Skills, and Lin Agent MCP settings do not automatically apply to Terminal Threads.
+[Agent profiles](./agent-profiles.md), Agent tool permissions, Lin Skills, and Agent MCP settings do not automatically apply to Terminal Threads.
 
 ## Opening a Terminal Thread {#opening-a-terminal-thread}
 

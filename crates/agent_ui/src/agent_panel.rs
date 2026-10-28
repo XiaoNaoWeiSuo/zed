@@ -5868,12 +5868,12 @@ impl AgentPanel {
                 Some(ContextMenu::build(window, cx, |menu, _window, cx| {
                     menu.context(focus_handle.clone())
                         .item(
-                            ContextMenuEntry::new("Zed Agent")
+                            ContextMenuEntry::new("Agent")
                                 .when(
                                     !showing_terminal && is_agent_selected(Agent::NativeAgent),
                                     |this| this.action(Box::new(NewThread)),
                                 )
-                                .icon(IconName::ZedAgent)
+                                .icon(IconName::Agent)
                                 .icon_color(Color::Muted)
                                 .handler({
                                     let workspace = workspace.clone();
@@ -9229,7 +9229,7 @@ mod tests {
 
     impl AgentServer for DelayedSelectionAgentServer {
         fn logo(&self) -> IconName {
-            IconName::ZedAgent
+            IconName::Agent
         }
 
         fn agent_id(&self) -> AgentId {

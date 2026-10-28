@@ -1,13 +1,13 @@
 ---
-title: Lin Agent
+title: Agent
 description: Use Lin's native AI agent with Lin-configured models, tools, profiles, skills, instructions, and MCP servers.
 ---
 
-# Lin Agent
+# Agent
 
-Lin Agent is Lin's native agent path. It runs in the [Agent Panel](./agent-panel.md) and [Threads Sidebar](./parallel-agents.md#threads-sidebar), uses models configured through [LLM Providers](./llm-providers.md), and integrates with Lin's project, editor, terminal, and review surfaces.
+Agent is the native agent path. It runs in the [Agent Panel](./agent-panel.md) and [Threads Sidebar](./parallel-agents.md#threads-sidebar), uses models configured through [LLM Providers](./llm-providers.md), and integrates with Lin's project, editor, terminal, and review surfaces.
 
-Use Lin Agent when you want the agent to:
+Use Agent when you want the agent to:
 
 - read and search your project
 - edit files
@@ -17,7 +17,7 @@ Use Lin Agent when you want the agent to:
 - use Lin [Skills](./skills.md) and [Instructions](./instructions.md)
 - show changes in Lin's review UI
 
-## What Lin Agent Uses {#what-lin-agent-uses}
+## What Agent Uses {#what-lin-agent-uses}
 
 | Capability                 | Source of truth                           |
 | -------------------------- | ----------------------------------------- |
@@ -34,7 +34,7 @@ Use Lin Agent when you want the agent to:
 
 | Agent path                                | Main difference                                                                              |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [Lin Agent](./lin-agent.md)               | Uses Lin's model, tool, profile, skill, instruction, and MCP configuration                   |
+| [Agent](./agent.md)               | Uses Lin's model, tool, profile, skill, instruction, and MCP configuration                   |
 | [External Agents](./external-agents.md)   | Use an ACP integration and often own auth, model, tool, and native instruction configuration |
 | [Terminal Threads](./terminal-threads.md) | Run a CLI/TUI in a terminal-backed thread; the CLI owns auth and configuration               |
 

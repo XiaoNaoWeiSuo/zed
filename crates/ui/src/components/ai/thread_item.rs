@@ -71,7 +71,7 @@ impl ThreadItem {
     pub fn new(id: impl Into<ElementId>, title: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
-            icon: IconName::ZedAgent,
+            icon: IconName::Agent,
             icon_char: None,
             icon_color: None,
             icon_visible: true,
@@ -797,7 +797,7 @@ impl Component for ThreadItem {
                 container()
                     .child(
                         ThreadItem::new("ti-5e", "Main worktree branch with diff stats")
-                            .icon(IconName::ZedAgent)
+                            .icon(IconName::Agent)
                             .worktrees(vec![ThreadItemWorktreeInfo {
                                 worktree_name: Some("zed".into()),
                                 full_path: "/projects/zed".into(),
@@ -878,7 +878,7 @@ impl Component for ThreadItem {
                 container()
                     .child(
                         ThreadItem::new("ti-5i", "Multi-root with per-worktree branches")
-                            .icon(IconName::ZedAgent)
+                            .icon(IconName::Agent)
                             .worktrees(vec![
                                 ThreadItemWorktreeInfo {
                                     worktree_name: Some("jade-glen".into()),
@@ -943,7 +943,7 @@ impl Component for ThreadItem {
                 container()
                     .child(
                         ThreadItem::new("ti-5l", "Thread with every metadata field populated")
-                            .icon(IconName::ZedAgent)
+                            .icon(IconName::Agent)
                             .project_name("remote-dev")
                             .worktrees(vec![ThreadItemWorktreeInfo {
                                 worktree_name: Some("my-worktree".into()),

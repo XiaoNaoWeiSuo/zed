@@ -32,7 +32,7 @@ Lin supports these first-class API providers for model-backed AI features:
 
 ## What API Access Applies To {#support}
 
-Use API access for the Lin Agent, Inline Assistant, Git commit generation,
+Use API access for the Agent, Inline Assistant, Git commit generation,
 thread summaries, and similar Lin-owned AI features.
 
 External Agents and Terminal Threads usually configure model access in the

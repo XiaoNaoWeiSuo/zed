@@ -598,7 +598,7 @@ mod tests {
                     .any(|(fav_provider, fav_name)| *fav_provider == provider && *fav_name == name);
                 ModelInfo {
                     model: test_language_model(name, provider),
-                    icon: IconOrSvg::Icon(IconName::ZedAgent),
+                    icon: IconOrSvg::Icon(IconName::Agent),
                     is_favorite,
                 }
             })

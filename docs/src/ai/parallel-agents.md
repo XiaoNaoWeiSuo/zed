@@ -61,7 +61,7 @@ The Threads Sidebar can hold different thread types:
 
 | Thread type                                   | Configuration                                                                          |
 | --------------------------------------------- | -------------------------------------------------------------------------------------- |
-| [Lin Agent thread](./lin-agent.md)            | Uses Lin Agent settings, profiles, tools, [Skills](./skills.md), Instructions, and MCP |
+| [Agent thread](./agent.md)            | Uses Agent settings, profiles, tools, [Skills](./skills.md), Instructions, and MCP |
 | [External Agent thread](./external-agents.md) | Uses the ACP integration and the agent's native configuration                          |
 | [Terminal Thread](./terminal-threads.md)      | Runs a CLI/TUI in a terminal-backed thread; the CLI owns auth and configuration        |
 

@@ -20,7 +20,7 @@ Lin also handles the `notifications/tools/list_changed` notification from MCP se
 
 | Agent path                                | MCP behavior                                                                            |
 | ----------------------------------------- | --------------------------------------------------------------------------------------- |
-| [Lin Agent](./lin-agent.md)               | Uses Lin-configured MCP servers directly                                                |
+| [Agent](./agent.md)               | Uses Lin-configured MCP servers directly                                                |
 | [External Agents](./external-agents.md)   | Lin can forward configured MCP servers over ACP; agents may also read native MCP config |
 | [Terminal Threads](./terminal-threads.md) | Native CLIs/TUIs read their own MCP configuration                                       |
 
