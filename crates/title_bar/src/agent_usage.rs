@@ -92,16 +92,17 @@ impl AgentUsageIndicator {
 
 impl Render for AgentUsageIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (running, cache_hit_rate, tokens_per_second, time_to_first_token) = {
+        let (running, model, cache_hit_rate, tokens_per_second, time_to_first_token) = {
             let metrics = self.metrics.read(cx);
             (
                 metrics.running,
+                metrics.model.clone(),
                 metrics.cache_hit_rate,
                 metrics.tokens_per_second,
                 metrics.time_to_first_token,
             )
         };
-        if !running {
+        if !running && model.is_none() {
             return div().into_any_element();
         }
 

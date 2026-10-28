@@ -338,7 +338,9 @@ impl Render for TitleBar {
                     IconButton::new("open-settings", IconName::Settings)
                         .icon_size(IconSize::Small)
                         .tooltip(Tooltip::text("Settings"))
-                        .on_click(|_, _window, cx| cx.dispatch_action(&zed_actions::OpenSettings)),
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(zed_actions::OpenSettings), cx)
+                        }),
                 )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
