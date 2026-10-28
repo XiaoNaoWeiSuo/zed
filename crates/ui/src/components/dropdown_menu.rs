@@ -27,6 +27,7 @@ pub struct DropdownMenu {
     trigger_icon: Option<IconName>,
     label_size: LabelSize,
     label_color: Color,
+    anchor: Anchor,
     style: DropdownStyle,
     menu: Entity<ContextMenu>,
     full_width: bool,
@@ -55,6 +56,7 @@ impl DropdownMenu {
             trigger_icon: Some(IconName::ChevronUpDown),
             label_size: LabelSize::Default,
             label_color: Color::Default,
+            anchor: Anchor::TopLeft,
             style: DropdownStyle::default(),
             menu,
             full_width: false,
@@ -83,6 +85,7 @@ impl DropdownMenu {
             trigger_icon: Some(IconName::ChevronUpDown),
             label_size: LabelSize::Default,
             label_color: Color::Default,
+            anchor: Anchor::TopLeft,
             style: DropdownStyle::default(),
             menu,
             full_width: false,
@@ -128,6 +131,11 @@ impl DropdownMenu {
 
     pub fn label_color(mut self, color: Color) -> Self {
         self.label_color = color;
+        self
+    }
+
+    pub fn anchor(mut self, anchor: Anchor) -> Self {
+        self.anchor = anchor;
         self
     }
 
@@ -322,12 +330,11 @@ impl RenderOnce for DropdownMenu {
             _ => popover,
         };
 
-        popover
-            .attach(match self.attach {
-                Some(attach) => attach,
-                None => Anchor::BottomRight,
-            })
-            .when_some(self.offset, |this, offset| this.offset(offset))
+        popover = popover.anchor(self.anchor);
+        if let Some(attach) = self.attach {
+            popover = popover.attach(attach);
+        }
+        popover.when_some(self.offset, |this, offset| this.offset(offset))
     }
 }
 

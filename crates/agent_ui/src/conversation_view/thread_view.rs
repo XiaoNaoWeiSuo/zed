@@ -12335,13 +12335,22 @@ impl ThreadView {
 
         let thread = self.as_native_thread(cx)?;
         let current = thread.read(cx).permission_tier();
+        let view = cx.entity().downgrade();
         let menu = ContextMenu::build(window, cx, |menu, _, _| {
             let mut menu = menu;
             for tier in PermissionTier::ALL {
                 let thread = thread.clone();
-                menu = menu.entry(tier.label(), None, move |_, cx| {
-                    thread.update(cx, |thread, cx| thread.set_permission_tier(tier, cx));
-                });
+                let view = view.clone();
+                menu = menu.toggleable_entry(
+                    tier.label(),
+                    tier == current,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        thread.update(cx, |thread, cx| thread.set_permission_tier(tier, cx));
+                        view.update(cx, |_, cx| cx.notify()).ok();
+                    },
+                );
             }
             menu
         });
@@ -12351,7 +12360,11 @@ impl ThreadView {
                 .style(ui::DropdownStyle::Ghost)
                 .label_size(LabelSize::Small)
                 .label_color(Color::Muted)
-                .attach(gpui::Anchor::BottomRight)
+                .anchor(gpui::Anchor::BottomRight)
+                .offset(gpui::Point {
+                    x: gpui::px(0.),
+                    y: gpui::px(-2.),
+                })
                 .trigger_icon(IconName::ChevronDown),
         )
     }
