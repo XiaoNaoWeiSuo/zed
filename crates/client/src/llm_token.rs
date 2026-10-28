@@ -28,10 +28,9 @@ enum TokenRefreshMode {
 }
 
 pub fn global_llm_token(cx: &App) -> LlmApiToken {
-    RefreshLlmTokenListener::global(cx)
-        .read(cx)
-        .llm_api_token
-        .clone()
+    cx.try_global::<GlobalRefreshLlmTokenListener>()
+        .map(|listener| listener.0.read(cx).llm_api_token.clone())
+        .unwrap_or_default()
 }
 
 struct GlobalRefreshLlmTokenListener(Entity<RefreshLlmTokenListener>);

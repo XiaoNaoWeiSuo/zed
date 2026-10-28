@@ -74,10 +74,6 @@ impl AgentModelSelector {
         self.menu_handle.toggle(window, cx);
     }
 
-    pub fn active_model(&self, cx: &App) -> Option<language_model::LanguageModel> {
-        self.selector.read(cx).delegate.active_model(cx)
-    }
-
     pub fn cycle_favorite_models(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.selector.update(cx, |selector, cx| {
             selector.delegate.cycle_favorite_models(window, cx);

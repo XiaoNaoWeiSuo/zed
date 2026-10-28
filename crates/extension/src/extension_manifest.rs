@@ -52,7 +52,7 @@ impl fmt::Display for SchemaVersion {
 
 impl SchemaVersion {
     pub const ZERO: Self = Self(0);
-    /// The latest schema version supported by Zed.
+    /// The latest schema version supported by Lin.
     pub const CURRENT: Self = Self(1);
 
     pub fn is_v0(&self) -> bool {

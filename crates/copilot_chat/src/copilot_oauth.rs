@@ -1,6 +1,6 @@
 //! A native GitHub OAuth device-code flow for Copilot.
 //!
-//! Historically, Zed relied on the Copilot language server to perform the
+//! Historically, Lin relied on the Copilot language server to perform the
 //! OAuth flow and then read the resulting token out of the language server's
 //! on-disk storage. That coupling was fragile. Instead, each Copilot provider
 //! (agent and edit predictions) now drives this device-code flow itself and
@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::CopilotChatConfiguration;
 
-/// The public OAuth application client ID of Zed
+/// The public OAuth application client ID of Lin
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "6e3a0413e62d19d75ff1";
 
 const DEVICE_CODE_SCOPE: &str = "read:user";

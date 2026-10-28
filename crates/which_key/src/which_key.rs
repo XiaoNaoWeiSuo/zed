@@ -1,4 +1,4 @@
-//! Which-key support for Zed.
+//! Which-key support for Lin.
 
 mod pending_bindings;
 mod pending_keystrokes_indicator;

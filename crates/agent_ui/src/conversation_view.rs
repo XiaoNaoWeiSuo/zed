@@ -13,7 +13,9 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
 use agent_settings::{AgentProfileId, AgentSettings};
-use anyhow::{Context as _, Result, anyhow};
+#[cfg(test)]
+use anyhow::Context as _;
+use anyhow::{Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
@@ -34,9 +36,9 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language};
-use language_model::{
-    LanguageModelCompletionError, ProviderErrorCategory, ZED_CLOUD_PROVIDER_NAME,
-};
+#[cfg(test)]
+use language_model::ZED_CLOUD_PROVIDER_NAME;
+use language_model::{LanguageModelCompletionError, ProviderErrorCategory};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -117,15 +119,8 @@ mod thread_view;
 pub use message_queue::*;
 pub use thread_view::*;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ThreadFeedback {
-    Positive,
-    Negative,
-}
-
 #[derive(Debug)]
 pub(crate) enum ThreadError {
-    ZedPaymentRequired,
     DataRetentionConsentRequired,
     Refusal,
     AuthenticationRequired(SharedString),
@@ -200,11 +195,6 @@ impl From<&anyhow::Error> for ThreadError {
                         provider: provider.to_string().into(),
                     },
                     ProviderErrorCategory::PromptTooLarge { .. } => Self::PromptTooLarge,
-                    ProviderErrorCategory::PaymentRequired
-                        if provider == &ZED_CLOUD_PROVIDER_NAME =>
-                    {
-                        Self::ZedPaymentRequired
-                    }
                     ProviderErrorCategory::Authentication => Self::AuthenticationFailed {
                         provider: provider.to_string().into(),
                     },
@@ -2661,7 +2651,7 @@ impl ConversationView {
         window.spawn(cx, async move |cx| {
             let mut task = login.clone();
             if let Some(cmd) = &task.command {
-                // Have "node" command use Zed's managed Node runtime by default
+                // Have "node" command use the managed Node runtime by default
                 if cmd == "node" {
                     let resolved_node_runtime = project.update(cx, |project, cx| {
                         let agent_server_store = project.agent_server_store().clone();
@@ -3782,7 +3772,7 @@ impl ConversationView {
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
-        // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
+        // For native agent (Lin Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
         // This provides better clarity about what refused the request
         if self.as_native_connection(cx).is_some() {
@@ -4511,25 +4501,6 @@ pub(crate) mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_payment_required_from_zed_uses_upgrade_prompt() {
-        let provider_error = LanguageModelCompletionError::from_provider_response(
-            ZED_CLOUD_PROVIDER_NAME,
-            Some(http_client::StatusCode::PAYMENT_REQUIRED),
-            None,
-            "Payment required".to_string(),
-            None,
-            ProviderErrorCategory::PaymentRequired,
-        );
-
-        let error = ThreadError::from(anyhow!(provider_error));
-
-        assert!(
-            matches!(error, ThreadError::ZedPaymentRequired),
-            "expected Zed upgrade prompt, got: {error:?}"
-        );
     }
 
     #[gpui::test]

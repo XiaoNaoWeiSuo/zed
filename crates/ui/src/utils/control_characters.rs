@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 /// The stand-in used for a line feed (`\n`).
 ///
-/// This is the symbol Zed has always used for line feeds in single-line labels,
+/// This is the symbol Lin has always used for line feeds in single-line labels,
 /// so text containing `\n` keeps rendering the way it used to.
 const LINE_FEED_SYMBOL: char = '⏎';
 

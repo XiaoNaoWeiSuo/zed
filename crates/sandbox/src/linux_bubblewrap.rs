@@ -564,7 +564,7 @@ pub fn check_can_create_sandbox(
     prepare_sandbox(permissions).map(|_| ())
 }
 
-/// The host (Zed-side) socket paths for the in-sandbox bind validator.
+/// The host (Lin-side) socket paths for the in-sandbox bind validator.
 #[derive(Clone, Copy)]
 pub struct ValidationSocket<'a> {
     /// Host pathname of the listener the validator connects back to.
@@ -576,7 +576,7 @@ pub struct ValidationSocket<'a> {
 
 /// Build the final command line that runs `program` inside Bubblewrap.
 ///
-/// `bridge_program` should be the current Zed executable; it is re-exec'd inside
+/// `bridge_program` should be the current Lin executable; it is re-exec'd inside
 /// the sandbox as the launcher whenever bind validation and/or the
 /// restricted-network bridge are needed, running before the real command.
 ///

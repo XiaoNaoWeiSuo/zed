@@ -38,7 +38,6 @@
       "cmd-h": "zed::Hide",
       "alt-cmd-h": "zed::HideOthers",
       "cmd-m": "zed::Minimize",
-      "ctrl-cmd-z": "edit_prediction::RatePredictions",
       "ctrl-cmd-i": "edit_prediction::ToggleMenu",
       "ctrl-cmd-l": "lsp_tool::ToggleMenu",
       "ctrl-cmd-c": "editor::DisplayCursorNames",
@@ -988,7 +987,6 @@
     "bindings": {
       "ctrl-alt-cmd-f": "workspace::FollowNextCollaborator",
       // TODO: Move this to a dock open action
-      "cmd-shift-c": "collab_panel::ToggleFocus",
       // Only available in debug builds: opens an element inspector for development.
       "cmd-alt-i": "dev::ToggleInspector",
       // Cycles the frame-time debug overlay between hidden, frame-time-only, and detailed modes.
@@ -1007,7 +1005,6 @@
       "cmd-shift-e": "pane::RevealInProjectPanel",
       "cmd-f8": "editor::GoToHunk",
       "cmd-shift-f8": "editor::GoToPreviousHunk",
-      "ctrl-enter": "assistant::InlineAssist",
       "ctrl-:": "editor::ToggleInlayHints",
     },
   },
@@ -1019,8 +1016,6 @@
       "alt-tab": "agent::CycleFavoriteModels",
       "ctrl-[": "agent::CyclePreviousInlineAssist",
       "ctrl-]": "agent::CycleNextInlineAssist",
-      "cmd-shift-enter": "inline_assistant::ThumbsUpResult",
-      "cmd-shift-backspace": "inline_assistant::ThumbsDownResult",
     },
   },
   {
@@ -1255,7 +1250,6 @@
     "context": "CollabPanel && not_editing",
     "use_key_equivalents": true,
     "bindings": {
-      "ctrl-backspace": "collab_panel::Remove",
       "space": "menu::Confirm",
     },
   },
@@ -1263,24 +1257,18 @@
     "context": "CollabPanel",
     "use_key_equivalents": true,
     "bindings": {
-      "alt-up": "collab_panel::MoveChannelUp",
-      "alt-down": "collab_panel::MoveChannelDown",
-      "alt-enter": "collab_panel::OpenSelectedChannelNotes",
-      "shift-enter": "collab_panel::ToggleSelectedChannelFavorite",
     },
   },
   {
     "context": "(CollabPanel && editing) > Editor",
     "use_key_equivalents": true,
     "bindings": {
-      "space": "collab_panel::InsertSpace",
     },
   },
   {
     "context": "ChannelModal",
     "use_key_equivalents": true,
     "bindings": {
-      "tab": "channel_modal::ToggleMode",
     },
   },
   {
@@ -1319,7 +1307,6 @@
     "context": "ChannelModal > Picker > Editor",
     "use_key_equivalents": true,
     "bindings": {
-      "tab": "channel_modal::ToggleMode",
     },
   },
   {
@@ -1383,7 +1370,6 @@
       "cmd-a": "editor::SelectAll",
       "cmd-k": "terminal::Clear",
       "cmd-n": "workspace::NewTerminal",
-      "ctrl-enter": "assistant::InlineAssist",
       "ctrl-_": null, // emacs undo
       // Some nice conveniences
       "cmd-backspace": ["terminal::SendKeystroke", "ctrl-u"], // clear line
@@ -1436,33 +1422,6 @@
     "bindings": {
       "cmd-f": "agent::ToggleSearch",
       "cmd-n": "agent::NewThread",
-    },
-  },
-  {
-    "context": "RatePredictionsModal",
-    "use_key_equivalents": true,
-    "bindings": {
-      "cmd-shift-enter": "zeta::ThumbsUpActivePrediction",
-      "cmd-shift-backspace": "zeta::ThumbsDownActivePrediction",
-      "shift-down": "zeta::NextEdit",
-      "shift-up": "zeta::PreviousEdit",
-      "right": "zeta::PreviewPrediction",
-    },
-  },
-  {
-    "context": "RatePredictionsModal > Editor",
-    "use_key_equivalents": true,
-    "bindings": {
-      "escape": "zeta::FocusPredictions",
-      "cmd-shift-enter": "zeta::ThumbsUpActivePrediction",
-      "cmd-shift-backspace": "zeta::ThumbsDownActivePrediction",
-    },
-  },
-  {
-    "context": "ZedPredictModal",
-    "use_key_equivalents": true,
-    "bindings": {
-      "escape": "menu::Cancel",
     },
   },
   {
@@ -1575,9 +1534,6 @@
       "cmd-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "cmd--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "cmd-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "cmd-enter": "onboarding::Finish",
-      "alt-tab": "onboarding::SignIn",
-      "alt-shift-a": "onboarding::OpenAccount",
     },
   },
   {

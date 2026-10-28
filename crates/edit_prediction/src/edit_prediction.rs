@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::BufferDiff;
-use client::{Client, EditPredictionUsage, UserStore, global_llm_token, zed_urls};
+use client::{Client, EditPredictionUsage, UserStore, global_llm_token};
 use cloud_api_client::LlmApiToken;
 use cloud_api_types::{
     EditPredictionRecentFile, EditPredictionSettledKeptChars,
@@ -23,7 +23,7 @@ use cloud_llm_client::{
 use collections::{HashMap, HashSet};
 use copilot::{Copilot, Reinstall};
 use credentials_provider::CredentialsProvider;
-use db::kvp::{Dismissable, KeyValueStore};
+use db::kvp::KeyValueStore;
 use edit_prediction_context::{RelatedExcerptStore, RelatedExcerptStoreEvent, RelatedFile};
 use edit_prediction_types::EditPredictionRequestTrigger;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
@@ -52,16 +52,12 @@ use release_channel::AppVersion;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use settings::{
-    EditPredictionDataCollectionChoice, EditPredictionProvider, Settings as _, SettingsStore,
-    update_settings_file,
+    EditPredictionDataCollectionChoice, EditPredictionProvider, Settings as _, update_settings_file,
 };
 use std::collections::{VecDeque, hash_map};
 use std::env;
 use std::rc::Rc;
 use text::{AnchorRangeExt, Edit};
-use workspace::notifications::{
-    NotificationId, show_app_notification, simple_message_notification::MessageNotification,
-};
 use workspace::{AppState, Workspace};
 use zeta_prompt::ContextSource;
 use zeta_prompt::{Zeta2PromptInput, Zeta3PromptInput, ZetaFormat};
@@ -84,7 +80,6 @@ mod license_detection;
 pub mod mercury;
 pub mod metrics;
 pub mod ollama;
-mod onboarding_modal;
 pub mod open_ai_response;
 mod prediction;
 pub mod sweep_prompt;
@@ -104,7 +99,6 @@ use crate::example_spec::RecentFile;
 use crate::license_detection::LicenseDetectionWatcher;
 use crate::mercury::Mercury;
 pub use crate::metrics::{KeptRateResult, compute_kept_rate};
-use crate::onboarding_modal::ZedPredictModal;
 use crate::prediction::EditPredictionResult;
 pub use crate::prediction::{EditPrediction, EditPredictionId, EditPredictionInputs};
 pub use language_model::ApiKeyState;
@@ -170,7 +164,6 @@ pub struct EditPredictionStore {
     user_store: Entity<UserStore>,
     llm_token: LlmApiToken,
     _fetch_experiments_task: Task<()>,
-    _user_store_subscription: gpui::Subscription,
     projects: HashMap<EntityId, ProjectState>,
     update_required: bool,
     edit_prediction_model: EditPredictionModel,
@@ -1035,12 +1028,6 @@ impl EditPredictionStore {
             .log_err();
         });
 
-        let user_store_subscription = cx.subscribe(&user_store, |_, user_store, event, cx| {
-            if let client::user::Event::PrivateUserInfoUpdated = event {
-                show_free_plan_edit_predictions_ended_notice_once(&user_store, cx);
-            }
-        });
-
         let credentials_provider = zed_credentials_provider::global(cx);
 
         let this = Self {
@@ -1049,7 +1036,6 @@ impl EditPredictionStore {
             user_store,
             llm_token,
             _fetch_experiments_task: fetch_experiments_task,
-            _user_store_subscription: user_store_subscription,
             update_required: false,
             edit_prediction_model: EditPredictionModel::Zeta,
             zeta2_raw_config: Self::zeta2_raw_config_from_env(),
@@ -3527,133 +3513,8 @@ pub struct ZedUpdateRequiredError {
 #[error("Cloud request timed out")]
 pub(crate) struct CloudRequestTimeoutError;
 
-struct ZedPredictUpsell;
-
-fn is_upsell_dismissed(cx: &App) -> bool {
-    // To make this backwards compatible with older versions of Zed, we
-    // check if the user has seen the previous Edit Prediction Onboarding
-    // before, by checking the data collection choice which was written to
-    // the database once the user clicked on "Accept and Enable"
-    let kvp = KeyValueStore::global(cx);
-    if kvp
-        .read_kvp(ZED_PREDICT_DATA_COLLECTION_CHOICE)
-        .log_err()
-        .is_some_and(|s| s.is_some())
-    {
-        return true;
-    }
-
-    kvp.read_kvp(ZedPredictUpsell::KEY)
-        .log_err()
-        .is_some_and(|s| s.is_some())
-}
-
-impl Dismissable for ZedPredictUpsell {
-    const KEY: &'static str = "dismissed-edit-predict-upsell";
-
-    fn dismissed(cx: &App) -> bool {
-        is_upsell_dismissed(cx)
-    }
-}
-
-pub fn should_show_upsell_modal(cx: &App) -> bool {
-    !is_upsell_dismissed(cx)
-}
-
-/// Returns whether the user is set up to use Zed's hosted edit predictions but their plan
-/// doesn't include them. Other providers, including Ollama and OpenAI-compatible servers that
-/// run Zeta, don't go through Zed's servers and are unaffected.
-pub fn zed_edit_predictions_excluded_from_plan(user_store: &UserStore, cx: &App) -> bool {
-    all_language_settings(None, cx).edit_predictions.provider == EditPredictionProvider::Zed
-        && user_store.edit_predictions_excluded_from_plan()
-}
-
-/// Returns whether Zed's edit predictions should be treated as turned off: the user's plan
-/// doesn't include them and Zed is only their provider by default. Users who explicitly chose
-/// Zed keep the status bar button, which explains why predictions aren't available.
-pub fn zed_edit_predictions_off_for_plan(user_store: &UserStore, cx: &App) -> bool {
-    let provider_explicitly_chosen = cx
-        .global::<SettingsStore>()
-        .raw_user_settings()
-        .and_then(|settings| {
-            settings
-                .content
-                .project
-                .all_languages
-                .edit_predictions
-                .as_ref()?
-                .provider
-        })
-        .is_some();
-
-    !provider_explicitly_chosen && zed_edit_predictions_excluded_from_plan(user_store, cx)
-}
-
-struct FreePlanEditPredictionsEndedNotice;
-
-impl Dismissable for FreePlanEditPredictionsEndedNotice {
-    const KEY: &'static str = "free-plan-edit-predictions-ended-notice";
-}
-
-fn show_free_plan_edit_predictions_ended_notice_once(user_store: &Entity<UserStore>, cx: &mut App) {
-    // Accepted predictions are metered per billing period, so a nonzero count identifies users
-    // who were actually relying on edit predictions rather than just having the default provider.
-    let has_accepted_predictions = user_store
-        .read(cx)
-        .edit_prediction_usage()
-        .is_some_and(|usage| usage.amount > 0);
-
-    if DisableAiSettings::get_global(cx).disable_ai
-        || !has_accepted_predictions
-        || !zed_edit_predictions_excluded_from_plan(user_store.read(cx), cx)
-        || FreePlanEditPredictionsEndedNotice::dismissed(cx)
-    {
-        return;
-    }
-
-    // Recorded when shown rather than when dismissed, so users see this once even if they
-    // never interact with it.
-    FreePlanEditPredictionsEndedNotice::set_dismissed(true, cx);
-    telemetry::event!("Free Plan Edit Predictions Ended Notice Shown");
-
-    show_app_notification(
-        NotificationId::unique::<FreePlanEditPredictionsEndedNotice>(),
-        cx,
-        |cx| {
-            cx.new(|cx| {
-                MessageNotification::new(
-                    "Edit predictions are no longer included in the Free plan. \
-                    Upgrade to Pro for unlimited edit predictions.",
-                    cx,
-                )
-                .primary_message("Upgrade")
-                .primary_on_click(|_window, cx| {
-                    telemetry::event!(
-                        "Upgrade To Pro Clicked",
-                        state = "free-plan-edit-predictions-ended"
-                    );
-                    cx.open_url(&zed_urls::upgrade_to_zed_pro_url(cx));
-                })
-                .show_suppress_button(false)
-            })
-        },
-    );
-}
-
 pub fn init(cx: &mut App) {
     cx.observe_new(move |workspace: &mut Workspace, _, _cx| {
-        workspace.register_action(
-            move |workspace, _: &zed_actions::OpenZedPredictOnboarding, window, cx| {
-                ZedPredictModal::toggle(
-                    workspace,
-                    workspace.user_store().clone(),
-                    workspace.client().clone(),
-                    window,
-                    cx,
-                )
-            },
-        );
-
         workspace.register_action(|workspace, _: &ResetOnboarding, _window, cx| {
             update_settings_file(workspace.app_state().fs.clone(), cx, move |settings, _| {
                 settings

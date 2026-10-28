@@ -1,23 +1,23 @@
 ---
-title: Zed Agent
-description: Use Zed's native AI agent with Zed-configured models, tools, profiles, skills, instructions, and MCP servers.
+title: Lin Agent
+description: Use Lin's native AI agent with Lin-configured models, tools, profiles, skills, instructions, and MCP servers.
 ---
 
-# Zed Agent
+# Lin Agent
 
-Zed Agent is Zed's native agent path. It runs in the [Agent Panel](./agent-panel.md) and [Threads Sidebar](./parallel-agents.md#threads-sidebar), uses models configured through [LLM Providers](./llm-providers.md), and integrates with Zed's project, editor, terminal, and review surfaces.
+Lin Agent is Lin's native agent path. It runs in the [Agent Panel](./agent-panel.md) and [Threads Sidebar](./parallel-agents.md#threads-sidebar), uses models configured through [LLM Providers](./llm-providers.md), and integrates with Lin's project, editor, terminal, and review surfaces.
 
-Use Zed Agent when you want the agent to:
+Use Lin Agent when you want the agent to:
 
 - read and search your project
 - edit files
 - run terminal commands
-- use Zed-managed MCP tools
+- use Lin-managed MCP tools
 - follow [Agent Profiles](./agent-profiles.md)
-- use Zed [Skills](./skills.md) and [Instructions](./instructions.md)
-- show changes in Zed's review UI
+- use Lin [Skills](./skills.md) and [Instructions](./instructions.md)
+- show changes in Lin's review UI
 
-## What Zed Agent Uses {#what-zed-agent-uses}
+## What Lin Agent Uses {#what-lin-agent-uses}
 
 | Capability                 | Source of truth                           |
 | -------------------------- | ----------------------------------------- |
@@ -34,7 +34,7 @@ Use Zed Agent when you want the agent to:
 
 | Agent path                                | Main difference                                                                              |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [Zed Agent](./zed-agent.md)               | Uses Zed's model, tool, profile, skill, instruction, and MCP configuration                   |
+| [Lin Agent](./lin-agent.md)               | Uses Lin's model, tool, profile, skill, instruction, and MCP configuration                   |
 | [External Agents](./external-agents.md)   | Use an ACP integration and often own auth, model, tool, and native instruction configuration |
 | [Terminal Threads](./terminal-threads.md) | Run a CLI/TUI in a terminal-backed thread; the CLI owns auth and configuration               |
 

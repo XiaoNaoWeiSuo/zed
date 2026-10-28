@@ -91,7 +91,7 @@ pub enum SandboxNetworkAccess {
 pub enum LinuxWslSandboxError {
     /// No usable `bwrap` binary was found on `PATH`.
     BwrapNotFound,
-    /// The only `bwrap` found is setuid-root, which Zed refuses to run.
+    /// The only `bwrap` found is setuid-root, which Lin refuses to run.
     SetuidRejected,
     /// `bwrap` is present but couldn't set up the sandbox (typically because
     /// unprivileged user namespaces are disabled).

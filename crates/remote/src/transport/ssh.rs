@@ -271,7 +271,7 @@ impl RemoteEnvironment {
                 "AMD64" => RemoteArch::X86_64,
                 "ARM64" => RemoteArch::Aarch64,
                 architecture => anyhow::bail!(
-                    "Prebuilt remote servers are not yet available for windows-{architecture}. See https://zed.dev/docs/remote-development"
+                    "Prebuilt remote servers are not yet available for windows-{architecture}. See https://lin.dev/docs/remote-development"
                 ),
             },
         };
@@ -2924,9 +2924,9 @@ mod tests {
         assert_eq!(
             sftp_put_command(
                 "/tmp/Zed Repro/remote_server",
-                ".zed_server/downloaded server",
+                ".lin_server/downloaded server",
             ),
-            "put \"/tmp/Zed Repro/remote_server\" \".zed_server/downloaded server\"\n"
+            "put \"/tmp/Zed Repro/remote_server\" \".lin_server/downloaded server\"\n"
         );
     }
 
@@ -2935,9 +2935,9 @@ mod tests {
         assert_eq!(
             sftp_put_command(
                 r#"/tmp/Zed "Nightly"/remote_server"#,
-                ".zed_server/remote_server",
+                ".lin_server/remote_server",
             ),
-            "put \"/tmp/Zed \\\"Nightly\\\"/remote_server\" \".zed_server/remote_server\"\n"
+            "put \"/tmp/Zed \\\"Nightly\\\"/remote_server\" \".lin_server/remote_server\"\n"
         );
     }
 
@@ -2954,9 +2954,9 @@ mod tests {
         assert_eq!(
             sftp_put_command(
                 r"/tmp/zed\server/remote_server",
-                ".zed_server/remote_server",
+                ".lin_server/remote_server",
             ),
-            "put \"/tmp/zed\\\\server/remote_server\" \".zed_server/remote_server\"\n"
+            "put \"/tmp/zed\\\\server/remote_server\" \".lin_server/remote_server\"\n"
         );
     }
 
@@ -2965,9 +2965,9 @@ mod tests {
         assert_eq!(
             sftp_put_command(
                 r"C:\Users\Smit\Zed Repro\remote_server",
-                ".zed_server/remote_server",
+                ".lin_server/remote_server",
             ),
-            "put \"C:\\\\Users\\\\Smit\\\\Zed Repro\\\\remote_server\" \".zed_server/remote_server\"\n"
+            "put \"C:\\\\Users\\\\Smit\\\\Zed Repro\\\\remote_server\" \".lin_server/remote_server\"\n"
         );
     }
 

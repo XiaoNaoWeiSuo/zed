@@ -1,4 +1,4 @@
-//! See [Telemetry in Zed](https://zed.dev/docs/telemetry) for additional information.
+//! See [Telemetry in Lin](https://lin.dev/docs/telemetry) for additional information.
 use futures::channel::mpsc;
 pub use serde_json;
 use std::sync::OnceLock;
@@ -53,11 +53,7 @@ macro_rules! serialize_property {
     };
 }
 
-pub fn send_event(event: Event) {
-    if let Some(queue) = TELEMETRY_QUEUE.get() {
-        queue.unbounded_send(event).ok();
-    }
-}
+pub fn send_event(_event: Event) {}
 
 pub fn init(tx: mpsc::UnboundedSender<Event>) {
     TELEMETRY_QUEUE.set(tx).ok();

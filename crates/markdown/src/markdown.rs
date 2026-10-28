@@ -6813,7 +6813,7 @@ mod tests {
                 TextAlign::Right,
             ),
             (
-                r#"<p style="text-align: center"><a href="https://zed.dev"><img src="icon.png"></a></p>"#,
+                r#"<p style="text-align: center"><a href="https://lin.dev"><img src="icon.png"></a></p>"#,
                 TextAlign::Center,
             ),
         ] {

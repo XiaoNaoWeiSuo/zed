@@ -502,7 +502,7 @@ impl LspLocationsDelegate {
         origin: Option<NavigationEntry>,
     ) -> Self {
         // Match against the line text and the file path, mirroring the fuzzy
-        // matching every other Zed picker uses.
+        // matching every other Lin picker uses.
         let candidates = all_matches
             .iter()
             .enumerate()

@@ -162,13 +162,13 @@ impl SubmissionRecord {
 
 #[derive(Clone)]
 pub(crate) enum SubmissionTransport {
-    /// Each prompt is a request whose response ends the turn, so Zed derives
+    /// Each prompt is a request whose response ends the turn, so Lin derives
     /// foreground state from its own turns.
     Completion,
     /// The agent acknowledges each prompt when it accepts it and reports
     /// foreground state separately.
     Receipt(Rc<dyn ReceiptSessionSubmissions>),
-    /// The agent owns the session's work, such as an ACP subagent: Zed cannot
+    /// The agent owns the session's work, such as an ACP subagent: Lin cannot
     /// submit prompts, and foreground state comes only from agent reports.
     AgentOwned,
 }

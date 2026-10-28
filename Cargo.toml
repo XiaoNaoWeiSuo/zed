@@ -11,14 +11,10 @@ members = [
     "crates/agent_skills",
     "crates/agent_ui",
     "crates/agent_ui_benchmarks",
-    "crates/ai_onboarding",
     "crates/anthropic",
     "crates/askpass",
     "crates/assets",
     "crates/audio",
-    "crates/auto_update",
-    "crates/auto_update_helper",
-    "crates/auto_update_ui",
     "crates/aws_http_client",
     "crates/bedrock",
     "crates/bench_metrics",
@@ -35,7 +31,6 @@ members = [
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
     "crates/codestral",
-    "crates/collab",
     "crates/collab_ui",
     "crates/collections",
     "crates/command_palette",
@@ -58,7 +53,6 @@ members = [
     "crates/diagnostics",
     "crates/docs_preprocessor",
     "crates/edit_prediction",
-    "crates/edit_prediction_cli",
     "crates/edit_prediction_context",
     "crates/edit_prediction_metrics",
     "crates/edit_prediction_types",
@@ -70,7 +64,6 @@ members = [
     "crates/etw_tracing",
     "crates/eval_cli",
     "crates/eval_utils",
-    "crates/explorer_command_injector",
     "crates/extension",
     "crates/extension_api",
     "crates/extension_cli",
@@ -79,7 +72,6 @@ members = [
     "crates/extensions_ui",
     "crates/feature_flags",
     "crates/feature_flags_macros",
-    "crates/feedback",
     "crates/file_content",
     "crates/file_finder",
     "crates/file_icons",
@@ -127,7 +119,6 @@ members = [
     "crates/language_model",
     "crates/language_model_core",
     "crates/language_models",
-    "crates/language_models_cloud",
     "crates/language_onboarding",
     "crates/language_selector",
     "crates/language_tools",
@@ -153,7 +144,6 @@ members = [
     "crates/notifications",
     "crates/oauth_callback_server",
     "crates/ollama",
-    "crates/onboarding",
     "crates/open_ai",
     "crates/open_path_prompt",
     "crates/open_router",
@@ -235,7 +225,6 @@ members = [
     "crates/vim_mode_setting",
     "crates/watch",
     "crates/web_search",
-    "crates/web_search_providers",
     "crates/which_key",
     "crates/windows_resources",
     "crates/workspace",
@@ -291,14 +280,11 @@ agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
 agent_skills = { path = "crates/agent_skills" }
 agent_ui = { path = "crates/agent_ui" }
-ai_onboarding = { path = "crates/ai_onboarding" }
 anthropic = { path = "crates/anthropic" }
 askpass = { path = "crates/askpass" }
 assets = { path = "crates/assets" }
 audio = { path = "crates/audio" }
 bench_metrics = { path = "crates/bench_metrics" }
-auto_update = { path = "crates/auto_update" }
-auto_update_ui = { path = "crates/auto_update_ui" }
 aws_http_client = { path = "crates/aws_http_client" }
 bedrock = { path = "crates/bedrock" }
 breadcrumbs = { path = "crates/breadcrumbs" }
@@ -313,7 +299,6 @@ cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
 codestral = { path = "crates/codestral" }
-collab = { path = "crates/collab" }
 collab_ui = { path = "crates/collab_ui" }
 collections = { path = "crates/collections", version = "0.1.0" }
 command_palette = { path = "crates/command_palette" }
@@ -353,7 +338,6 @@ extension_suggest = { path = "crates/extension_suggest" }
 extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
-feedback = { path = "crates/feedback" }
 file_content = { path = "crates/file_content" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
@@ -400,7 +384,6 @@ language_extension = { path = "crates/language_extension" }
 language_model = { path = "crates/language_model" }
 language_model_core = { path = "crates/language_model_core" }
 language_models = { path = "crates/language_models" }
-language_models_cloud = { path = "crates/language_models_cloud" }
 language_onboarding = { path = "crates/language_onboarding" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
@@ -426,7 +409,6 @@ node_runtime = { path = "crates/node_runtime" }
 notifications = { path = "crates/notifications" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 ollama = { path = "crates/ollama" }
-onboarding = { path = "crates/onboarding" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
@@ -506,7 +488,6 @@ vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 watch = { path = "crates/watch" }
 web_search = { path = "crates/web_search" }
-web_search_providers = { path = "crates/web_search_providers" }
 which_key = { path = "crates/which_key" }
 windows_resources = { path = "crates/windows_resources" }
 workspace = { path = "crates/workspace" }

@@ -129,7 +129,7 @@ impl CompactedResponse {
 /// Packages a canonical replacement window into opaque provider state owned by
 /// `owner`.
 ///
-/// Several backends speak the OpenAI Responses protocol (OpenAI itself, Zed
+/// Several backends speak the OpenAI Responses protocol (OpenAI itself, Lin
 /// Cloud's OpenAI models, OpenAI-compatible endpoints, and others), but their
 /// encrypted compaction items are not interchangeable: only the backend that
 /// produced an item can decrypt it. The owner recorded here is what

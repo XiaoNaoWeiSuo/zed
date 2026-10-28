@@ -123,11 +123,11 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp_v2::Meta {
 pub const COMMAND_CATEGORY_META_KEY: &str = "command_category";
 
 /// The source category of a slash command, used to group commands in the
-/// completion popup. Only the native Zed agent annotates its commands; commands
+/// completion popup. Only the native Lin agent annotates its commands; commands
 /// from external ACP agents carry no category and are grouped on their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandCategory {
-    /// Built-in Zed agent commands (e.g. `/compact`).
+    /// Built-in Lin agent commands (e.g. `/compact`).
     Native,
     /// Commands sourced from MCP server prompts.
     Mcp,
@@ -3919,7 +3919,7 @@ impl AcpThread {
         }
     }
 
-    /// Marks an ACP subagent session, whose work its parent agent owns. Zed cannot
+    /// Marks an ACP subagent session, whose work its parent agent owns. Lin cannot
     /// submit prompts to it, and its foreground state is unconfirmed until the agent
     /// reports one.
     pub fn agent_owned(mut self) -> Self {
@@ -4156,7 +4156,7 @@ impl AcpThread {
         }
     }
 
-    /// Whether the agent reports this session's foreground state, rather than Zed
+    /// Whether the agent reports this session's foreground state, rather than Lin
     /// deriving it from its own prompt turns.
     pub fn uses_reported_activity(&self) -> bool {
         !matches!(
@@ -4594,8 +4594,8 @@ impl AcpThread {
                     stop_reason: stop_reason.clone(),
                 });
             }
-            // A subagent's work can stop because Zed cancelled an ancestor. Its requests stay
-            // answerable until it reports that, and then go as if Zed had cancelled it.
+            // A subagent's work can stop because Lin cancelled an ancestor. Its requests stay
+            // answerable until it reports that, and then go as if Lin had cancelled it.
             if self.subagent_association.is_some()
                 && matches!(stop_reason, Some(acp_v2::StopReason::Cancelled))
             {
@@ -11575,7 +11575,7 @@ mod tests {
             thread.update_session_state(running(), cx).expect("running");
         });
 
-        // Zed did not cancel this subagent: its work stopped with an ancestor's.
+        // Lin did not cancel this subagent: its work stopped with an ancestor's.
         thread.update(cx, |thread, cx| {
             thread
                 .update_session_state(idle_with(acp_v2::StopReason::Cancelled), cx)
@@ -20409,7 +20409,7 @@ mod tests {
             "file:///tmp/authorize",
             "data:text/plain,authorize",
             "mailto:user@example.com",
-            "zed://settings",
+            "lin://settings",
         ] {
             let result = thread.update(cx, |thread, cx| {
                 thread.request_elicitation(
@@ -22103,7 +22103,7 @@ mod tests {
     /// the outer task observes `rx.await` returning `Err(Cancelled)` and
     /// must still clear `running_turn` so the panel transitions out of
     /// `Generating`. Without this, the agent thread is wedged in the
-    /// loading state until Zed restarts.
+    /// loading state until Lin restarts.
     #[gpui::test]
     async fn test_running_turn_cleared_when_send_task_dropped(cx: &mut TestAppContext) {
         init_test(cx);

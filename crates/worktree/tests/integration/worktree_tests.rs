@@ -5323,7 +5323,7 @@ async fn test_noisy_dot_git_events_do_not_emit_git_repo_update(
 ) {
     // Events for object database writes, hook files, lock files, and the
     // reflogs of HEAD/branches/remote-tracking branches carry no git state
-    // changes that Zed cares about beyond what the accompanying ref or index
+    // changes that Lin cares about beyond what the accompanying ref or index
     // events already convey, so they must not trigger a git metadata rescan.
     // The stash reflog and ref updates themselves must still trigger one.
     //
@@ -5800,7 +5800,7 @@ async fn test_dot_git_event_explained_by_filtered_sibling_does_not_emit_git_repo
     // rescan (to cope with coalesced events on macOS), but when the same batch
     // contains a filtered-out event that explains the directory change, acting
     // on the bare event turns every ignored lock file into a rescan. Since
-    // Zed's own rescans take .git/index.lock via `git diff`, that feeds back
+    // Lin's own rescans take .git/index.lock via `git diff`, that feeds back
     // into an infinite loop of git scans.
     init_test(cx);
 

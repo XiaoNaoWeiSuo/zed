@@ -874,7 +874,7 @@ impl ConfigurationView {
                             .child(Label::new("ollama run gpt-oss:20b").inline_code(cx)),
                     )
                     .child(
-                        ListBulletItem::new("Click 'Connect' below to start using Ollama in Zed")
+                        ListBulletItem::new("Click 'Connect' below to start using Ollama in Lin")
                             .label_color(Color::Muted),
                     ),
             )

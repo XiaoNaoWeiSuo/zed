@@ -1,6 +1,6 @@
-//! # UI – Zed UI Primitives & Components
+//! # UI – Lin UI Primitives & Components
 //!
-//! This crate provides a set of UI primitives and components that are used to build all of the elements in Zed's UI.
+//! This crate provides a set of UI primitives and components that are used to build all of the elements in Lin's UI.
 //!
 //! ## Related Crates:
 //!

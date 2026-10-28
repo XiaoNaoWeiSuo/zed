@@ -1684,7 +1684,7 @@ mod tests {
             px(16.),
             &[TextRun {
                 len: text.len(),
-                font: font(".ZedMono"),
+                font: font(".LinMono"),
                 color: black(),
                 ..TextRun::default()
             }],

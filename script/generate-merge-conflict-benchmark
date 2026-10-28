@@ -23,9 +23,9 @@ def run_git(
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_AUTHOR_NAME": "Zed Benchmark",
-            "GIT_AUTHOR_EMAIL": "benchmark@zed.dev",
+            "GIT_AUTHOR_EMAIL": "benchmark@lin.local",
             "GIT_COMMITTER_NAME": "Zed Benchmark",
-            "GIT_COMMITTER_EMAIL": "benchmark@zed.dev",
+            "GIT_COMMITTER_EMAIL": "benchmark@lin.local",
         }
     )
     result = subprocess.run(

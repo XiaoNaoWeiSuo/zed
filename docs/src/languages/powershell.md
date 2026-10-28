@@ -1,11 +1,11 @@
 ---
 title: PowerShell
-description: "Configure PowerShell language support in Zed, including language servers, formatting, and debugging."
+description: "Configure PowerShell language support in Lin, including language servers, formatting, and debugging."
 ---
 
 # PowerShell
 
-PowerShell language support in Zed is provided by the community-maintained [Zed PowerShell extension](https://github.com/wingyplus/zed-powershell). Please report issues to: [github.com/wingyplus/zed-powershell/issues](https://github.com/wingyplus/zed-powershell/issues)
+PowerShell language support in Lin is provided by the community-maintained [Lin PowerShell extension](https://github.com/wingyplus/lin-powershell). Please report issues to: [github.com/wingyplus/lin-powershell/issues](https://github.com/wingyplus/lin-powershell/issues)
 
 - Tree-sitter: [airbus-cert/tree-sitter-powershell](https://github.com/airbus-cert/tree-sitter-powershell)
 - Language Server: [PowerShell/PowerShellEditorServices](https://github.com/PowerShell/PowerShellEditorServices)
@@ -21,13 +21,13 @@ PowerShell language support in Zed is provided by the community-maintained [Zed 
 - Ubuntu: [Install PowerShell on RHEL](https://learn.microsoft.com/en-us/powershell/scripting/install/install-ubuntu)
 - Windows: [Install PowerShell on Windows](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows)
 
-The Zed PowerShell extension will default to the `pwsh` executable found in your path.
+The Lin PowerShell extension will default to the `pwsh` executable found in your path.
 
 ### Install PowerShell Editor Services (Optional) {#powershell-editor-services}
 
-The Zed PowerShell extension will attempt to download [PowerShell Editor Services](https://github.com/PowerShell/PowerShellEditorServices) automatically.
+The Lin PowerShell extension will attempt to download [PowerShell Editor Services](https://github.com/PowerShell/PowerShellEditorServices) automatically.
 
-If you want to use a specific binary, you can specify that in your Zed settings.json:
+If you want to use a specific binary, you can specify that in your Lin settings.json:
 
 ```json [settings]
   "lsp": {

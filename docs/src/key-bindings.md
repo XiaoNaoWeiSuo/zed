@@ -1,18 +1,18 @@
 ---
-title: Key Bindings and Shortcuts - Zed
-description: Customize Zed's keyboard shortcuts. Rebind actions, create key sequences, and set context-specific bindings.
+title: Key Bindings and Shortcuts - Lin
+description: Customize Lin's keyboard shortcuts. Rebind actions, create key sequences, and set context-specific bindings.
 ---
 
 # Key bindings
 
-Zed's key binding system is fully customizable. You can rebind any action, create key sequences, and define context-specific bindings.
+Lin's key binding system is fully customizable. You can rebind any action, create key sequences, and define context-specific bindings.
 
 ## Predefined Keymaps
 
-If you're used to a specific editor's defaults, you can change your `base_keymap` through the settings window ({#kb zed::OpenSettings}) or directly through your `settings.json` file ({#kb zed::OpenSettingsFile}).
+If you're used to a specific editor's defaults, you can change your `base_keymap` through the settings window ({#kb lin::OpenSettings}) or directly through your `settings.json` file ({#kb lin::OpenSettingsFile}).
 We currently support:
 
-- Zed (default)
+- Lin (default)
 - VS Code
 - Atom
 - Emacs (Beta)
@@ -22,16 +22,16 @@ We currently support:
 - Cursor
 - None (disables _all_ key bindings)
 
-This setting can also be changed via the command palette through the {#action zed::ToggleBaseKeymapSelector} action.
+This setting can also be changed via the command palette through the {#action lin::ToggleBaseKeymapSelector} action.
 
 You can also enable `vim_mode` or `helix_mode`, which add modal bindings.
 For more information, see the documentation for [Vim mode](./vim.md) and [Helix mode](./helix.md).
 
 ## Keymap Editor
 
-You can access the keymap editor through the {#kb zed::OpenKeymap} action or by running {#action zed::OpenKeymap} action from the [command palette](./command-palette.md). You can easily add or change a keybind for an action with the `Change Keybinding` or `Add Keybinding` button on the command palette's left bottom corner.
+You can access the keymap editor through the {#kb lin::OpenKeymap} action or by running {#action lin::OpenKeymap} action from the [command palette](./command-palette.md). You can easily add or change a keybind for an action with the `Change Keybinding` or `Add Keybinding` button on the command palette's left bottom corner.
 
-In there, you can see all of the existing actions in Zed as well as the associated keybindings set to them by default.
+In there, you can see all of the existing actions in Lin as well as the associated keybindings set to them by default.
 
 You can also customize them right from there, either by clicking on the pencil icon that appears when you hover over a particular action, by double-clicking on the action row, or by pressing the `enter` key.
 
@@ -41,10 +41,10 @@ Anything that you end up doing on the keymap editor also gets reflected on the `
 
 The keymap file is stored in the following locations for each platform:
 
-- macOS/Linux: `~/.config/zed/keymap.json`
-- Windows: `~\AppData\Roaming\Zed/keymap.json`
+- macOS/Linux: `~/.config/lin/keymap.json`
+- Windows: `~\AppData\Roaming\Lin/keymap.json`
 
-You can open the keymap with the {#action zed::OpenKeymapFile} action from the command palette.
+You can open the keymap with the {#action lin::OpenKeymapFile} action from the command palette.
 
 This file contains a JSON array of objects with `"bindings"`.
 If no `"context"` is set, the bindings are always active.
@@ -74,18 +74,18 @@ For example:
 ]
 ```
 
-You can see all of Zed's default bindings for each platform in the default keymaps files:
+You can see all of Lin's default bindings for each platform in the default keymaps files:
 
-- [macOS](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-macos.json)
-- [Windows](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-windows.json)
-- [Linux](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-linux.json).
+- [macOS](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-macos.json)
+- [Windows](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-windows.json)
+- [Linux](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-linux.json).
 
 If you want to debug problems with custom keymaps, you can use {#action dev::OpenKeyContextView} from the command palette.
-Please file [an issue](https://github.com/zed-industries/zed) if you run into something you think should work but isn't.
+Please file [an issue](https://github.com/lin-editor/lin) if you run into something you think should work but isn't.
 
 ### Keybinding Syntax
 
-Zed has the ability to match against not just a single keypress, but a sequence of keys typed in order. Each key in the `"bindings"` map is a sequence of keypresses separated with a space.
+Lin has the ability to match against not just a single keypress, but a sequence of keys typed in order. Each key in the `"bindings"` map is a sequence of keypresses separated with a space.
 
 Each keypress is a sequence of modifiers followed by a key. The modifiers are:
 
@@ -94,7 +94,7 @@ Each keypress is a sequence of modifiers followed by a key. The modifiers are:
 - `alt-` for alt (option on macOS)
 - `shift-` The shift key
 - `fn-` The function key
-- `secondary-` Equivalent to `cmd` when Zed is running on macOS and `ctrl` when on Windows and Linux
+- `secondary-` Equivalent to `cmd` when Lin is running on macOS and `ctrl` when on Windows and Linux
 
 The keys can be any single Unicode codepoint that your keyboard generates (for example `a`, `0`, `£` or `ç`), or any named key (`tab`, `f1`, `shift`, or `cmd`). If you are using a non-Latin layout (e.g. Cyrillic), you can bind either to the Cyrillic character or the Latin character that key generates with `cmd` pressed.
 
@@ -103,7 +103,7 @@ A few examples:
 ```json [keymap]
 {
   "bindings": {
-    "cmd-k cmd-s": "zed::OpenKeymap", // matches ⌘-k then ⌘-s
+    "cmd-k cmd-s": "lin::OpenKeymap", // matches ⌘-k then ⌘-s
     "space e": "editor::ShowCompletions", // type space then e
     "ç": "editor::ShowCompletions", // matches ⌥-c
     "shift shift": "file_finder::Toggle" // matches pressing and releasing shift twice
@@ -113,15 +113,15 @@ A few examples:
 
 The `shift-` modifier can only be used in combination with a letter to indicate the uppercase version. For example, `shift-g` matches typing `G`. Although on many keyboards shift is used to type punctuation characters like `(`, the keypress is not considered to be modified, and so `shift-(` does not match.
 
-The `alt-` modifier can be used on many layouts to generate a different key. For example, on a macOS US keyboard, the combination `alt-c` types `ç`. You can match against either in your keymap file, though by convention, Zed spells this combination as `alt-c`.
+The `alt-` modifier can be used on many layouts to generate a different key. For example, on a macOS US keyboard, the combination `alt-c` types `ç`. You can match against either in your keymap file, though by convention, Lin spells this combination as `alt-c`.
 
 It is possible to match against typing a modifier key on its own. For example, `shift shift` can be used to implement JetBrains' 'Search Everywhere' shortcut. In this case, the binding happens on key release instead of on keypress.
 
 ### Contexts
 
-If a binding group has a `"context"` key, it will be matched against the currently active contexts in Zed.
+If a binding group has a `"context"` key, it will be matched against the currently active contexts in Lin.
 
-Zed's contexts make up a tree, with the root being `Workspace`. Workspaces contain Panes and Panels, and Panes contain Editors, etc. The easiest way to see what contexts are active at a given moment is the key context view, which you can get to with the {#action dev::OpenKeyContextView} command in the command palette.
+Lin's contexts make up a tree, with the root being `Workspace`. Workspaces contain Panes and Panels, and Panes contain Editors, etc. The easiest way to see what contexts are active at a given moment is the key context view, which you can get to with the {#action dev::OpenKeyContextView} command in the command palette.
 
 For example:
 
@@ -153,14 +153,14 @@ For example:
 
 It's worth noting that attributes are only available on the node they are defined on. This means that if you want to (for example) only enable a keybinding when the debugger is stopped in vim normal mode, you need to do `debugger_stopped > vim_mode == normal`.
 
-> Note: Before Zed v0.197.x, the `!` operator only looked at one node at a time, and `>` meant "parent" not "ancestor". This meant that `!Editor` would match the context `Workspace > Pane > Editor`, because (confusingly) the Pane matches `!Editor`, and that `os == macos > Editor` did not match the context `Workspace > Pane > Editor` because of the intermediate `Pane` node.
+> Note: Before Lin v0.197.x, the `!` operator only looked at one node at a time, and `>` meant "parent" not "ancestor". This meant that `!Editor` would match the context `Workspace > Pane > Editor`, because (confusingly) the Pane matches `!Editor`, and that `os == macos > Editor` did not match the context `Workspace > Pane > Editor` because of the intermediate `Pane` node.
 
 If you're using Vim mode, we have information on how [vim modes influence the context](./vim.md#selecting-the-correct-context). Helix mode is built on top of Vim mode and uses the same contexts.
 
 ### Actions
 
-Almost all of Zed's functionality is exposed as actions.
-Although there is no explicitly documented list, you can find most of them by searching in the command palette, by looking in the default keymaps for [macOS](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-macos.json), [Windows](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-windows.json) or [Linux](https://github.com/zed-industries/zed/blob/main/assets/keymaps/default-linux.json), or by using Zed's autocomplete in your keymap file.
+Almost all of Lin's functionality is exposed as actions.
+Although there is no explicitly documented list, you can find most of them by searching in the command palette, by looking in the default keymaps for [macOS](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-macos.json), [Windows](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-windows.json) or [Linux](https://github.com/lin-editor/lin/blob/main/assets/keymaps/default-linux.json), or by using Lin's autocomplete in your keymap file.
 
 Most actions do not require any arguments, and so you can bind them as strings: `"ctrl-a": "language_selector::Toggle"`. Some require a single argument and must be bound as an array: `"cmd-1": ["workspace::ActivatePane", 0]`. Some actions require multiple arguments and are bound as an array of a string and an object: `"ctrl-a": ["pane::DeploySearch", { "replace_enabled": true }]`.
 
@@ -173,9 +173,9 @@ When multiple keybindings have the same keystroke and are active at the same tim
 
 The other kind of conflict that arises is when you have two bindings, one of which is a prefix of the other. For example, if you have `"ctrl-w":"editor::DeleteToNextWordEnd"` and `"ctrl-w left":"editor::DeleteToEndOfLine"`.
 
-When this happens, and both bindings are active in the current context, Zed will wait for 1 second after you type `ctrl-w` to see if you're about to type `left`. If you don't type anything, or if you type a different key, then `DeleteToNextWordEnd` will be triggered. If you do, then `DeleteToEndOfLine` will be triggered.
+When this happens, and both bindings are active in the current context, Lin will wait for 1 second after you type `ctrl-w` to see if you're about to type `left`. If you don't type anything, or if you type a different key, then `DeleteToNextWordEnd` will be triggered. If you do, then `DeleteToEndOfLine` will be triggered.
 
-Zed can also wait before inserting printable text when it might begin a multi-stroke binding. For example, with a `j k` binding, typing `j` waits briefly for `k`; otherwise, `j` is inserted after the timeout.
+Lin can also wait before inserting printable text when it might begin a multi-stroke binding. For example, with a `j k` binding, typing `j` waits briefly for `k`; otherwise, `j` is inserted after the timeout.
 
 Whenever multi-stroke input is pending, an indicator with the pending keystrokes is shown in the status bar. Hovering it lists the bindings that could still match. If the input has a timeout, the indicator also shows a countdown, and hovering pauses the timeout so you can read the bindings. The timeout resumes with the same remaining duration when the pointer leaves. Without a timeout, the pending keystrokes are shown without a countdown. The indicator can be hidden with `{"status_bar": {"pending_keystrokes_indicator": false}}`. Vim and Helix modes continue to use their existing pending-key indicator instead.
 
@@ -222,11 +222,11 @@ popover is disabled. Or add this to your settings.json:
 }
 ```
 
-Set `which_key.delay_ms` to change how long Zed waits before opening the menu.
+Set `which_key.delay_ms` to change how long Lin waits before opening the menu.
 
 ### Non-QWERTY keyboards
 
-Zed's support for non-QWERTY keyboards is still a work in progress.
+Lin's support for non-QWERTY keyboards is still a work in progress.
 
 If your keyboard can type the full ASCII range (DVORAK, COLEMAK, etc.), then shortcuts should work as you expect.
 
@@ -234,7 +234,7 @@ Otherwise, read on...
 
 #### macOS
 
-On Cyrillic, Hebrew, Armenian, and other keyboards that are mostly non-ASCII, macOS automatically maps keys to the ASCII range when `cmd` is held. Zed takes this a step further, and it can always match key-presses against either the ASCII layout or the real layout, regardless of modifiers and the `use_key_equivalents` setting. For example, in Thai, pressing `ctrl-ๆ` will match bindings associated with `ctrl-q` or `ctrl-ๆ`.
+On Cyrillic, Hebrew, Armenian, and other keyboards that are mostly non-ASCII, macOS automatically maps keys to the ASCII range when `cmd` is held. Lin takes this a step further, and it can always match key-presses against either the ASCII layout or the real layout, regardless of modifiers and the `use_key_equivalents` setting. For example, in Thai, pressing `ctrl-ๆ` will match bindings associated with `ctrl-q` or `ctrl-ๆ`.
 
 On keyboards that support extended Latin alphabets (French AZERTY, German QWERTZ, etc.), it is often not possible to type the entire ASCII range without `option`. This introduces an ambiguity: `option-2` produces `@`. To ensure that all the built-in keyboard shortcuts can still be typed on these keyboards, we move key bindings around. For example, shortcuts bound to `@` on QWERTY are moved to `"` on a Spanish layout. This mapping is based on the macOS system defaults and can be seen by running {#action dev::OpenKeyContextView} from the command palette.
 
@@ -279,7 +279,7 @@ the sequence, or if you want to disable multikey bindings starting with that key
 
 A `null` binding follows the same precedence rules as normal actions, so it disables all bindings that would match further up in the tree too. If you'd like a binding that matches further up in the tree to take precedence over a lower binding, you need to rebind it to the action you want in the context you want.
 
-This is useful for preventing Zed from falling back to a default key binding when the action you specified is conditional and propagates. For example, `buffer_search::DeployReplace` only triggers when the search bar is not in view. If the search bar is in view, it would propagate and trigger the default action set for that key binding, such as opening the right dock. To prevent this from happening:
+This is useful for preventing Lin from falling back to a default key binding when the action you specified is conditional and propagates. For example, `buffer_search::DeployReplace` only triggers when the search bar is not in view. If the search bar is in view, it would propagate and trigger the default action set for that key binding, such as opening the right dock. To prevent this from happening:
 
 ```json [keymap]
 [
@@ -337,9 +337,9 @@ If the argument to `SendKeystrokes` contains the binding used to trigger it, it 
 
 ### Forward keys to terminal
 
-If you're on Linux or Windows, you might find yourself wanting to forward key combinations to the built-in terminal instead of them being handled by Zed.
+If you're on Linux or Windows, you might find yourself wanting to forward key combinations to the built-in terminal instead of them being handled by Lin.
 
-For example, `ctrl-n` creates a new tab in Zed on Linux. If you want to send `ctrl-n` to the built-in terminal when it's focused, add the following to your keymap:
+For example, `ctrl-n` creates a new tab in Lin on Linux. If you want to send `ctrl-n` to the built-in terminal when it's focused, add the following to your keymap:
 
 ```json [keymap]
 {
@@ -352,12 +352,12 @@ For example, `ctrl-n` creates a new tab in Zed on Linux. If you want to send `ct
 
 ### Task Key bindings
 
-You can also bind keys to launch Zed Tasks defined in your `tasks.json`.
+You can also bind keys to launch Lin Tasks defined in your `tasks.json`.
 See the [tasks documentation](tasks.md#custom-keybindings-for-tasks) for more.
 
 ### Subword Navigation
 
-Zed exposes word and subword motions as separate actions. Word motions stop at whitespace and punctuation boundaries, while subword motions also stop inside identifiers such as `camelCase`, `PascalCase`, and `snake_case`.
+Lin exposes word and subword motions as separate actions. Word motions stop at whitespace and punctuation boundaries, while subword motions also stop inside identifiers such as `camelCase`, `PascalCase`, and `snake_case`.
 
 The JetBrains base keymap uses editor-local `alt-left` / `alt-right` and `shift-alt-left` / `shift-alt-right` for subword navigation to match JetBrains-style CamelHump navigation. If you use another base keymap and want that behavior, add this to your `keymap.json`:
 

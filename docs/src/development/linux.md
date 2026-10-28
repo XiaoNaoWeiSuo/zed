@@ -1,13 +1,13 @@
 ---
-title: Building Zed for Linux
-description: "Guide to building zed for linux for Zed development."
+title: Building Lin for Linux
+description: "Guide to building lin for linux for Lin development."
 ---
 
-# Building Zed for Linux
+# Building Lin for Linux
 
 ## Repository
 
-Clone the [Zed repository](https://github.com/zed-industries/zed).
+Clone the [Lin repository](https://github.com/lin-editor/lin).
 
 ## Dependencies
 
@@ -23,7 +23,7 @@ Clone the [Zed repository](https://github.com/zed-industries/zed).
 
 ## Building from source
 
-Once the dependencies are installed, you can build Zed using [Cargo](https://doc.rust-lang.org/cargo/).
+Once the dependencies are installed, you can build Lin using [Cargo](https://doc.rust-lang.org/cargo/).
 
 For a debug build of the editor:
 
@@ -51,49 +51,30 @@ You can install a local build on your machine with:
 ./script/install-linux
 ```
 
-This builds `zed` and the `cli` in release mode, installs the binary at `~/.local/bin/zed`, and installs `.desktop` files to `~/.local/share`.
+This builds `lin` and the `cli` in release mode, installs the binary at `~/.local/bin/lin`, and installs `.desktop` files to `~/.local/share`.
 
 ## Wayland & X11
 
-Zed supports both X11 and Wayland. By default, we pick whichever we can find at runtime. If you're on Wayland and want to run in X11 mode, use the environment variable `WAYLAND_DISPLAY=''`.
+Lin supports both X11 and Wayland. By default, we pick whichever we can find at runtime. If you're on Wayland and want to run in X11 mode, use the environment variable `WAYLAND_DISPLAY=''`.
 
-## Notes for packaging Zed
-
-This section is for distribution maintainers packaging Zed.
+## Notes for packaging Lin
 
 ### Technical requirements
 
-Zed has two main binaries:
+Lin has two main binaries:
 
-- You will need to build `crates/cli` and make its binary available in `$PATH` with the name `zed`.
-- You will need to build `crates/zed` and put it at `$PATH/to/cli/../../libexec/zed-editor`. For example, if you are going to put the cli at `~/.local/bin/zed` put zed at `~/.local/libexec/zed-editor`. As some linux distributions (notably Arch) discourage the use of `libexec`, you can also put this binary at `$PATH/to/cli/../../lib/zed/zed-editor` (e.g. `~/.local/lib/zed/zed-editor`) instead.
-- If you are going to provide a `.desktop` file you can find a template in `crates/zed/resources/zed.desktop.in`, and use `envsubst` to populate it with the values required. This file should also be renamed to `$APP_ID.desktop` so that the file [follows the FreeDesktop standards](https://github.com/zed-industries/zed/issues/12707#issuecomment-2168742761). You should also make this desktop file executable (`chmod 755`).
-- You will need to ensure that the necessary libraries are installed. You can get the current list by [inspecting the built binary](https://github.com/zed-industries/zed/blob/935cf542aebf55122ce6ed1c91d0fe8711970c82/script/bundle-linux#L65-L67) on your system.
-- For an example of a complete build script, see [script/bundle-linux](https://github.com/zed-industries/zed/blob/935cf542aebf55122ce6ed1c91d0fe8711970c82/script/bundle-linux).
-- You can disable Zed's auto updates and provide instructions for users who try to update Zed manually by building (or running) Zed with the environment variable `ZED_UPDATE_EXPLANATION`. For example: `ZED_UPDATE_EXPLANATION="Please use flatpak to update zed."`.
-- Make sure to update the contents of the `crates/zed/RELEASE_CHANNEL` file to 'nightly', 'preview', or 'stable', with no newline. This will cause Zed to use the credentials manager to remember a user's login.
+- Build `crates/cli` and make its binary available in `$PATH` with the name `lin`.
+- Build `crates/lin` and put it at `$PATH/to/cli/../../libexec/lin-editor`. For example, if the CLI is at `~/.local/bin/lin`, put the editor at `~/.local/libexec/lin-editor`. Distributions that discourage `libexec` can use `$PATH/to/cli/../../lib/lin/lin-editor` instead.
+- A `.desktop` template lives at `crates/lin/resources/lin.desktop.in`; populate it with `envsubst` and rename it to `$APP_ID.desktop`.
+- Ensure the necessary libraries are installed; `script/bundle-linux` shows the expected set.
+- `crates/lin/RELEASE_CHANNEL` must contain `nightly`, `preview`, or `stable` with no trailing newline.
 
 ### Other things to note
 
-Zed moves quickly, and distribution maintainers often have different constraints and priorities. The points below describe current trade-offs:
-
-- Zed is a fast-moving project. We typically publish 2-3 builds per week to address reported issues and ship larger changes.
-- There are a couple of other `zed` binaries that may be present on Linux systems ([1](https://openzfs.github.io/openzfs-docs/man/v2.2/8/zed.8.html), [2](https://zed.brimdata.io/docs/commands/zed)). If you want to rename our CLI binary because of these issues, we suggest `zedit`, `zeditor`, or `zed-cli`.
-- Zed automatically installs versions of common developer tools, similar to rustup/rbenv/pyenv. This behavior is discussed [here](https://github.com/zed-industries/zed/issues/12589).
-- Users can install extensions locally and from [zed-industries/extensions](https://github.com/zed-industries/extensions). Extensions may install additional tools such as language servers. Planned safety improvements are tracked [here](https://github.com/zed-industries/zed/issues/12358).
-- Zed connects to several online services by default (AI, telemetry, collaboration). AI and our telemetry can be disabled by your users with their zed settings or by patching our [default settings file](https://github.com/zed-industries/zed/blob/main/assets/settings/default.json).
-- Because of the points above, Zed currently does not work well with sandboxes. See [this discussion](https://github.com/zed-industries/zed/pull/12006#issuecomment-2130421220).
-
-## Flatpak
-
-> Zed's current Flatpak integration exits the sandbox on startup. Workflows that rely on Flatpak's sandboxing may not work as expected.
-
-To build & install the Flatpak package locally follow the steps below:
-
-1. Install Flatpak for your distribution as outlined [here](https://flathub.org/setup).
-2. Run the `script/flatpak/deps` script to install the required dependencies.
-3. Run `script/flatpak/bundle-flatpak`.
-4. Now the package has been installed and has a bundle available at `target/release/{app-id}.flatpak`.
+- Different Linux distributions refresh at different speeds; package from a tagged commit.
+- Lin installs common developer tools on demand, similar to rustup/rbenv/pyenv.
+- Extensions are installed from the official Lin extension registry.
+- Lin does not contact hosted services. Telemetry, crash reporting, and automatic updates are disabled.
 
 ## Memory profiling
 
@@ -104,24 +85,24 @@ $ sudo apt install heaptrack heaptrack-gui
 $ cargo install cargo-heaptrack
 ```
 
-Then, to build and run Zed with the profiler attached:
+Then, to build and run Lin with the profiler attached:
 
 ```sh
-$ cargo heaptrack -b zed
+$ cargo heaptrack -b lin
 ```
 
-When this zed instance is exited, terminal output will include a command to run `heaptrack_interpret` to convert the `*.raw.zst` profile to a `*.zst` file which can be passed to `heaptrack_gui` for viewing.
+When this lin instance is exited, terminal output will include a command to run `heaptrack_interpret` to convert the `*.raw.zst` profile to a `*.zst` file which can be passed to `heaptrack_gui` for viewing.
 
 ## Perf recording
 
-How to get a flamegraph with resolved symbols from a running Zed instance.
-Use this when Zed is using a lot of CPU. It is not useful for hangs.
+How to get a flamegraph with resolved symbols from a running Lin instance.
+Use this when Lin is using a lot of CPU. It is not useful for hangs.
 
 ### During the incident
 
 - Find the PID (process ID) using:
-  `ps -eo size,pid,comm | grep zed | sort | head -n 1 | cut -d ' ' -f 2`
-  Or find the PID of `zed-editor` with the highest RAM usage in something
+  `ps -eo size,pid,comm | grep lin | sort | head -n 1 | cut -d ' ' -f 2`
+  Or find the PID of `lin-editor` with the highest RAM usage in something
   like htop/btop/top.
 
 - Install perf:
@@ -135,13 +116,13 @@ Use this when Zed is using a lot of CPU. It is not useful for hangs.
   run `sudo chown $USER:$USER perf.data`
 
 - Get build info:
-  Run zed again and type {#action zed::About} in the command pallet to get the exact commit.
+  Run lin again and type {#action lin::About} in the command pallet to get the exact commit.
 
-The `perf.data` file can be sent to Zed together with the exact commit.
+The `perf.data` file can be sent to Lin together with the exact commit.
 
 ### Later
 
-This can be done by Zed staff.
+This can be done by Lin staff.
 
 Released Linux binaries are stripped, but the unstripped binary for every release is archived in Sentry (uploaded by `script/bundle-linux`).
 Download it from the Sentry project's Debug Files page (search by the release version or the binary's build id), then continue with the `perf buildid-cache` step below.
@@ -159,7 +140,7 @@ Alternatively, rebuild the binary with symbols:
 ```
 
 - Add the symbols to the perf database:
-  `perf buildid-cache -v -a <path to release zed binary>`
+  `perf buildid-cache -v -a <path to release lin binary>`
 
 - Resolve the symbols from the db:
   `perf inject -i perf.data -o perf_with_symbols.data`

@@ -508,7 +508,7 @@ mod tests {
             "https://gitlab.com/zed-industries/zed/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fnew-feature"
         );
 
-        let base_url = Url::parse("https://gitlab.zed.com").unwrap();
+        let base_url = Url::parse("https://gitlab.lin.com").unwrap();
         let github = Gitlab::new("GitLab Self-Hosted", base_url);
         let url = github
             .build_create_pull_request_url(&remote, "feature/new-feature")
@@ -516,7 +516,7 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://gitlab.zed.com/zed-industries/zed/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fnew-feature"
+            "https://gitlab.lin.com/zed-industries/zed/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fnew-feature"
         );
     }
 

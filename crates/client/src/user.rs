@@ -852,7 +852,7 @@ impl UserStore {
         self.edit_prediction_usage
     }
 
-    /// Returns whether the current plan doesn't include Zed's hosted edit predictions. This is
+    /// Returns whether the current plan doesn't include Lin's hosted edit predictions. This is
     /// decided by plan rather than by the usage limit Cloud reports, because Cloud may still
     /// report a nonzero Free allowance while it denies requests.
     pub fn edit_predictions_excluded_from_plan(&self) -> bool {

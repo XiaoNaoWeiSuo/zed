@@ -8,7 +8,7 @@ pub struct SubagentAssociation {
     /// The parent's label for the subagent, which can differ from the subagent's own title.
     pub title: Option<SharedString>,
     pub description: Option<SharedString>,
-    /// Whether Zed may cancel the subagent's current work.
+    /// Whether Lin may cancel the subagent's current work.
     pub can_cancel: bool,
 }
 
@@ -29,7 +29,7 @@ impl SubagentAssociation {
     }
 }
 
-/// Association metadata is not carried over: Zed does not use it, and v1 replaces it
+/// Association metadata is not carried over: Lin does not use it, and v1 replaces it
 /// where v2 patches it by key.
 pub fn update_from_v1(update: acp_v1::SubagentUpdate) -> Result<acp_v2::SubagentUpdate> {
     let state = match update.state {

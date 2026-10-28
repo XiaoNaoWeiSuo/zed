@@ -43,15 +43,15 @@ use crate::{
 
 use settings_json::{infer_json_indent_size, update_value_in_json_text};
 
-pub const LSP_SETTINGS_SCHEMA_URL_PREFIX: &str = "zed://schemas/settings/lsp/";
+pub const LSP_SETTINGS_SCHEMA_URL_PREFIX: &str = "lin://schemas/settings/lsp/";
 
 // GPUI resolves these aliases, but they are not part of the platform font inventory.
 const VIRTUAL_FONT_NAMES: [&str; 5] = [
     ".SystemUIFont",
-    ".ZedMono",
-    ".ZedSans",
-    "Zed Plex Mono",
-    "Zed Plex Sans",
+    ".LinMono",
+    ".LinSans",
+    "Lin Plex Mono",
+    "Lin Plex Sans",
 ];
 
 pub trait SettingsKey: 'static + Send + Sync {
@@ -3309,7 +3309,7 @@ mod tests {
 
         assert_eq!(
             init_options_ref,
-            "zed://schemas/settings/lsp/rust-analyzer/initialization_options"
+            "lin://schemas/settings/lsp/rust-analyzer/initialization_options"
         );
 
         let settings_ref = properties
@@ -3322,7 +3322,7 @@ mod tests {
 
         assert_eq!(
             settings_ref,
-            "zed://schemas/settings/lsp/rust-analyzer/settings"
+            "lin://schemas/settings/lsp/rust-analyzer/settings"
         );
     }
 
@@ -3364,7 +3364,7 @@ mod tests {
 
         assert_eq!(
             init_options_ref,
-            "zed://schemas/settings/lsp/rust-analyzer/initialization_options"
+            "lin://schemas/settings/lsp/rust-analyzer/initialization_options"
         );
 
         let settings_ref = properties
@@ -3377,7 +3377,7 @@ mod tests {
 
         assert_eq!(
             settings_ref,
-            "zed://schemas/settings/lsp/rust-analyzer/settings"
+            "lin://schemas/settings/lsp/rust-analyzer/settings"
         );
     }
 

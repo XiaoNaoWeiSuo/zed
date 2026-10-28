@@ -1,15 +1,15 @@
 ---
-title: Building Zed for Windows
-description: "Guide to building zed for windows for Zed development."
+title: Building Lin for Windows
+description: "Guide to building lin for windows for Lin development."
 ---
 
-# Building Zed for Windows
+# Building Lin for Windows
 
 > The following commands may be executed in any shell.
 
 ## Repository
 
-Clone the [Zed repository](https://github.com/zed-industries/zed).
+Clone the [Lin repository](https://github.com/lin-editor/lin).
 
 ## Dependencies
 
@@ -23,7 +23,7 @@ Clone the [Zed repository](https://github.com/zed-industries/zed).
 
 > Starting with Visual Studio 2026 (or MSVC 14.50), you need to install optional components `MSVC Build Tools for x64/x86 (Latest)` and `C++ Spectre-mitigated libraries for x64/x86 (Latest MSVC)`, since Microsoft has decoupled the MSVC version from the Visual Studio version. The traditional naming format `MSVC v*** - VS YYYY C++ x64/x86 ...` will no longer be applicable to newer MSVC toolchain. See [this blog](https://devblogs.microsoft.com/cppblog/new-release-cadence-and-support-lifecycle-for-msvc-build-tools/) for more details.
 
-If you cannot compile Zed, make sure a Visual Studio installation includes at least the following components:
+If you cannot compile Lin, make sure a Visual Studio installation includes at least the following components:
 
 ```json
 {
@@ -95,7 +95,7 @@ After this, restart the `postgresql` service. Press `Win`+`R` to open the Run di
 
 ## Building from source
 
-Once you have the dependencies installed, you can build Zed using [Cargo](https://doc.rust-lang.org/cargo/).
+Once you have the dependencies installed, you can build Lin using [Cargo](https://doc.rust-lang.org/cargo/).
 
 For a debug build:
 
@@ -115,19 +115,19 @@ And to run the tests:
 cargo test --workspace
 ```
 
-> **Note:** Visual regression tests are currently macOS-only and require Screen Recording permission. See [Building Zed for macOS](./macos.md#visual-regression-tests) for details.
+> **Note:** Visual regression tests are currently macOS-only and require Screen Recording permission. See [Building Lin for macOS](./macos.md#visual-regression-tests) for details.
 
 ## Installing from msys2
 
-Zed does not support unofficial MSYS2 Zed packages built for Mingw-w64. Please report any issues you may have with [mingw-w64-zed](https://packages.msys2.org/base/mingw-w64-zed) to [msys2/MINGW-packages/issues](https://github.com/msys2/MINGW-packages/issues?q=is%3Aissue+is%3Aopen+zed).
+Lin does not support unofficial MSYS2 Lin packages built for Mingw-w64. Please report any issues you may have with [mingw-w64-lin](https://packages.msys2.org/base/mingw-w64-lin) to [msys2/MINGW-packages/issues](https://github.com/msys2/MINGW-packages/issues?q=is%3Aissue+is%3Aopen+lin).
 
-Please refer to [MSYS2 documentation](https://www.msys2.org/docs/ides-editors/#zed) first.
+Please refer to [MSYS2 documentation](https://www.msys2.org/docs/ides-editors/#lin) first.
 
 ## Troubleshooting
 
 ### Setting `RUSTFLAGS` env var breaks builds
 
-If you set the `RUSTFLAGS` env var, it will override the `rustflags` settings in `.cargo/config.toml` which is required to properly build Zed.
+If you set the `RUSTFLAGS` env var, it will override the `rustflags` settings in `.cargo/config.toml` which is required to properly build Lin.
 
 Because these settings change over time, the resulting build errors may vary from linker failures to other hard-to-diagnose errors.
 
@@ -152,13 +152,13 @@ rustflags = [
 ]
 ```
 
-Or, create a new `.cargo/config.toml` in the parent directory of the Zed repo (see below). This is useful in CI because you do not need to edit the repo's original `.cargo/config.toml`.
+Or, create a new `.cargo/config.toml` in the parent directory of the Lin repo (see below). This is useful in CI because you do not need to edit the repo's original `.cargo/config.toml`.
 
 ```
 upper_dir
 ├── .cargo          // <-- Make this folder
 │   └── config.toml // <-- Make this file
-└── zed
+└── lin
     ├── .cargo
     │   └── config.toml
     └── crates
@@ -181,19 +181,19 @@ Try `cargo clean` and `cargo build`.
 
 This error can happen if you are using the "rust-lld.exe" linker. Consider trying a different linker.
 
-If you are using a global config, consider moving the Zed repository to a nested directory and add a `.cargo/config.toml` with a custom linker config in the parent directory.
+If you are using a global config, consider moving the Lin repository to a nested directory and add a `.cargo/config.toml` with a custom linker config in the parent directory.
 
-See this issue for more information [#12041](https://github.com/zed-industries/zed/issues/12041)
+See this issue for more information [#12041](https://github.com/lin-editor/lin/issues/12041)
 
 ### Invalid RC path selected
 
-Sometimes, depending on the security rules applied to your laptop, you may get the following error while compiling Zed:
+Sometimes, depending on the security rules applied to your laptop, you may get the following error while compiling Lin:
 
 ```
-error: failed to run custom build command for `zed(C:\Users\USER\src\zed\crates\zed)`
+error: failed to run custom build command for `lin(C:\Users\USER\src\lin\crates\lin)`
 
 Caused by:
-  process didn't exit successfully: `C:\Users\USER\src\zed\target\debug\build\zed-b24f1e9300107efc\build-script-build` (exit code: 1)
+  process didn't exit successfully: `C:\Users\USER\src\lin\target\debug\build\lin-b24f1e9300107efc\build-script-build` (exit code: 1)
   --- stdout
   cargo:rerun-if-changed=../../.git/logs/HEAD
   cargo:rustc-env=ZED_COMMIT_SHA=25e2e9c6727ba9b77415588cfa11fd969612adb7
@@ -210,14 +210,14 @@ warning: build failed, waiting for other jobs to finish...
 To fix this issue, manually set the `ZED_RC_TOOLKIT_PATH` environment variable to the RC toolkit path. Usually this is:
 `C:\Program Files (x86)\Windows Kits\10\bin\<SDK_version>\x64`.
 
-See this [issue](https://github.com/zed-industries/zed/issues/18393) for more information.
+See this [issue](https://github.com/lin-editor/lin/issues/18393) for more information.
 
 ### Build fails: Path too long
 
 You may receive an error like the following when building
 
 ```
-error: failed to get `pet` as a dependency of package `languages v0.1.0 (D:\a\zed-windows-builds\zed-windows-builds\crates\languages)`
+error: failed to get `pet` as a dependency of package `languages v0.1.0 (D:\a\lin-windows-builds\lin-windows-builds\crates\languages)`
 
 Caused by:
   failed to load source for dependency `pet`
@@ -245,20 +245,20 @@ For more information on this, please see [win32 docs](https://learn.microsoft.co
 
 ### Graphics issues
 
-#### Zed fails to launch
+#### Lin fails to launch
 
-Zed currently uses Vulkan as its graphics API on Windows. If Zed fails to launch, Vulkan is a common cause.
+Lin currently uses Vulkan as its graphics API on Windows. If Lin fails to launch, Vulkan is a common cause.
 
-You can check the Zed log at:
-`C:\Users\YOU\AppData\Local\Zed\logs\Zed.log`
+You can check the Lin log at:
+`C:\Users\YOU\AppData\Local\Lin\logs\Lin.log`
 
 If you see messages like:
 
-- `Zed failed to open a window: NoSupportedDeviceFound`
+- `Lin failed to open a window: NoSupportedDeviceFound`
 - `ERROR_INITIALIZATION_FAILED`
 - `GPU Crashed`
 - `ERROR_SURFACE_LOST_KHR`
 
 Vulkan may not be working correctly on your system. Updating GPU drivers often resolves this.
 
-If there's nothing Vulkan-related in the logs and you happen to have Bandicam installed, try uninstalling it. Zed is currently not compatible with Bandicam.
+If there's nothing Vulkan-related in the logs and you happen to have Bandicam installed, try uninstalling it. Lin is currently not compatible with Bandicam.

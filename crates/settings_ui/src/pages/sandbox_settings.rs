@@ -409,7 +409,7 @@ fn raw_sandbox_lists(cx: &App) -> (Vec<String>, Vec<PathBuf>) {
         .map(|hosts| hosts.0.clone())
         .unwrap_or_default();
     // Display and match on the requested path of each entry (the literal a
-    // hand-edit types); Zed-written "allow always" grants also carry a resolved
+    // hand-edit types); Lin-written "allow always" grants also carry a resolved
     // canonical, but the settings row still keys off the requested path.
     let write_paths = permissions
         .and_then(|permissions| permissions.write_paths.as_ref())

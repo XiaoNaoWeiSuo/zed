@@ -1112,7 +1112,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let forbidden_file = std::env::home_dir()
             .unwrap()
-            .join(".zed-sandbox-forbidden-write-test");
+            .join(".lin-sandbox-forbidden-write-test");
         let _ = std::fs::remove_file(&forbidden_file);
 
         let (program, args, _config_file) = wrap_invocation(

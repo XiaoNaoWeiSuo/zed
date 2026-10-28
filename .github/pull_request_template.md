@@ -12,7 +12,7 @@ How can reviewers test this easily? Include setup and steps.
 ## Self-review
 
 - [ ] I've reviewed my diff for quality, security, reliability, and performance.
-- [ ] UI changes follow the [checklist](https://zed.dev/docs/development/ui-checklist).
+- [ ] UI changes follow the [checklist](./docs/src/development/ui-checklist.md).
 - [ ] Tests cover the new or changed behavior.
 
 Release Notes:

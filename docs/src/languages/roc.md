@@ -1,14 +1,14 @@
 ---
 title: Roc
-description: "Configure Roc language support in Zed, including language servers, formatting, and debugging."
+description: "Configure Roc language support in Lin, including language servers, formatting, and debugging."
 ---
 
 # Roc
 
 [Roc](https://www.roc-lang.org/) is a fast, friendly, functional language.
 
-Roc language support in Zed is provided by the community-maintained [Roc extension](https://github.com/h2000/zed-roc).
-Report issues to: [https://github.com/h2000/zed-roc/issues](https://github.com/h2000/zed-roc/issues)
+Roc language support in Lin is provided by the community-maintained [Roc extension](https://github.com/h2000/lin-roc).
+Report issues to: [https://github.com/h2000/lin-roc/issues](https://github.com/h2000/lin-roc/issues)
 
 - Tree-sitter: [faldor20/tree-sitter-roc](https://github.com/faldor20/tree-sitter-roc)
 - Language Server: [roc-lang/roc/tree/main/src/lsp](https://github.com/roc-lang/roc/tree/main/src/lsp)

@@ -2678,7 +2678,7 @@ mod tests {
         fs.insert_tree(
             "/test",
             json!({
-                ".zed": {
+                ".lin": {
                     "tasks.json": r#"[{"label": "test", "command": "echo"}]"#
                 },
                 "src": {

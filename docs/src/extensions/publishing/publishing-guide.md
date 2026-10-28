@@ -1,6 +1,6 @@
 ---
 title: Publishing Guide
-description: "Submit and update extensions in the Zed Extension Registry."
+description: "Submit and update extensions in the Lin Extension Registry."
 ---
 
 # Publishing Guide {#publishing-your-extension}
@@ -11,7 +11,7 @@ Follow each step carefully to help the publishing process go smoothly.
 
 ## Pull request rules {#pull-request-rules}
 
-To keep the review queue manageable, the following rules apply to every PR against the `zed-industries/extensions` repository:
+To keep the review queue manageable, the following rules apply to every PR against the `lin-editor/extensions` repository:
 
 - Every PR must add or update **exactly one extension**.
 - You may have **at most three open PRs** at any given time.
@@ -21,9 +21,9 @@ PRs that do not adhere to these rules will be closed without further feedback. R
 
 ## Forking and cloning the repo
 
-1. Fork the `zed-industries/extensions` repository.
+1. Fork the `lin-editor/extensions` repository.
 
-> **Note:** It is very helpful if you fork the `zed-industries/extensions` repo to a personal GitHub account instead of a GitHub organization, as this allows Zed staff to push any needed changes to your PR to expedite the publishing process.
+> **Note:** It is very helpful if you fork the `lin-editor/extensions` repo to a personal GitHub account instead of a GitHub organization, as this allows Lin staff to push any needed changes to your PR to expedite the publishing process.
 
 2. Clone the repo to your local machine.
 
@@ -37,7 +37,7 @@ git submodule update
 
 ## Submitting your extension {#submitting-your-extension}
 
-To publish an extension, open a PR to [the `zed-industries/extensions` repo](https://github.com/zed-industries/extensions).
+To publish an extension, open a PR to [the `lin-editor/extensions` repo](https://github.com/lin-editor/extensions).
 
 In your PR, do the following:
 
@@ -47,7 +47,7 @@ In your PR, do the following:
    - The checked out submodule commit must be present on a branch and thus not be a detached commit.
 
 ```sh
-git submodule add https://github.com/your-username/foobar-zed.git extensions/my-extension
+git submodule add https://github.com/your-username/foobar-lin.git extensions/my-extension
 git add extensions/my-extension
 ```
 
@@ -65,13 +65,13 @@ If your extension is in a subdirectory within the submodule, you can use the `pa
 ```toml
 [my-extension]
 submodule = "extensions/my-extension"
-path = "packages/zed"
+path = "packages/lin"
 version = "0.0.1"
 ```
 
 3. Run `pnpm sort-extensions` to ensure `extensions.toml` and `.gitmodules` are sorted.
 
-That's it! Once your PR is accepted and merged, the extension will be packaged and published to the Zed extension registry.
+That's it! Once your PR is accepted and merged, the extension will be packaged and published to the Lin extension registry.
 
 ## Review process {#review-process}
 

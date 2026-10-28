@@ -455,7 +455,7 @@ async fn fetch_remote_for_worktree_base(
 ///
 /// Multiple entries in `git_repos` can be linked worktrees of the *same*
 /// underlying repository (e.g. a project that has both the main checkout and
-/// one of its linked worktrees open as separate Zed worktrees). Those entries
+/// one of its linked worktrees open as separate Lin worktrees). Those entries
 /// resolve to the same target path via [`project::git_store::RepositorySnapshot::path_for_new_linked_worktree`],
 /// so we create the new worktree only once and remap every contributing
 /// work directory onto it. Without this dedup, the second `git worktree add`
@@ -709,7 +709,7 @@ pub fn handle_create_worktree(
 pub struct CreatedWorktreeWorkspace {
     /// The newly opened workspace.
     pub workspace: Entity<Workspace>,
-    /// True when the project contained more than one Zed worktree backed by
+    /// True when the project contained more than one Lin worktree backed by
     /// the same underlying git repository, so they were consolidated into a
     /// single new worktree (they resolve to the same target path). Callers
     /// that care — like the `create_thread` agent tool — can use this to warn
@@ -1065,7 +1065,7 @@ async fn do_create_worktree(
     let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
 
     // Record each created worktree so thread archival can later verify that
-    // Zed created it before deleting it from disk. Failures are non-fatal:
+    // Lin created it before deleting it from disk. Failures are non-fatal:
     // the worktree just won't be eligible for automatic archival.
     for (repo, path) in creation_pairs {
         crate::created_worktrees::record_created_worktree_for_repo(
@@ -1477,7 +1477,7 @@ mod tests {
                     .update_file_based_tasks(
                         TaskSettingsLocation::Worktree(SettingsLocation {
                             worktree_id,
-                            path: rel_path(".zed"),
+                            path: rel_path(".lin"),
                         }),
                         Some(hook_tasks_json),
                     )
@@ -1500,7 +1500,7 @@ mod tests {
             json!({
                 "project": {
                     ".git": {},
-                    ".zed": {
+                    ".lin": {
                         "tasks.json": hook_tasks_json,
                     },
                     "src": {

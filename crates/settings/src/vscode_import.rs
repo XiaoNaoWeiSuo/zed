@@ -102,7 +102,7 @@ impl VsCodeSettings {
     fn read_window_title_format(&self) -> Option<String> {
         self.read_string("window.title")
             .map(|template| translate_vscode_window_title_format(&template))
-            // If every placeholder is dropped during translation, keep Zed's
+            // If every placeholder is dropped during translation, keep Lin's
             // default title behavior instead of importing a template that
             // renders as nothing but whitespace.
             .filter(|template| !template.trim().is_empty())
@@ -1586,7 +1586,7 @@ mod tests {
 
         assert_eq!(imported_title("{}"), None);
 
-        // VS Code variables are translated to their Zed equivalents.
+        // VS Code variables are translated to their Lin equivalents.
         assert_eq!(
             imported_title(
                 r#"{ "window.title": "${rootName} ${activeRepositoryBranchName} ${activeEditorMedium}" }"#,
@@ -1594,21 +1594,21 @@ mod tests {
             Some("${projectName} ${branch} ${relativePath}".to_string())
         );
 
-        // Zed-native variables pass through unchanged.
+        // Lin-native variables pass through unchanged.
         assert_eq!(
             imported_title(r#"{ "window.title": "${projectName}${separator}${filePath}" }"#),
             Some("${projectName}${separator}${filePath}".to_string())
         );
 
         // VS Code's `${remoteName}` is a provider label such as `SSH`, which
-        // doesn't match Zed's connection-name semantics, so it is dropped.
+        // doesn't match Lin's connection-name semantics, so it is dropped.
         assert_eq!(
             imported_title(r#"{ "window.title": "${remoteName}: ${rootName}" }"#),
             Some(": ${projectName}".to_string())
         );
 
         // Templates that translate to nothing but whitespace fall back to
-        // Zed's default title instead of overriding it.
+        // Lin's default title instead of overriding it.
         assert_eq!(
             imported_title(r#"{ "window.title": " ${activeFolderShort} " }"#),
             None

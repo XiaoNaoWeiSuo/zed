@@ -799,7 +799,7 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
                     .into()
             })
             .description(InlineDescription::Text(
-                "To use Zed's agent with Bedrock, set a custom authentication strategy in your settings or use static credentials. Mantle-only models (e.g. GPT-5.5, GPT-5.4, Grok 4.3) additionally require IAM permissions for the `bedrock-mantle` endpoint.".into(),
+                "To use Lin's agent with Bedrock, set a custom authentication strategy in your settings or use static credentials. Mantle-only models (e.g. GPT-5.5, GPT-5.4, Grok 4.3) additionally require IAM permissions for the `bedrock-mantle` endpoint.".into(),
             )),
         ))
     }
@@ -2996,7 +2996,7 @@ impl Render for ConfigurationView {
             .child(Headline::new("Amazon Bedrock").size(HeadlineSize::Small))
             .child(
                 Label::new(
-                    "To use Zed's agent with Bedrock, you can set a custom authentication strategy through your settings file or use static credentials.",
+                    "To use Lin's agent with Bedrock, you can set a custom authentication strategy through your settings file or use static credentials.",
                 )
                 .color(Color::Muted),
             )
@@ -3472,7 +3472,7 @@ mod tests {
             BedrockRequestAuth::ApiKey { api_key } if api_key == "token"
         ));
 
-        // An API key configured in Zed takes precedence over the environment.
+        // An API key configured in Lin takes precedence over the environment.
         provider.state.update(cx, |state, _| {
             state.set_auth(Some(BedrockAuth::ApiKey {
                 api_key: "configured".into(),

@@ -1,6 +1,6 @@
 ---
 title: Extension Publishing Prerequisites
-description: "Review the requirements for publishing an extension to the Zed Extension Registry."
+description: "Review the requirements for publishing an extension to the Lin Extension Registry."
 ---
 
 # Extension Publishing Prerequisites {#extension-publishing-prerequisites}
@@ -11,7 +11,7 @@ Note that maintainers will raise non-compliance during the publishing process. S
 
 ## General Requirements
 
-- Test your extension within Zed manually at the submodule commit you are submitting.
+- Test your extension within Lin manually at the submodule commit you are submitting.
 - Publish functionality that is not already available in the extension registry.
   - If you face issues with an existing extension, first try contributing to the existing extension. See the [FAQ](./faq.md#reporting-issues-and-improvements) for more details on this requirement.
 - Do not misuse the extension API to work around its current limitations.
@@ -20,13 +20,13 @@ Note that maintainers will raise non-compliance during the publishing process. S
 - Use an appropriate ID for your extension. The ID must:
   - be unique
   - be kebab-cased
-  - not include the words `zed` or `extension`
+  - not include the words `lin` or `extension`
   - be a good indicator for what your extension provides (more on this below)
 - Include only the resources your extension needs to function.
 - License your extension under one of the [allowed licenses](./license-requirements.md).
 - Write all user-facing text in English.
-- Do not read or modify anything outside the environment Zed designates for your extension.
-  - Use the [Zed Rust Extension API](https://docs.rs/zed_extension_api/latest/zed_extension_api/) to read and modify the environment.
+- Do not read or modify anything outside the environment Lin designates for your extension.
+  - Use the [Lin Rust Extension API](https://docs.rs/lin_extension_api/latest/lin_extension_api/) to read and modify the environment.
   - Use Rust standard library methods to read and modify the work directory provided to the extension.
   - Ask the user to make any other required changes themselves.
 
@@ -41,12 +41,12 @@ Note that maintainers will raise non-compliance during the publishing process. S
 ## Language Server Extensions
 
 - Should your extension only provide a language server, make sure your extension ID reflects that (e.g., by suffixing it with `-language-server` or `-lsp`).
-- Do not bundle a language server with the extension. Download it or check for it in the user's environment through the [Zed Rust Extension API](https://docs.rs/zed_extension_api/latest/zed_extension_api/).
+- Do not bundle a language server with the extension. Download it or check for it in the user's environment through the [Lin Rust Extension API](https://docs.rs/lin_extension_api/latest/lin_extension_api/).
 
 ## Debugger Extensions
 
 - Should your extension only provide a debugger, make sure your extension ID reflects that (e.g., by suffixing it with `-debugger`).
-- Do not bundle the debug adapter with the extension. Download it or check for it in the user's environment through the [Zed Rust Extension API](https://docs.rs/zed_extension_api/latest/zed_extension_api/).
+- Do not bundle the debug adapter with the extension. Download it or check for it in the user's environment through the [Lin Rust Extension API](https://docs.rs/lin_extension_api/latest/lin_extension_api/).
 
 ## Theme Extensions
 
@@ -65,15 +65,15 @@ Note that maintainers will raise non-compliance during the publishing process. S
 
 ## MCP Server Extensions
 
-> MCP server extensions will be deprecated in favor of the MCP registry in the future; progress for this is tracked in [#59351](https://github.com/zed-industries/zed/issues/59351). Please make sure to also publish your server to the registry to ensure it can be used with future versions of Zed.
+> MCP server extensions will be deprecated in favor of the MCP registry in the future; progress for this is tracked in [#59351](https://github.com/lin-editor/lin/issues/59351). Please make sure to also publish your server to the registry to ensure it can be used with future versions of Lin.
 
 - Only provide one MCP server and nothing else.
 - Make sure your extension ID indicates it is an MCP server (e.g., by prefixing it with `mcp-server-` or suffixing it with `-mcp-server`).
-- Do not bundle the MCP server with the extension. Download it or check for it in the user's environment through the [Zed Rust Extension API](https://docs.rs/zed_extension_api/latest/zed_extension_api/).
+- Do not bundle the MCP server with the extension. Download it or check for it in the user's environment through the [Lin Rust Extension API](https://docs.rs/lin_extension_api/latest/lin_extension_api/).
 
 ## Agent Server and Slash Command Extensions
 
-Agent server and slash command extensions have been deprecated and submissions will no longer be accepted. If you intend on making an agent server available within Zed, publish it to the [ACP Registry](https://agentclientprotocol.com/registry) instead.
+Agent server and slash command extensions have been deprecated and submissions will no longer be accepted. If you intend on making an agent server available within Lin, publish it to the [ACP Registry](https://agentclientprotocol.com/registry) instead.
 
 ---
 

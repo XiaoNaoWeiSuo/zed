@@ -1293,7 +1293,7 @@ async fn npm_command_directory(
     }
 
     // npm checks the local prefix's devEngines even for package queries in some versions.
-    // Pin both the prefix and cwd so Zed's tooling does not inherit a project's requirements.
+    // Pin both the prefix and cwd so Lin's tooling does not inherit a project's requirements.
     let directory = runtime_directory.join("npm-work");
     fs::create_dir_all(&directory)
         .await

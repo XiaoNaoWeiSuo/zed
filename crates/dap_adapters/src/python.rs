@@ -156,7 +156,7 @@ impl PythonDebugAdapter {
 
         let mut configuration = task_definition.config.clone();
         if let Some(object) = configuration.as_object_mut() {
-            // Use built-in Zed terminal if user did not explicitly provide a setting for console.
+            // Use built-in Lin terminal if user did not explicitly provide a setting for console.
             let console = object.entry("console").or_insert(Value::Null);
             if console.is_null() {
                 *console = Value::String("integratedTerminal".into());
@@ -919,7 +919,7 @@ impl DebugAdapter for PythonDebugAdapter {
             })
             .chain(
                 // While Debugpy's wiki saids absolute paths are required, but it actually supports relative paths when cwd is passed in.
-                // (Which should always be the case because Zed defaults to the cwd worktree root)
+                // (Which should always be the case because Lin defaults to the cwd worktree root)
                 // So we want to check that these relative paths find toolchains as well. Otherwise, they won't be checked
                 // because the strip prefix in the iteration above will return an error
                 config
@@ -1233,7 +1233,7 @@ mod tests {
         fs.insert_tree(
             "/project",
             serde_json::json!({
-                // .env file suggests VS Code, but the explicit config overrides it with Zed
+                // .env file suggests VS Code, but the explicit config overrides it with Lin
                 ".env": "IDE=vscode\nLLM=openai\n"
             }),
         )

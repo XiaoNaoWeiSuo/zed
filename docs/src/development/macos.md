@@ -1,13 +1,13 @@
 ---
-title: Building Zed for macOS
-description: "Guide to building zed for macos for Zed development."
+title: Building Lin for macOS
+description: "Guide to building lin for macos for Lin development."
 ---
 
-# Building Zed for macOS
+# Building Lin for macOS
 
 ## Repository
 
-Clone the [Zed repository](https://github.com/zed-industries/zed).
+Clone the [Lin repository](https://github.com/lin-editor/lin).
 
 ## Dependencies
 
@@ -39,9 +39,9 @@ Clone the [Zed repository](https://github.com/zed-industries/zed).
 Release bundling with `script/bundle-mac` requires the macOS 26 SDK or newer, provided by Xcode 26 or newer.
 The bundled app requires macOS 12.0 (Monterey) or later.
 
-## Building Zed from Source
+## Building Lin from Source
 
-Once you have the dependencies installed, you can build Zed using [Cargo](https://doc.rust-lang.org/cargo/).
+Once you have the dependencies installed, you can build Lin using [Cargo](https://doc.rust-lang.org/cargo/).
 
 For a debug build:
 
@@ -63,7 +63,7 @@ cargo test --workspace
 
 ## Visual Regression Tests
 
-Zed includes visual regression tests that capture screenshots of real Zed windows and compare them against baseline images. These tests require macOS with Screen Recording permission.
+Lin includes visual regression tests that capture screenshots of real Lin windows and compare them against baseline images. These tests require macOS with Screen Recording permission.
 
 ### Prerequisites
 
@@ -77,12 +77,12 @@ You must grant Screen Recording permission to your terminal:
 ### Running Visual Tests
 
 ```sh
-cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+cargo run -p lin --bin lin_visual_test_runner --features visual-tests
 ```
 
 ### Baseline Images
 
-Baseline images are stored in `crates/zed/test_fixtures/visual_tests/` but are
+Baseline images are stored in `crates/lin/test_fixtures/visual_tests/` but are
 **gitignored** to avoid bloating the repository. You must generate them locally
 before running tests.
 
@@ -92,7 +92,7 @@ Before making any UI changes, generate baseline images from a known-good state:
 
 ```sh
 git checkout origin/main
-UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+UPDATE_BASELINE=1 cargo run -p lin --bin lin_visual_test_runner --features visual-tests
 git checkout -
 ```
 
@@ -103,7 +103,7 @@ This creates baselines that reflect the current expected UI.
 When UI changes are intentional, update the baseline images after your changes:
 
 ```sh
-UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+UPDATE_BASELINE=1 cargo run -p lin --bin lin_visual_test_runner --features visual-tests
 ```
 
 > **Note:** In the future, baselines may be stored externally. For now, they
@@ -111,34 +111,34 @@ UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visua
 
 ## Sampling released builds
 
-How to get a symbolicated CPU profile from a released (non-dev) Zed instance.
-Use this when Zed is using a lot of CPU.
+How to get a symbolicated CPU profile from a released (non-dev) Lin instance.
+Use this when Lin is using a lot of CPU.
 
 Released macOS binaries are stripped of local symbols, so `sample` and Instruments show raw addresses for most frames.
-The debug symbols for every release are archived: `script/bundle-mac` uploads `zed.dwarf` to Sentry before stripping.
+The debug symbols for every release are archived: `script/bundle-mac` uploads `lin.dwarf` to Sentry before stripping.
 
 ### During the incident
 
-- Run `sample Zed 10 -f zed-sample.txt` (adjust the process name for Preview or Nightly).
-- Get the exact build: type {#action zed::About} in the command palette and copy the version and commit.
+- Run `sample Lin 10 -f lin-sample.txt` (adjust the process name for Preview or Nightly).
+- Get the exact build: type {#action lin::About} in the command palette and copy the version and commit.
 
-The `zed-sample.txt` file can be sent to Zed together with the exact version.
+The `lin-sample.txt` file can be sent to Lin together with the exact version.
 
 ### Later
 
-This can be done by Zed staff.
+This can be done by Lin staff.
 
 - Find the binary UUID in the `Binary Images` section at the bottom of the sample output.
-- Download the matching `zed.dwarf` from the Sentry project's Debug Files page by searching for that UUID.
+- Download the matching `lin.dwarf` from the Sentry project's Debug Files page by searching for that UUID.
 - Resolve the addresses:
-  `atos -o zed.dwarf -l <load address> <address...>`
+  `atos -o lin.dwarf -l <load address> <address...>`
   Each unresolved frame in the sample output prints its `load address` and absolute address.
 
-To profile a released build on your own machine with full symbols, download the matching `zed.dwarf`, convert it into a `.dSYM` bundle Spotlight can index, and re-run `sample`:
+To profile a released build on your own machine with full symbols, download the matching `lin.dwarf`, convert it into a `.dSYM` bundle Spotlight can index, and re-run `sample`:
 
 ```sh
-mkdir -p Zed.dSYM/Contents/Resources/DWARF
-cp zed.dwarf Zed.dSYM/Contents/Resources/DWARF/zed
+mkdir -p Lin.dSYM/Contents/Resources/DWARF
+cp lin.dwarf Lin.dSYM/Contents/Resources/DWARF/lin
 ```
 
 Frames then resolve automatically, including file and line information.
@@ -148,7 +148,7 @@ Frames then resolve automatically, including file and line information.
 ### Error compiling metal shaders
 
 ```sh
-error: failed to run custom build command for gpui v0.1.0 (/Users/path/to/zed)`**
+error: failed to run custom build command for gpui v0.1.0 (/Users/path/to/lin)`**
 
 xcrun: error: unable to find utility "metal", not a developer tool or in PATH
 ```
@@ -212,18 +212,18 @@ This error seems to be caused by OS resource constraints. Installing and running
 
 ### Avoiding continual rebuilds
 
-If Zed continually rebuilds root crates, you may be opening the Zed codebase itself in your development build.
+If Lin continually rebuilds root crates, you may be opening the Lin codebase itself in your development build.
 
 This causes problems because `cargo run` exports a bunch of environment
 variables which are picked up by the `rust-analyzer` that runs in the development
-build of Zed. These environment variables are in turn passed to `cargo check`, which
+build of Lin. These environment variables are in turn passed to `cargo check`, which
 invalidates the build cache of some of the crates we depend on.
 
 To avoid this, run the built binary against a different project, for example `cargo run ~/path/to/other/project`.
 
 ### Speeding up verification
 
-If you build Zed frequently, macOS may keep verifying new builds, which can add a few seconds to each iteration.
+If you build Lin frequently, macOS may keep verifying new builds, which can add a few seconds to each iteration.
 
 To fix this, you can:
 

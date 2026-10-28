@@ -82,7 +82,6 @@
       "ctrl-space": "editor::ShowCompletions",
       "ctrl-q": "editor::Hover",
       "ctrl-p": "editor::ShowSignatureHelp",
-      "ctrl-\\": "assistant::InlineAssist",
       "ctrl-alt-h": "call_hierarchy::ShowIncomingCalls",
     },
   },

@@ -504,7 +504,7 @@ mod tests {
         fs.insert_tree(
             worktree_root,
             json!({
-                ".zed": {
+                ".lin": {
                     "tasks.json": "[]",
                 },
                 "scenes": {
@@ -550,7 +550,7 @@ mod tests {
         fs.insert_tree(
             path!("/dir"),
             json!({
-                ".zed": {
+                ".lin": {
                     "tasks.json": r#"[
                             {
                                 "label": "example task",

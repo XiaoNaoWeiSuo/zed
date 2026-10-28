@@ -80,7 +80,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
-    /// Whether Zed advertised the subagents RFD, so the agent reports subagents with it.
+    /// Whether Lin advertised the subagents RFD, so the agent reports subagents with it.
     accepts_subagent_updates: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
@@ -479,7 +479,7 @@ fn client_builder(
         )
 }
 
-/// `offer_subagents` advertises the unstable subagents RFD, which Zed only offers v1 agents
+/// `offer_subagents` advertises the unstable subagents RFD, which Lin only offers v1 agents
 /// behind the `acp-beta` flag.
 fn client_capabilities_for_agent(
     agent_id: &AgentId,
@@ -7154,7 +7154,7 @@ mod tests {
             ),
         });
         // Like claude-agent-acp, this agent reports a subagent while it works on a prompt.
-        // It sends the announcement whatever Zed advertised, so the test also covers Zed
+        // It sends the announcement whatever Lin advertised, so the test also covers Lin
         // ignoring subagent updates it did not ask for.
         let script = format!(
             r#"

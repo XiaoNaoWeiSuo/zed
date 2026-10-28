@@ -1318,7 +1318,7 @@ impl OsWatcher {
         if backend.is_none() {
             *backend = Some(match self.kind {
                 OsWatcherKind::Native => {
-                    // CORE excludes Access events, which Zed discards anyway. Without this,
+                    // CORE excludes Access events, which Lin discards anyway. Without this,
                     // the default mask subscribes to inotify OPEN/CLOSE_* on Linux, so every
                     // file read in a watched directory would queue events, increasing the
                     // risk of queue overflows (and thus full rescans) under read-heavy

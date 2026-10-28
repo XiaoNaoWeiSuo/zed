@@ -1,11 +1,11 @@
 ---
 title: Emmet
-description: "Configure Emmet language support in Zed, including language servers, formatting, and debugging."
+description: "Configure Emmet language support in Lin, including language servers, formatting, and debugging."
 ---
 
 # Emmet
 
-Emmet support is available through the [Emmet extension](https://github.com/zed-extensions/emmet).
+Emmet support is available through the [Emmet extension](https://github.com/lin-extensions/emmet).
 
 [Emmet](https://emmet.io/) is a web-developer’s toolkit that can greatly improve your HTML & CSS workflow.
 
@@ -45,5 +45,5 @@ The action has no default keybinding. To add one, bind it in your keymap:
 ```
 
 <!--
-TBD: Document Emmet usage in zed with: HTML, PHP, ERB, Javascript, TSX, CSS
+TBD: Document Emmet usage in lin with: HTML, PHP, ERB, Javascript, TSX, CSS
 -->

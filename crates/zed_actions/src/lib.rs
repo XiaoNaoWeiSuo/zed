@@ -20,7 +20,7 @@ pub struct OpenBrowser {
     pub url: Arc<str>,
 }
 
-/// Opens a zed:// URL within the application.
+/// Opens a lin:// URL within the application.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = zed)]
 #[serde(deny_unknown_fields)]
@@ -65,15 +65,15 @@ actions!(
         OpenServerSettings,
         /// Quits the application.
         Quit,
-        /// Shows information about Zed.
+        /// Shows information about Lin.
         About,
         /// Opens the documentation website.
         OpenDocs,
         /// Views open source licenses.
         OpenLicenses,
-        /// Opens the Zed status page.
+        /// Opens the Lin status page.
         OpenStatusPage,
-        /// Opens the Zed merch store.
+        /// Opens the Lin merch store.
         GetMerch,
         /// Opens the telemetry log.
         OpenTelemetryLog,
@@ -321,7 +321,7 @@ pub enum NewWorktreeBranchTarget {
 #[action(namespace = git)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorktree {
-    /// When this is None, Zed will randomly generate a worktree name.
+    /// When this is None, Lin will randomly generate a worktree name.
     pub worktree_name: Option<String>,
     pub branch_target: NewWorktreeBranchTarget,
 }
@@ -429,22 +429,6 @@ pub mod project_panel {
         ]
     );
 }
-pub mod feedback {
-    use gpui::actions;
-
-    actions!(
-        feedback,
-        [
-            /// Opens email client to send feedback to Zed support.
-            EmailZed,
-            /// Opens the bug report form.
-            FileBugReport,
-            /// Opens the feature request form.
-            RequestFeature
-        ]
-    );
-}
-
 pub mod theme {
     use gpui::actions;
 
@@ -807,7 +791,7 @@ pub mod outline {
 actions!(
     zed_predict_onboarding,
     [
-        /// Opens the Zed Predict onboarding modal.
+        /// Opens the Lin Predict onboarding modal.
         OpenZedPredictOnboarding
     ]
 );

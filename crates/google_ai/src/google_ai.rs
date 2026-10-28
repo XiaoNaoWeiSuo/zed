@@ -16,7 +16,7 @@ pub mod completion;
 // Google's model catalog reports token limits and whether a model thinks, but not the facts
 // below. Update these lists when Google releases or retires models.
 
-/// Catalog entries Zed doesn't offer: models that produce media or serve specialized APIs,
+/// Catalog entries Lin doesn't offer: models that produce media or serve specialized APIs,
 /// and `-latest` aliases, which silently retarget to models already listed by version.
 ///
 /// Matched by ID segment so that new versions of these families stay excluded.
@@ -76,7 +76,7 @@ fn supports_minimal_thinking(model_id: &str) -> bool {
     )
 }
 
-/// The thinking level Zed selects for a level-based model until the user picks another.
+/// The thinking level Lin selects for a level-based model until the user picks another.
 fn default_thinking_level(model_id: &str) -> ThinkingLevel {
     match model_id {
         "gemini-3.5-flash-lite" => ThinkingLevel::Minimal,
@@ -100,7 +100,7 @@ pub(crate) fn lowest_thinking_level(model_id: &str) -> Option<ThinkingLevel> {
 /// Whether the ID has a version after `gemini-`, as in `gemini-3.1-pro-preview`.
 ///
 /// Every Gemini text model is versioned. Unversioned IDs such as `gemini-flash-latest` or
-/// `gemini-nano-banana-2.1` are aliases or other model families, so Zed doesn't offer them.
+/// `gemini-nano-banana-2.1` are aliases or other model families, so Lin doesn't offer them.
 fn is_versioned_model(model_id: &str) -> bool {
     model_id
         .strip_prefix("gemini-")
@@ -873,7 +873,7 @@ impl<'de> Deserialize<'de> for ModelName {
     }
 }
 
-/// A Gemini model and the request settings Zed uses for it.
+/// A Gemini model and the request settings Lin uses for it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     pub id: String,
@@ -887,7 +887,7 @@ pub struct Model {
 }
 
 impl Model {
-    /// Builds a model from a catalog entry, or `None` if Zed doesn't offer it.
+    /// Builds a model from a catalog entry, or `None` if Lin doesn't offer it.
     fn from_listed(entry: ListModelEntry) -> Option<Self> {
         let id = entry.name.strip_prefix("models/")?;
         let generates_content = entry

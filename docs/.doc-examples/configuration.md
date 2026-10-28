@@ -14,25 +14,25 @@
 
 ---
 
-title: Configuring Zed - Settings and Preferences
-description: Configure Zed with the Settings Editor, JSON files, and project-specific overrides. Covers all settings options.
+title: Configuring Lin - Settings and Preferences
+description: Configure Lin with the Settings Editor, JSON files, and project-specific overrides. Covers all settings options.
 
 ---
 
-# Configuring Zed
+# Configuring Lin
 
-This guide explains how Zed's settings system works, including the Settings Editor, JSON configuration files, and project-specific settings.
+This guide explains how Lin's settings system works, including the Settings Editor, JSON configuration files, and project-specific settings.
 
 For visual customization (themes, fonts, icons), see [Appearance](./appearance.md).
 
 ## Settings Editor {#settings-editor}
 
-The **Settings Editor** ({#kb zed::OpenSettings}) is the primary way to configure Zed. It provides a searchable interface where you can browse available settings, see their current values, and make changes.
+The **Settings Editor** ({#kb lin::OpenSettings}) is the primary way to configure Lin. It provides a searchable interface where you can browse available settings, see their current values, and make changes.
 
 To open it:
 
-- Press {#kb zed::OpenSettings}
-- Or run {#action zed::OpenSettings} from the command palette
+- Press {#kb lin::OpenSettings}
+- Or run {#action lin::OpenSettings} from the command palette
 
 As you type in the search box, matching settings appear with descriptions and controls to modify them. Changes save automatically to your settings file.
 
@@ -42,28 +42,28 @@ As you type in the search box, matching settings appear with descriptions and co
 
 ### User Settings {#user-settings}
 
-Your user settings apply globally across all projects. Open the file with {#kb zed::OpenSettingsFile} or run {#action zed::OpenSettingsFile} from the command palette.
+Your user settings apply globally across all projects. Open the file with {#kb lin::OpenSettingsFile} or run {#action lin::OpenSettingsFile} from the command palette.
 
 The file is located at:
 
-- macOS: `~/.config/zed/settings.json`
-- Linux: `~/.config/zed/settings.json` (or `$XDG_CONFIG_HOME/zed/settings.json`)
-- Windows: `%APPDATA%\Zed\settings.json`
+- macOS: `~/.config/lin/settings.json`
+- Linux: `~/.config/lin/settings.json` (or `$XDG_CONFIG_HOME/lin/settings.json`)
+- Windows: `%APPDATA%\Lin\settings.json`
 
 The syntax is JSON with support for `//` comments.
 
 ### Default Settings {#default-settings}
 
-To see all available settings with their default values, run {#action zed::OpenDefaultSettings} from the command palette. This opens a read-only reference you can use when editing your own settings.
+To see all available settings with their default values, run {#action lin::OpenDefaultSettings} from the command palette. This opens a read-only reference you can use when editing your own settings.
 
 ### Project Settings {#project-settings}
 
-Override user settings for a specific project by creating a `.zed/settings.json` file in your project root. Run {#action zed::OpenProjectSettings} to create this file.
+Override user settings for a specific project by creating a `.lin/settings.json` file in your project root. Run {#action lin::OpenProjectSettings} to create this file.
 
 Project settings take precedence over user settings for that project only.
 
 ```json [settings]
-// .zed/settings.json
+// .lin/settings.json
 {
   "tab_size": 2,
   "formatter": "prettier",
@@ -79,7 +79,7 @@ You can also add settings files in subdirectories for more granular control.
 
 Settings are applied in layers:
 
-1. **Default settings** — Zed's built-in defaults
+1. **Default settings** — Lin's built-in defaults
 2. **User settings** — Your global preferences
 3. **Project settings** — Project-specific overrides
 
@@ -113,12 +113,12 @@ Changes made in the Settings Editor apply across all channels.
 
 ## Settings Deep Links {#deep-links}
 
-Zed supports deep links that open specific settings directly:
+Lin supports deep links that open specific settings directly:
 
 ```
-zed://settings/theme
-zed://settings/vim_mode
-zed://settings/buffer_font_size
+lin://settings/theme
+lin://settings/vim_mode
+lin://settings/buffer_font_size
 ```
 
 These are useful for sharing configuration tips or linking from documentation.

@@ -990,7 +990,7 @@ pub(crate) fn frame_sample_is_valid(id: WindowId, start: Instant) -> bool {
 // WindowProfiler are bare begin/end call pairs rather than uses of this
 // guard. A caught unwind between a pair leaves `turn_depth` (and potentially
 // the runnable counter) permanently unbalanced, which silently disables
-// idle boundaries for the rest of the process. Zed aborts on panics so
+// idle boundaries for the rest of the process. Lin aborts on panics so
 // this is latent today, but gpui-as-a-library callers may catch unwinds;
 // route all bracketing through this guard.
 pub(crate) struct ForegroundTurnGuard;

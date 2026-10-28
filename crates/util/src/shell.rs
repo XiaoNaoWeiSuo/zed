@@ -782,7 +782,7 @@ mod tests {
     // WSL
     // wsl.exe --distribution NixOS --cd /home/user -- /usr/bin/zsh -c "echo hello"
     // wsl.exe --distribution NixOS --cd /home/user -- /usr/bin/zsh -c "\"echo hello\"" | grep hello"
-    // wsl.exe --distribution NixOS --cd ~ env RUST_LOG=info,remote=debug .zed_wsl_server/zed-remote-server-dev-build proxy --identifier dev-workspace-53
+    // wsl.exe --distribution NixOS --cd ~ env RUST_LOG=info,remote=debug .lin_wsl_server/zed-remote-server-dev-build proxy --identifier dev-workspace-53
     // PowerShell from Nushell
     // nu -c overlay use "C:\Users\kubko\dev\python\39007\tests\.venv\Scripts\activate.nu"; ^"C:\Program Files\PowerShell\7\pwsh.exe" -C "C:\Users\kubko\dev\python\39007\tests\.venv\Scripts\python.exe -m pytest \"test_foo.py::test_foo\""
     // PowerShell from CMD
@@ -1052,9 +1052,9 @@ mod tests {
         );
         assert_eq!(
             shell_kind
-                .try_quote("/home/a^b/.zed_server/server")
+                .try_quote("/home/a^b/.lin_server/server")
                 .unwrap(),
-            "'/home/a^b/.zed_server/server'"
+            "'/home/a^b/.lin_server/server'"
         );
         assert_eq!(
             shell_kind.try_quote("$env.HOME (1 + 1) `id` a\\b").unwrap(),
@@ -1097,7 +1097,7 @@ mod tests {
             "a=b",
             "--flag=a/b.c",
             "1..3",
-            "/home/a^b/.zed_server/server",
+            "/home/a^b/.lin_server/server",
             "钥匙🔑",
             "",
         ];

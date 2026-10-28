@@ -49,7 +49,7 @@ The only exception are the ID restrictions: since an extension's ID cannot chang
 
 ## Do I have to maintain my extension? {#do-i-have-to-maintain-my-extension}
 
-No. After your extension has been published, there are no further requirements from our side. Thank you for enriching the Zed extension collection, we really appreciate it!
+No. After your extension has been published, there are no further requirements from our side. Thank you for enriching the Lin extension collection, we really appreciate it!
 
 That said, no extension is perfect on day one - bugs may surface and improvement requests may come in. While maintenance is never required, it helps everyone if you respond to those reports within a reasonable timeframe.
 
@@ -64,7 +64,7 @@ If the owner does not respond for an extended period of time, see [What happens 
 Completely fine - priorities change, and stepping back from an extension is nothing to feel bad about. As the current owner, you can:
 
 - transfer ownership of the repository to a new owner, or
-- open an issue or pull request against [`zed-industries/extensions`](https://github.com/zed-industries/extensions) asking for the removal of your extension.
+- open an issue or pull request against [`lin-editor/extensions`](https://github.com/lin-editor/extensions) asking for the removal of your extension.
 
 Note that you may also just keep your extension around - many extensions have received few to no updates and yet have many happy users.
 
@@ -73,7 +73,7 @@ Note that you may also just keep your extension around - many extensions have re
 We don't want published extensions to go stale, since that leaves their users with a poor experience. So if an extension owner can no longer be reached:
 
 - a contributor may fork the extension and propose their fork as a replacement for the current extension, or
-- Zed staff can fork the extension into the [`zed-extensions`](https://github.com/zed-extensions) organization, where maintenance continues as a joint effort of the community and Zed staff.
+- Lin staff can fork the extension into the [`lin-extensions`](https://github.com/lin-extensions) organization, where maintenance continues as a joint effort of the community and Lin staff.
 
 We will only take either action if one of the following requirements is met:
 
@@ -94,4 +94,4 @@ First of all, thank you for reading through these!
 
 While all of these policies were added with good reason, not all of them are entirely set in stone - we value open discussion around all of this.
 
-If anything here seems off to you or you have questions, feel free to open a discussion in the [`zed-industries/zed`](https://github.com/zed-industries/zed) repository and ping @MrSubidubi there - we would much rather talk it through than leave you frustrated.
+If anything here seems off to you or you have questions, feel free to open a discussion in the [`lin-editor/lin`](https://github.com/lin-editor/lin) repository and ping @MrSubidubi there - we would much rather talk it through than leave you frustrated.

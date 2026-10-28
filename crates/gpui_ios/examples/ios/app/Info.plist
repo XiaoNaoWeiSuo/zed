@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>gpui_ios_example</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.zed.gpui-ios-example</string>
+	<string>dev.lin.gpui-ios-example</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

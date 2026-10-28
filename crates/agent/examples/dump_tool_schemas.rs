@@ -1,4 +1,4 @@
-//! Zed built-in tool schema dump.
+//! Lin built-in tool schema dump.
 //!
 //! This example serializes the same normalized built-in tool definitions used
 //! to construct language model requests.

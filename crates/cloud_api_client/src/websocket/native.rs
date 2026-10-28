@@ -82,7 +82,7 @@ impl CloudApiClient {
         let authorization_header = format!("{} {}", credentials.user_id, credentials.access_token);
 
         Ok(gpui_tokio::Tokio::spawn_result(cx, async move {
-            // Use the same TLS configuration as the rest of Zed (the platform
+            // Use the same TLS configuration as the rest of Lin (the platform
             // certificate verifier), instead of yawc's default connector which only
             // trusts the bundled webpki roots and ignores the system trust store.
             let tls_connector = TlsConnector::from(Arc::new(http_client_tls::tls_config()));

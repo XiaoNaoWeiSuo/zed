@@ -4,7 +4,7 @@
 //! relative, normalized, and valid unicode. Internally stored in POSIX (`/`-delimited)
 //! format regardless of host platform.
 //!
-//! Adapted from Zed's `util::rel_path` module.
+//! Adapted from Lin's `util::rel_path` module.
 
 #[cfg(windows)]
 use anyhow::Context;

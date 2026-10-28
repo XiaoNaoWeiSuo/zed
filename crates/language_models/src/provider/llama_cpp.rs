@@ -1209,7 +1209,7 @@ impl ConfigurationView {
                     )
                     .child(
                         ListBulletItem::new(
-                            "Click 'Connect' below to start using llama.cpp in Zed",
+                            "Click 'Connect' below to start using llama.cpp in Lin",
                         )
                         .label_color(Color::Muted),
                     ),

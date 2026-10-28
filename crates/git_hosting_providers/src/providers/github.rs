@@ -606,7 +606,7 @@ mod tests {
             "https://github.com/zed-industries/zed/pull/new/feature%2Fnew-feature"
         );
 
-        let base_url = Url::parse("https://github.zed.com").unwrap();
+        let base_url = Url::parse("https://github.lin.com").unwrap();
         let github = Github::new("GitHub Self-Hosted", base_url);
         let url = github
             .build_create_pull_request_url(&remote, "feature/new-feature")
@@ -614,7 +614,7 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://github.zed.com/zed-industries/zed/pull/new/feature%2Fnew-feature"
+            "https://github.lin.com/zed-industries/zed/pull/new/feature%2Fnew-feature"
         );
     }
 

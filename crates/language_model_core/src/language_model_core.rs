@@ -111,12 +111,12 @@ impl LanguageModelCompletionEvent {
 /// Normalized semantic classification of a provider-originated rejection.
 ///
 /// Each language model provider reports failures with its own wire format
-/// (Anthropic's `error.type` strings, OpenRouter's numeric codes, Zed cloud's
+/// (Anthropic's `error.type` strings, OpenRouter's numeric codes, Lin cloud's
 /// `upstream_http_*` codes, ...). Callers that need to react to a rejection's
 /// meaning — deciding whether to retry, which message to show — shouldn't
 /// have to match on every provider's raw vocabulary. Wire-level parsing stays
 /// local to each provider crate, but is mapped once into this shared
-/// category so the rest of Zed only needs to understand one vocabulary.
+/// category so the rest of Lin only needs to understand one vocabulary.
 ///
 /// A category does not replace `ProviderRejection`'s `status`, `code`, and
 /// `message` fields: those are always preserved verbatim alongside it so a
@@ -201,7 +201,7 @@ pub enum LanguageModelCompletionError {
     #[error("missing {provider} API key")]
     NoApiKey { provider: LanguageModelProviderName },
     /// A rejection reported by the language model provider itself, as
-    /// opposed to a transport or plumbing failure on Zed's side.
+    /// opposed to a transport or plumbing failure on Lin's side.
     ///
     /// `status` and `code` are preserved verbatim from the provider's
     /// response even when `category` already gives them a known meaning, so

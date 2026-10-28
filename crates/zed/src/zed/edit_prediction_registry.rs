@@ -114,9 +114,7 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
     match provider {
         EditPredictionProvider::None => None,
         EditPredictionProvider::Copilot => Some(EditPredictionProviderConfig::Copilot),
-        EditPredictionProvider::Zed => {
-            Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
-        }
+        EditPredictionProvider::Zed => None,
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
             let custom_settings = if provider == EditPredictionProvider::Ollama {
@@ -409,7 +407,7 @@ mod tests {
         });
 
         // Override the default provider to None so the subscribe closure
-        // captures None at init time. (The test default is Zed/Zeta1, which
+        // captures None at init time. (The test default is Lin/Zeta1, which
         // is a no-op on project-less editors and would mask the bug.)
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store: &mut SettingsStore, cx| {

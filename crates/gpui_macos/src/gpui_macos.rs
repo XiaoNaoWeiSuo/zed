@@ -44,6 +44,27 @@ pub(crate) use window::*;
 
 pub use platform::MacPlatform;
 
+/// Sets the Dock icon for the running application.
+///
+/// macOS only uses the bundle icon for bundled apps; this also gives unbundled
+/// development builds a visible icon.
+pub fn set_application_icon(png: &[u8]) {
+    use objc2::{class, msg_send};
+
+    unsafe {
+        let data: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: png.as_ptr() as *const std::ffi::c_void,
+            length: png.len()
+        ];
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: data];
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, setApplicationIconImage: image];
+        let _: () = msg_send![image, release];
+    }
+}
+
 trait BoolExt {
     fn to_objc(self) -> Bool;
 }

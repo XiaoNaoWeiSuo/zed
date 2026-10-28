@@ -1,6 +1,6 @@
 ---
-title: Project Panel - Zed
-description: Navigate workspace files and directories with Zed's project panel. Create, rename, trash and delete files and directories.
+title: Project Panel - Lin
+description: Navigate workspace files and directories with Lin's project panel. Create, rename, trash and delete files and directories.
 ---
 
 # Project Panel
@@ -10,7 +10,7 @@ Toggle it with {#action project_panel::ToggleFocus} ({#kb
 project_panel::ToggleFocus}), or click the **Project Panel** button in the
 status bar.
 
-![Project Panel](https://images.zed.dev/docs/project-panel/panel.png)
+![Project Panel](https://images.lin.dev/docs/project-panel/panel.png)
 
 ## Navigating
 
@@ -40,9 +40,9 @@ disabled with the `project_panel.auto_reveal_entries` setting.
 When `project_panel.sticky_scroll` is enabled (the default), ancestor directories pin themselves to the top
 of the panel as you scroll, so you always know which directory you're on.
 
-![Project Panel: Sticky Scroll Enabled](https://images.zed.dev/docs/project-panel/sticky-scroll-true.png)
+![Project Panel: Sticky Scroll Enabled](https://images.lin.dev/docs/project-panel/sticky-scroll-true.png)
 
-![Project Panel: Sticky Scroll Disabled](https://images.zed.dev/docs/project-panel/sticky-scroll-false.png)
+![Project Panel: Sticky Scroll Disabled](https://images.lin.dev/docs/project-panel/sticky-scroll-false.png)
 
 ### Directory Folding
 
@@ -52,9 +52,9 @@ single child directory are collapsed into one row (for example,
 directory and choose **Unfold Directory** to expand the chain, or **Fold
 Directory** to collapse it again.
 
-![Project Panel: Auto Fold Directories Enabled](https://images.zed.dev/docs/project-panel/auto-fold-dirs-true.png)
+![Project Panel: Auto Fold Directories Enabled](https://images.lin.dev/docs/project-panel/auto-fold-dirs-true.png)
 
-![Project Panel: Auto Fold Directories Disabled](https://images.zed.dev/docs/project-panel/auto-fold-dirs-false.png)
+![Project Panel: Auto Fold Directories Disabled](https://images.lin.dev/docs/project-panel/auto-fold-dirs-false.png)
 
 ## Selecting Multiple Entries
 
@@ -65,7 +65,7 @@ set of marked entries.
 When exactly two files are marked, {#action project_panel::CompareMarkedFiles}
 ({#kb project_panel::CompareMarkedFiles}) opens a diff view comparing them.
 
-![Project Panel: Compare Marked Files](https://images.zed.dev/docs/project-panel/compare-marked-files.png)
+![Project Panel: Compare Marked Files](https://images.lin.dev/docs/project-panel/compare-marked-files.png)
 
 ## File Operations
 
@@ -98,7 +98,7 @@ cancel.
 - {#action project_panel::Paste} ({#kb project_panel::Paste}) places them in the
   selected directory.
 
-When pasting would create a name conflict, Zed appends a "copy" suffix (e.g.,
+When pasting would create a name conflict, Lin appends a "copy" suffix (e.g.,
 `file copy.txt`, `file copy 2.txt`). If a single file is pasted with a generated
 suffix, the rename editor opens automatically so you can adjust the name.
 
@@ -135,7 +135,7 @@ Setting `project_panel.git_status_indicator` to `true` (disabled by default) add
 to each name: **M** (modified), **A** (added), **D** (deleted), **U**
 (untracked) or **!** (conflict).
 
-![Project Panel: Git Integration](https://images.zed.dev/docs/project-panel/git-status.png)
+![Project Panel: Git Integration](https://images.lin.dev/docs/project-panel/git-status.png)
 
 Use {#action project_panel::SelectNextGitEntry} and {#action
 project_panel::SelectPrevGitEntry} to jump between tracked files with
@@ -213,7 +213,7 @@ The following operations are tracked:
 - {#action project_panel::Duplicate}
 
 Besides these actions, moving items within the panel using drag and drop, as
-well as dragging files into the panel from outside Zed, are also tracked.
+well as dragging files into the panel from outside Lin, are also tracked.
 
 Undoing a move or rename (for example {#action project_panel::Rename}, a
 {#action project_panel::Cut} followed by paste, or a drag within the panel)
@@ -222,7 +222,7 @@ returns the item to its original name or location.
 Undoing an operation that creates a file or directory (for example
 {#action project_panel::NewFile}, {#action project_panel::NewDirectory},
 {#action project_panel::Duplicate}, a {#action project_panel::Copy} followed by
-paste, or a drag from outside Zed) moves the new item to your system trash
+paste, or a drag from outside Lin) moves the new item to your system trash
 rather than deleting it. This keeps it recoverable and lets redo restore it, but
 it also means you may notice these items appear in your trash.
 
@@ -246,12 +246,12 @@ single step, and a failure in one of the operations does not block the rest.
 - Undoing a {#action project_panel::Trash} restores the item from your system's
   trash. If you empty the trash, the item can no longer be restored.
 - Undo and redo act on the current state of the filesystem. If something changed
-  outside Zed, for example, a conflicting file now exists at the destination, or
+  outside Lin, for example, a conflicting file now exists at the destination, or
   the item was moved or deleted by another program, the operation may no longer
-  be undoable, and Zed will show a notification accordingly.
+  be undoable, and Lin will show a notification accordingly.
 - On remote hosts without system trash support, {#action project_panel::Trash}
   will fail when used, along with anything that relies on it, such as undoing a
   trash or undoing an operation that creates a file or directory. At the time of
-  writing, Zed does not reliably detect trash support ahead of time, so the
+  writing, Lin does not reliably detect trash support ahead of time, so the
   action is always available but may report an error.
-- The undo history is not persisted across sessions, so quitting Zed clears it.
+- The undo history is not persisted across sessions, so quitting Lin clears it.

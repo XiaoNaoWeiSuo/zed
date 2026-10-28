@@ -45,7 +45,7 @@ use language_model::{
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
     LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    StopReason, TokenUsage,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -835,7 +835,7 @@ pub struct SiblingThreadRequest {
     pub title: SharedString,
     /// The initial prompt to send to the new thread.
     pub prompt: String,
-    /// Optional agent ID to use. Defaults to the native Zed agent.
+    /// Optional agent ID to use. Defaults to the native Lin agent.
     pub agent_id: Option<String>,
     /// Optional model override, as `provider/model-id`.
     /// Defaults to the user's configured default model for the agent.
@@ -879,7 +879,7 @@ pub struct AvailableAgent {
     pub id: String,
     /// Human-readable name shown in the UI.
     pub name: SharedString,
-    /// Whether this is Zed's built-in native agent.
+    /// Whether this is Lin's built-in native agent.
     pub is_native: bool,
     /// Models available for this agent. May be empty if models are not
     /// enumerated up front (e.g., external agents that choose their own).
@@ -889,7 +889,7 @@ pub struct AvailableAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableModel {
     /// Identifier to pass as the `model` field when creating a thread.
-    /// For `spawn_agent`, use a model from the native Zed agent entry.
+    /// For `spawn_agent`, use a model from the native Lin agent entry.
     pub id: String,
     /// Human-readable name.
     pub name: SharedString,
@@ -3582,7 +3582,7 @@ impl Thread {
         &mut self,
         error: LanguageModelCompletionError,
         attempt: u8,
-        plan: Option<Plan>,
+        _plan: Option<Plan>,
         cx: &mut Context<Self>,
     ) -> Result<acp_thread::RetryStatus> {
         if let LanguageModelCompletionError::ProviderRejection {
@@ -3593,19 +3593,9 @@ impl Thread {
             self.mark_token_limit_exceeded(*tokens, cx);
         }
 
-        let Some(model) = self.model() else {
+        let Some(_model) = self.model() else {
             return Err(anyhow!(error));
         };
-
-        let auto_retry = if model.provider_id() == ZED_CLOUD_PROVIDER_ID {
-            plan.is_some()
-        } else {
-            true
-        };
-
-        if !auto_retry {
-            return Err(anyhow!(error));
-        }
 
         let Some(strategy) = Self::retry_strategy_for(&error) else {
             return Err(anyhow!(error));
@@ -9240,7 +9230,7 @@ mod tests {
     #[test]
     fn test_retry_strategy_does_not_retry_status_less_provider_rejection() {
         // A rejection like OpenAI's `cyber_policy` content-policy error has
-        // no HTTP status of its own (it arrives as a Zed cloud upstream
+        // no HTTP status of its own (it arrives as a Lin cloud upstream
         // error code); retrying sends the identical request and gets the
         // identical rejection, so it must not retry.
         let error = LanguageModelCompletionError::from_provider_response(

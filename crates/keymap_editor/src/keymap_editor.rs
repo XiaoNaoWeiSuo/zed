@@ -232,7 +232,7 @@ impl FilterState {
 #[derive(Default, PartialEq, Eq, Copy, Clone)]
 struct SourceFilters {
     user: bool,
-    zed_defaults: bool,
+    lin_defaults: bool,
     vim_defaults: bool,
 }
 
@@ -242,7 +242,7 @@ impl SourceFilters {
             Some(KeybindSource::User) => self.user,
             Some(KeybindSource::Vim) => self.vim_defaults,
             Some(KeybindSource::Base | KeybindSource::Default | KeybindSource::Unknown) | None => {
-                self.zed_defaults
+                self.lin_defaults
             }
         }
     }
@@ -629,7 +629,7 @@ impl KeymapEditor {
             filter_state: FilterState::default(),
             source_filters: SourceFilters {
                 user: true,
-                zed_defaults: true,
+                lin_defaults: true,
                 vim_defaults: true,
             },
             show_no_action_bindings: true,
@@ -1534,8 +1534,8 @@ impl KeymapEditor {
         self.on_query_changed(cx);
     }
 
-    fn toggle_zed_defaults_filter(&mut self, cx: &mut Context<Self>) {
-        self.source_filters.zed_defaults = !self.source_filters.zed_defaults;
+    fn toggle_lin_defaults_filter(&mut self, cx: &mut Context<Self>) {
+        self.source_filters.lin_defaults = !self.source_filters.lin_defaults;
         self.on_query_changed(cx);
     }
 
@@ -1675,12 +1675,12 @@ impl KeymapEditor {
                             ))
                             .map(add_filter(
                                 "Default",
-                                source_filters.zed_defaults,
+                                source_filters.lin_defaults,
                                 None,
                                 &focus_handle,
                                 &keymap_editor,
                                 Some(|editor, cx| {
-                                    editor.toggle_zed_defaults_filter(cx);
+                                    editor.toggle_lin_defaults_filter(cx);
                                 }),
                             ))
                             .map(add_filter(

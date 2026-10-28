@@ -1,6 +1,6 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
-//! Renders a div with deep children hierarchy. This example is useful to exemplify that Zed can
+//! Renders a div with deep children hierarchy. This example is useful to exemplify that Lin can
 //! handle deep hierarchies (even though it cannot just yet!).
 #[path = "example_support/fonts.rs"]
 mod example_support;

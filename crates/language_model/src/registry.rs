@@ -1,7 +1,6 @@
 use crate::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelId,
-    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderState,
-    ZED_CLOUD_PROVIDER_ID, unavailable_error,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderState, unavailable_error,
 };
 use collections::{BTreeMap, HashSet};
 use gpui::{App, Context, Entity, EventEmitter, Global, Task, prelude::*};
@@ -99,10 +98,6 @@ impl LanguageModel {
     /// of changes to its capabilities.
     pub fn is_same_as(&self, other: &LanguageModel) -> bool {
         self.id == other.id && self.provider_id == other.provider_id
-    }
-
-    pub fn is_provided_by_zed(&self) -> bool {
-        self.provider_id == ZED_CLOUD_PROVIDER_ID
     }
 }
 

@@ -5,7 +5,6 @@ use anyhow::{Context as _, Result, anyhow};
 use cli::{CliRequest, CliResponse, CliResponseSink};
 use cli::{IpcHandshake, ipc};
 use client::{ZedLink, parse_zed_link};
-use db::kvp::KeyValueStore;
 use editor::Editor;
 use fs::Fs;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -16,8 +15,6 @@ use futures::{FutureExt, StreamExt};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
-use onboarding::FIRST_OPEN;
-use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use settings::Settings;
@@ -61,7 +58,7 @@ pub enum OpenRequestKind {
         external_source_prompt: Option<ExternalSourcePrompt>,
     },
     InstallSkill {
-        /// Full `SKILL.md` contents embedded in a `zed://skill` share link.
+        /// Full `SKILL.md` contents embedded in a `lin://skill` share link.
         content: String,
     },
     DockMenuAction {
@@ -155,7 +152,7 @@ impl OpenRequest {
         }
 
         for url in request.urls {
-            if let Some(server_name) = url.strip_prefix("zed-cli://") {
+            if let Some(server_name) = url.strip_prefix("lin-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {
                 this.kind = Some(OpenRequestKind::DockMenuAction {
@@ -163,34 +160,34 @@ impl OpenRequest {
                 });
             } else if let Some(file) = url.strip_prefix("file://") {
                 this.parse_file_path(file)
-            } else if let Some(file) = url.strip_prefix("zed://file") {
+            } else if let Some(file) = url.strip_prefix("lin://file") {
                 this.parse_file_path(file)
-            } else if let Some(file) = url.strip_prefix("zed://ssh") {
+            } else if let Some(file) = url.strip_prefix("lin://ssh") {
                 let ssh_url = "ssh:/".to_string() + file;
                 this.parse_ssh_file_path(&ssh_url, cx)?
-            } else if let Some(extension_id) = url.strip_prefix("zed://extension/") {
+            } else if let Some(extension_id) = url.strip_prefix("lin://extension/") {
                 this.kind = Some(OpenRequestKind::Extension {
                     extension_id: extension_id.to_string(),
                 });
             } else if url.starts_with(agent_skills::SKILL_SHARE_LINK_PREFIX) {
                 this.parse_skill_install_url(&url)?
-            } else if let Some(agent_path) = url.strip_prefix("zed://agent") {
+            } else if let Some(agent_path) = url.strip_prefix("lin://agent") {
                 this.parse_agent_url(agent_path)
-            } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
+            } else if url == "lin://" || url == "lin://open" || url == "lin://open/" {
                 this.kind = Some(OpenRequestKind::FocusApp);
-            } else if let Some(schema_path) = url.strip_prefix("zed://schemas/") {
+            } else if let Some(schema_path) = url.strip_prefix("lin://schemas/") {
                 this.kind = Some(OpenRequestKind::BuiltinJsonSchema {
                     schema_path: schema_path.to_string(),
                 });
-            } else if url == "zed://settings" || url == "zed://settings/" {
+            } else if url == "lin://settings" || url == "lin://settings/" {
                 this.kind = Some(OpenRequestKind::Setting { setting_path: None });
-            } else if let Some(setting_path) = url.strip_prefix("zed://settings/") {
+            } else if let Some(setting_path) = url.strip_prefix("lin://settings/") {
                 this.kind = Some(OpenRequestKind::Setting {
                     setting_path: Some(setting_path.to_string()),
                 });
-            } else if let Some(clone_path) = url.strip_prefix("zed://git/clone") {
+            } else if let Some(clone_path) = url.strip_prefix("lin://git/clone") {
                 this.parse_git_clone_url(clone_path)?
-            } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
+            } else if let Some(commit_path) = url.strip_prefix("lin://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
@@ -234,7 +231,7 @@ impl OpenRequest {
     }
 
     fn parse_skill_install_url(&mut self, url: &str) -> Result<()> {
-        // Format: zed://skill?data=<base64url of SKILL.md contents>
+        // Format: lin://skill?data=<base64url of SKILL.md contents>
         let content = agent_skills::decode_skill_share_link(url)?;
         self.kind = Some(OpenRequestKind::InstallSkill { content });
         Ok(())
@@ -410,7 +407,7 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
     use release_channel::RELEASE_CHANNEL_NAME;
     use std::os::unix::net::UnixDatagram;
 
-    let sock_path = paths::data_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL_NAME));
+    let sock_path = paths::data_dir().join(format!("lin-{}.sock", *RELEASE_CHANNEL_NAME));
     // remove the socket if the process listening on it has died
     if let Err(e) = UnixDatagram::unbound()?.connect(&sock_path)
         && e.kind() == std::io::ErrorKind::ConnectionRefused
@@ -862,24 +859,16 @@ async fn open_workspaces(
         };
 
     if grouped_locations.is_empty() {
-        // If we have no paths to open, show the welcome screen if this is the first launch
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-            cx.update(|cx| show_onboarding_view(app_state, cx).detach());
-        }
-        // If not the first launch, show an empty window with empty editor
-        else {
-            cx.update(|cx| {
-                let open_options = OpenOptions {
-                    env,
-                    ..Default::default()
-                };
-                workspace::open_new(open_options, app_state, cx, |workspace, window, cx| {
-                    Editor::new_file(workspace, &Default::default(), window, cx)
-                })
-                .detach_and_log_err(cx);
-            });
-        }
+        cx.update(|cx| {
+            let open_options = OpenOptions {
+                env,
+                ..Default::default()
+            };
+            workspace::open_new(open_options, app_state, cx, |workspace, window, cx| {
+                Editor::new_file(workspace, &Default::default(), window, cx)
+            })
+            .detach_and_log_err(cx);
+        });
         return Ok(());
     }
     // If there are paths to open, open a workspace for each grouping of paths
@@ -963,7 +952,7 @@ async fn open_local_workspace(
     // When only diff paths are provided (no regular paths), add the CLI's
     // working directory so the workspace opens with the right context.
     // Note: must use the CLI process's cwd (forwarded via `cli_cwd`), not
-    // `std::env::current_dir()`, since the Zed app process's cwd is typically
+    // `std::env::current_dir()`, since the Lin app process's cwd is typically
     // `/` on macOS bundles or the launch dir of an already-running instance.
     if !user_provided_paths
         && !diff_paths.is_empty()
@@ -1476,7 +1465,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://agent".into()],
+                    urls: vec!["lin://agent".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1530,7 +1519,7 @@ mod tests {
         let result = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://skill?data=!!!notbase64".into()],
+                    urls: vec!["lin://skill?data=!!!notbase64".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1541,7 +1530,7 @@ mod tests {
     }
 
     fn agent_url_with_prompt(prompt: &str) -> String {
-        let mut serializer = url::form_urlencoded::Serializer::new("zed://agent?".to_string());
+        let mut serializer = url::form_urlencoded::Serializer::new("lin://agent?".to_string());
         serializer.append_pair("prompt", prompt);
         serializer.finish()
     }
@@ -1584,7 +1573,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://agent/?prompt=hello".into()],
+                    urls: vec!["lin://agent/?prompt=hello".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1611,7 +1600,7 @@ mod tests {
     fn test_parse_focus_app_url(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 
-        for url in ["zed://", "zed://open", "zed://open/"] {
+        for url in ["lin://", "lin://open", "lin://open/"] {
             let request = cx.update(|cx| {
                 OpenRequest::parse(
                     RawOpenRequest {
@@ -1667,7 +1656,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/abc123?repo=path/to/repo".into()],
+                    urls: vec!["lin://git/commit/abc123?repo=path/to/repo".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1688,7 +1677,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/def456?repo=path%20with%20spaces".into()],
+                    urls: vec!["lin://git/commit/def456?repo=path%20with%20spaces".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1709,7 +1698,7 @@ mod tests {
             assert!(
                 OpenRequest::parse(
                     RawOpenRequest {
-                        urls: vec!["zed://git/commit/abc123?repo=".into()],
+                        urls: vec!["lin://git/commit/abc123?repo=".into()],
                         ..Default::default()
                     },
                     cx,
@@ -1724,7 +1713,7 @@ mod tests {
         let result = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/abc123?foo=bar".into()],
+                    urls: vec!["lin://git/commit/abc123?foo=bar".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1893,7 +1882,7 @@ mod tests {
             .unwrap();
 
         // Test case 2: Open a single file that does not exist yet,
-        // but tell Zed to add it to the current workspace
+        // but tell Lin to add it to the current workspace
         open_workspace_file(
             path!("/root/file6.txt"),
             workspace::OpenOptions {
@@ -1916,7 +1905,7 @@ mod tests {
             .unwrap();
 
         // Test case 3: Open a single file that does not exist yet,
-        // but tell Zed to NOT add it to the current workspace
+        // but tell Lin to NOT add it to the current workspace
         open_workspace_file(
             path!("/root/file7.txt"),
             workspace::OpenOptions {
@@ -2086,7 +2075,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone/?repo=https://github.com/zed-industries/zed.git".into(),
+                        "lin://git/clone/?repo=https://github.com/zed-industries/zed.git".into(),
                     ],
                     ..Default::default()
                 },
@@ -2111,7 +2100,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone?repo=https://github.com/zed-industries/zed.git".into(),
+                        "lin://git/clone?repo=https://github.com/zed-industries/zed.git".into(),
                     ],
                     ..Default::default()
                 },
@@ -2136,7 +2125,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone/?repo=https%3A%2F%2Fgithub.com%2Fzed-industries%2Fzed.git"
+                        "lin://git/clone/?repo=https%3A%2F%2Fgithub.com%2Fzed-industries%2Fzed.git"
                             .into(),
                     ],
                     ..Default::default()
@@ -2476,7 +2465,7 @@ mod tests {
     }
 
     /// Runs the real [`cli::run_cli_response_loop`] on an OS thread against
-    /// the Zed-side `handle_cli_connection` on the GPUI foreground executor,
+    /// the Lin-side `handle_cli_connection` on the GPUI foreground executor,
     /// using `allow_parking` so the test scheduler tolerates cross-thread
     /// wakeups.
     ///

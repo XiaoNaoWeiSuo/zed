@@ -83,7 +83,7 @@ pub enum DevContainerError {
     NotInValidProject,
     /// Multiple existing containers match this project's identifying labels
     /// (`devcontainer.local_folder` + `devcontainer.config_file`). The spec
-    /// expects those labels to be unique per project, so Zed can't choose
+    /// expects those labels to be unique per project, so Lin can't choose
     /// which one to connect to. The user must remove the duplicate(s).
     MultipleMatchingContainers(Vec<String>),
 }

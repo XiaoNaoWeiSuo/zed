@@ -103,8 +103,17 @@ impl ReqwestClient {
                 })
                 .ok()
         }) {
-            // Respect NO_PROXY env var
-            client = client.proxy(proxy.no_proxy(reqwest::NoProxy::from_env()));
+            // Local model servers must never go through an HTTP proxy: doing so
+            // turns a connection refused into an opaque 502 from the proxy.
+            let no_proxy = std::env::var("NO_PROXY")
+                .or_else(|_| std::env::var("no_proxy"))
+                .unwrap_or_default();
+            let no_proxy = if no_proxy.is_empty() {
+                "localhost,127.0.0.1,::1".to_string()
+            } else {
+                format!("{no_proxy},localhost,127.0.0.1,::1")
+            };
+            client = client.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(&no_proxy)));
             client_has_proxy = true;
         } else {
             client_has_proxy = false;

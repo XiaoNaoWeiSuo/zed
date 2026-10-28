@@ -26789,7 +26789,7 @@ async fn test_toggle_block_comment(cx: &mut TestAppContext) {
     cx.update_editor(|editor, window, cx| {
         editor.toggle_comments(&ToggleComments::default(), window, cx)
     });
-    // TODO this is how it actually worked in Zed Stable, which is not very ergonomic.
+    // TODO this is how it actually worked in Lin Stable, which is not very ergonomic.
     // Uncommenting and commenting from this position brings in even more wrong artifacts.
     cx.assert_editor_state(
         &r#"
@@ -31210,7 +31210,7 @@ struct Row10;"#};
         &mut cx,
     );
 
-    // Deletion hunks are ephemeral, so it's impossible to place the caret into them — Zed triggers reverts for lines, adjacent to carets and selections.
+    // Deletion hunks are ephemeral, so it's impossible to place the caret into them — Lin triggers reverts for lines, adjacent to carets and selections.
     assert_hunk_revert(
         indoc! {r#"struct Row;
                    ˇstruct Row2;
@@ -46634,7 +46634,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
     fs.insert_tree(
         path!("/project"),
         json!({
-            ".zed": {
+            ".lin": {
                 "settings.json": r#"{"languages":{"Rust":{"language_servers":["override-rust-analyzer"]}}}"#
             },
             "main.rs": "fn main() {}"
@@ -46733,7 +46733,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
             [language::language_settings::ConfiguredLanguageServer::new(
                 "..."
             )],
-            "local .zed/settings.json must not apply before trust approval"
+            "local .lin/settings.json must not apply before trust approval"
         )
     });
 
@@ -46768,7 +46768,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
             [language::language_settings::ConfiguredLanguageServer::new(
                 "override-rust-analyzer"
             )],
-            "local .zed/settings.json should apply after trust approval"
+            "local .lin/settings.json should apply after trust approval"
         )
     });
     let _fake_language_server = fake_language_server.await.unwrap();
@@ -50973,13 +50973,13 @@ async fn test_soft_wrap_indent_updated_on_file_move_between_directories(
         root,
         serde_json::json!({
             "dir_a": {
-                ".zed": {
+                ".lin": {
                     "settings.json": "{\n  \"soft_wrap_indent\": \"same\"\n}"
                 },
                 "test.txt": "    let a_long_variable = 123456789;\n"
             },
             "dir_b": {
-                ".zed": {
+                ".lin": {
                     "settings.json": "{\n  \"soft_wrap_indent\": \"none\"\n}"
                 }
             }

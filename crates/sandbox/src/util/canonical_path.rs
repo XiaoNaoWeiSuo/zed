@@ -32,7 +32,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 /// `/proc/self/fd`, `from_canonical` re-verifies a claimed value against the
 /// reopened fd). Both constructors reject a non-absolute input on the platforms
 /// that resolve paths themselves (Linux/macOS): a relative path would otherwise
-/// be resolved against Zed's *own* process working directory, silently pinning
+/// be resolved against Lin's *own* process working directory, silently pinning
 /// an unpredictable location.
 #[derive(Clone)]
 pub(crate) struct CanonicalPathBuf {
@@ -54,7 +54,7 @@ impl CanonicalPathBuf {
     /// [`Self::from_canonical`], which verifies it.
     pub(crate) fn resolve(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        // A relative path would be resolved against Zed's own process working
+        // A relative path would be resolved against Lin's own process working
         // directory by the `open`/`canonicalize` below, silently pinning an
         // unpredictable location. Every grant flows through this constructor, so
         // rejecting here fails closed for all of them at once.
@@ -116,7 +116,7 @@ impl CanonicalPathBuf {
     /// elsewhere.
     pub(crate) fn from_canonical(path: PathBuf) -> io::Result<Self> {
         // Same absolute-path requirement as `resolve`: a persisted or
-        // hand-authored relative grant must never be resolved against Zed's own
+        // hand-authored relative grant must never be resolved against Lin's own
         // working directory (Linux) or emitted as a relative Seatbelt literal
         // (macOS).
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn constructors_reject_relative_paths() {
-        // A relative grant would otherwise be resolved against Zed's own working
+        // A relative grant would otherwise be resolved against Lin's own working
         // directory; both constructors must fail closed before touching the fs.
         // (`CanonicalPathBuf` is deliberately not `Debug`, so match rather than
         // `expect_err`.)

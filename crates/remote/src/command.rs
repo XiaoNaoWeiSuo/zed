@@ -198,8 +198,8 @@ mod tests {
             "($env.HOME | path join \"a b/O'Brien\")"
         );
         assert_eq!(
-            home_stdio_launcher_command(ShellKind::Nushell, None, ".zed_server/server")?,
-            "exec ($env.HOME | path join .zed_server/server) exec"
+            home_stdio_launcher_command(ShellKind::Nushell, None, ".lin_server/server")?,
+            "exec ($env.HOME | path join .lin_server/server) exec"
         );
         assert_eq!(
             home_stdio_launcher_command(ShellKind::Nushell, Some("/home/u/"), "x y")?,

@@ -1,37 +1,37 @@
 ---
-title: How to Migrate from RustRover to Zed
-description: "Guide for migrating from RustRover to Zed, including settings and keybindings."
+title: How to Migrate from RustRover to Lin
+description: "Guide for migrating from RustRover to Lin, including settings and keybindings."
 ---
 
-# How to Migrate from RustRover to Zed
+# How to Migrate from RustRover to Lin
 
 This guide covers keybindings, settings, and the differences you'll encounter as a Rust developer switching from RustRover.
 
-## Install Zed
+## Install Lin
 
-Zed is available on macOS, Windows, and Linux.
+Lin is available on macOS, Windows, and Linux.
 
-For macOS, you can download it from zed.dev/download, or install via Homebrew:
-
-```sh
-brew install --cask zed
-```
-
-For Windows, download the installer from zed.dev/download, or install via winget:
+For macOS, you can download it from lin.dev/download, or install via Homebrew:
 
 ```sh
-winget install Zed.Zed
+brew install --cask lin
 ```
 
-For most Linux users, the easiest way to install Zed is through our installation script:
+For Windows, download the installer from lin.dev/download, or install via winget:
 
 ```sh
-curl -f https://zed.dev/install.sh | sh
+winget install Lin.Lin
 ```
 
-After installation, you can launch Zed from your Applications folder (macOS), Start menu (Windows), or directly from the terminal using:
-`zed .`
-This opens the current directory in Zed.
+For most Linux users, the easiest way to install Lin is through our installation script:
+
+```sh
+curl -f https://lin.dev/install.sh | sh
+```
+
+After installation, you can launch Lin from your Applications folder (macOS), Start menu (Windows), or directly from the terminal using:
+`lin .`
+This opens the current directory in Lin.
 
 ## Set Up the JetBrains Keymap
 
@@ -47,11 +47,11 @@ In editors, the JetBrains keymap also makes `Alt+Left` / `Alt+Right` and `Shift+
 
 ## Set Up Editor Preferences
 
-You can configure most settings in the Settings Editor ({#kb zed::OpenSettings}). For advanced settings, run {#action zed::OpenSettingsFile} from the Command Palette to edit your settings file directly.
+You can configure most settings in the Settings Editor ({#kb lin::OpenSettings}). For advanced settings, run {#action lin::OpenSettingsFile} from the Command Palette to edit your settings file directly.
 
 Settings RustRover users typically configure first:
 
-| Zed Setting             | What it does                                                                    |
+| Lin Setting             | What it does                                                                    |
 | ----------------------- | ------------------------------------------------------------------------------- |
 | `format_on_save`        | Auto-format when saving. Set to `"on"` to enable (uses rustfmt by default).     |
 | `soft_wrap`             | Wrap long lines. Options: `"none"`, `"editor_width"`, `"preferred_line_length"` |
@@ -59,20 +59,20 @@ Settings RustRover users typically configure first:
 | `inlay_hints`           | Show type hints, parameter names, and chaining hints inline.                    |
 | `relative_line_numbers` | Useful if you're coming from IdeaVim.                                           |
 
-Zed also supports per-project settings. Create a `.zed/settings.json` file in your project root to override global settings for that project.
+Lin also supports per-project settings. Create a `.lin/settings.json` file in your project root to override global settings for that project.
 
 > **Tip:** If you're joining an existing project, check `format_on_save` before making your first commit. Otherwise you might accidentally reformat an entire file when you only meant to change one line.
 
 ## Open or Create a Project
 
-After setup, press `Cmd+Shift+O` (with JetBrains keymap) to open a folder. This becomes your workspace in Zed.
+After setup, press `Cmd+Shift+O` (with JetBrains keymap) to open a folder. This becomes your workspace in Lin.
 
 To start a new project, use Cargo from the terminal:
 
 ```sh
 cargo new my_project
 cd my_project
-zed .
+lin .
 ```
 
 Or for a library:
@@ -81,8 +81,8 @@ Or for a library:
 cargo new --lib my_library
 ```
 
-You can also launch Zed from the terminal inside any existing Cargo project with:
-`zed .`
+You can also launch Lin from the terminal inside any existing Cargo project with:
+`lin .`
 
 Once inside a project:
 
@@ -94,7 +94,7 @@ Open buffers appear as tabs across the top. The Project Panel shows your file tr
 
 ## Differences in Keybindings
 
-If you chose the JetBrains keymap during onboarding, most of your shortcuts should already feel familiar. Here's a quick reference for how Zed compares to RustRover.
+If you chose the JetBrains keymap during onboarding, most of your shortcuts should already feel familiar. Here's a quick reference for how Lin compares to RustRover.
 
 ### Common Shared Keybindings
 
@@ -121,9 +121,9 @@ If you chose the JetBrains keymap during onboarding, most of your shortcuts shou
 | Go Back / Forward             | `Cmd + [` / `Cmd + ]`      |
 | Toggle Breakpoint             | `Ctrl + F8`                |
 
-### Different Keybindings (RustRover → Zed)
+### Different Keybindings (RustRover → Lin)
 
-| Action                 | RustRover   | Zed (JetBrains keymap)   |
+| Action                 | RustRover   | Lin (JetBrains keymap)   |
 | ---------------------- | ----------- | ------------------------ |
 | File Structure         | `Cmd + F12` | `Cmd + F12` (outline)    |
 | Navigate to Next Error | `F2`        | `F2`                     |
@@ -132,7 +132,7 @@ If you chose the JetBrains keymap during onboarding, most of your shortcuts shou
 | Stop                   | `Cmd + F2`  | `Ctrl + F2`              |
 | Expand Macro           | `Alt+Enter` | `Cmd + Shift + M`        |
 
-### Unique to Zed
+### Unique to Lin
 
 | Action            | Shortcut                   | Notes                          |
 | ----------------- | -------------------------- | ------------------------------ |
@@ -142,52 +142,52 @@ If you chose the JetBrains keymap during onboarding, most of your shortcuts shou
 ### How to Customize Keybindings
 
 - Open the Command Palette (`Cmd+Shift+A` or `Shift Shift`)
-- Run {#action zed::OpenKeymap}
+- Run {#action lin::OpenKeymap}
 
 This opens a list of all available bindings. You can override individual shortcuts or remove conflicts.
 
-Zed also supports key sequences (multi-key shortcuts).
+Lin also supports key sequences (multi-key shortcuts).
 
 ## Differences in User Interfaces
 
 ### Different Analysis Engines
 
-RustRover uses its own proprietary code analysis engine for Rust intelligence. Zed uses rust-analyzer via the Language Server Protocol (LSP).
+RustRover uses its own proprietary code analysis engine for Rust intelligence. Lin uses rust-analyzer via the Language Server Protocol (LSP).
 
 What this means for you:
 
-- **Completions, go-to-definition, find usages, type inference** — All available in Zed via rust-analyzer
-- **Macro expansion** — Available in both (use `Cmd+Shift+M` in Zed)
+- **Completions, go-to-definition, find usages, type inference** — All available in Lin via rust-analyzer
+- **Macro expansion** — Available in both (use `Cmd+Shift+M` in Lin)
 - **Inlay hints** — Both support type hints, parameter hints, and chaining hints
 
 Where you might notice differences:
 
 - Some refactorings available in RustRover may not have rust-analyzer equivalents
-- RustRover-specific inspections (beyond Clippy) won't exist in Zed
-- rust-analyzer is configured via JSON in Zed, not through a GUI
+- RustRover-specific inspections (beyond Clippy) won't exist in Lin
+- rust-analyzer is configured via JSON in Lin, not through a GUI
 
 **How to adapt:**
 
 - Use `Alt+Enter` for available code actions—rust-analyzer provides many
-- Configure rust-analyzer settings in `.zed/settings.json` for project-specific needs
+- Configure rust-analyzer settings in `.lin/settings.json` for project-specific needs
 - Run `cargo clippy` for linting (it integrates with rust-analyzer diagnostics)
 
 ### Project Configuration
 
-Both editors store per-project configuration in a hidden folder. RustRover uses `.idea` (with XML files), Zed uses `.zed` (with JSON files).
+Both editors store per-project configuration in a hidden folder. RustRover uses `.idea` (with XML files), Lin uses `.lin` (with JSON files).
 
-**Run configurations don't transfer.** RustRover stores run/debug configurations in `.idea`. These have no automatic migration path. You'll recreate them as Zed [tasks](../tasks.md) in `.zed/tasks.json` and debug configurations in `.zed/debug.json`.
+**Run configurations don't transfer.** RustRover stores run/debug configurations in `.idea`. These have no automatic migration path. You'll recreate them as Lin [tasks](../tasks.md) in `.lin/tasks.json` and debug configurations in `.lin/debug.json`.
 
-**No Cargo tool window.** RustRover provides a visual tree of your workspace members, targets, features, and dependencies. Zed doesn't have this. You work with `Cargo.toml` and the Cargo CLI directly.
+**No Cargo tool window.** RustRover provides a visual tree of your workspace members, targets, features, and dependencies. Lin doesn't have this. You work with `Cargo.toml` and the Cargo CLI directly.
 
-**Toolchain management is external.** RustRover lets you select and switch toolchains in its settings UI. In Zed, you manage toolchains through `rustup`.
+**Toolchain management is external.** RustRover lets you select and switch toolchains in its settings UI. In Lin, you manage toolchains through `rustup`.
 
-**Configuration is opt-in.** RustRover auto-generates `.idea` when you open a project. Zed doesn't generate anything. You create `.zed/settings.json`, `tasks.json`, and `debug.json` as needed.
+**Configuration is opt-in.** RustRover auto-generates `.idea` when you open a project. Lin doesn't generate anything. You create `.lin/settings.json`, `tasks.json`, and `debug.json` as needed.
 
 **How to adapt:**
 
-- Create a `.zed/settings.json` in your project root for project-specific settings
-- Define common commands in `tasks.json` (open via Command Palette: {#action zed::OpenTasks}):
+- Create a `.lin/settings.json` in your project root for project-specific settings
+- Define common commands in `tasks.json` (open via Command Palette: {#action lin::OpenTasks}):
 
 ```json
 [
@@ -221,7 +221,7 @@ Both editors store per-project configuration in a hidden folder. RustRover uses 
 
 RustRover's Cargo tool window provides visual access to your project's targets, dependencies, and common Cargo commands. You can run builds, tests, and benchmarks with a click.
 
-Zed doesn't have a Cargo GUI. You work with Cargo through:
+Lin doesn't have a Cargo GUI. You work with Cargo through:
 
 - **Terminal** — Run any Cargo command directly
 - **Tasks** — Define shortcuts for common commands
@@ -235,9 +235,9 @@ Zed doesn't have a Cargo GUI. You work with Cargo through:
 
 ### Tool Windows vs. Docks
 
-RustRover organizes auxiliary views into numbered tool windows (Project = 1, Cargo = Alt+1, Terminal = Alt+F12, etc.). Zed uses a similar concept called "docks":
+RustRover organizes auxiliary views into numbered tool windows (Project = 1, Cargo = Alt+1, Terminal = Alt+F12, etc.). Lin uses a similar concept called "docks":
 
-| RustRover Tool Window | Zed Equivalent | Shortcut (JetBrains keymap) |
+| RustRover Tool Window | Lin Equivalent | Shortcut (JetBrains keymap) |
 | --------------------- | -------------- | --------------------------- |
 | Project (1)           | Project Panel  | `Cmd + 1`                   |
 | Git (9 or Cmd+0)      | Git Panel      | `Cmd + 0`                   |
@@ -246,27 +246,27 @@ RustRover organizes auxiliary views into numbered tool windows (Project = 1, Car
 | Problems (6)          | Diagnostics    | `Cmd + 6`                   |
 | Debug (5)             | Debug Panel    | `Cmd + 5`                   |
 
-Zed has three dock positions: left, bottom, and right. Panels can be moved between docks by dragging or through settings.
+Lin has three dock positions: left, bottom, and right. Panels can be moved between docks by dragging or through settings.
 
-Note that there's no dedicated Cargo tool window in Zed. Use the terminal or define tasks for your common Cargo commands.
+Note that there's no dedicated Cargo tool window in Lin. Use the terminal or define tasks for your common Cargo commands.
 
 ### Debugging
 
-Both RustRover and Zed offer integrated debugging for Rust, but using different backends:
+Both RustRover and Lin offer integrated debugging for Rust, but using different backends:
 
 - RustRover uses its own debugger integration
-- Zed uses **CodeLLDB** (the same debug adapter popular in VS Code)
+- Lin uses **CodeLLDB** (the same debug adapter popular in VS Code)
 
-To debug Rust code in Zed:
+To debug Rust code in Lin:
 
 - Set breakpoints with `Ctrl+F8`
 - Start debugging with `Alt+Shift+F9` or press `F4` and select a debug target
 - Step through code with `F7` (step into), `F8` (step over), `Shift+F8` (step out)
 - Continue execution with `F9`
 
-Zed can automatically detect debuggable targets in your Cargo project. Press `F4` to see available options.
+Lin can automatically detect debuggable targets in your Cargo project. Press `F4` to see available options.
 
-For more control, create a `.zed/debug.json` file:
+For more control, create a `.lin/debug.json` file:
 
 ```json
 [
@@ -299,7 +299,7 @@ For more control, create a `.zed/debug.json` file:
 
 ### Running Tests
 
-RustRover has a dedicated test runner with a visual interface showing pass/fail status for each test. Zed provides test running through:
+RustRover has a dedicated test runner with a visual interface showing pass/fail status for each test. Lin provides test running through:
 
 - **Gutter icons** — Click the play button next to `#[test]` functions or test modules
 - **Tasks** — Define `cargo test` commands in `tasks.json`
@@ -315,13 +315,13 @@ The test output appears in the terminal panel. For more detailed output, use:
 
 RustRover has a full JetBrains plugin catalog.
 
-Zed's extension catalog is smaller and more focused:
+Lin's extension catalog is smaller and more focused:
 
 - Language support and syntax highlighting
 - Themes
 - Context servers
 
-Several features that might require plugins in other editors are built into Zed:
+Several features that might require plugins in other editors are built into Lin:
 
 - Real-time collaboration with voice chat
 - AI coding assistance
@@ -330,9 +330,9 @@ Several features that might require plugins in other editors are built into Zed:
 - rust-analyzer integration
 - rustfmt formatting
 
-### What's Not in Zed
+### What's Not in Lin
 
-Here's what RustRover offers that Zed doesn't have:
+Here's what RustRover offers that Lin doesn't have:
 
 - **Profiler integration** — Use `cargo flamegraph`, `perf`, or external profiling tools
 - **Database tools** — Use DataGrip, DBeaver, or TablePlus
@@ -343,22 +343,22 @@ Here's what RustRover offers that Zed doesn't have:
 
 On licensing and telemetry:
 
-- **Zed is open source** (primarily GPL-licensed, with Apache-licensed components)
+- **Lin is open source** (primarily GPL-licensed, with Apache-licensed components)
 - **Telemetry is optional** and can be disabled during onboarding or in settings
 
-## Collaboration in Zed vs. RustRover
+## Collaboration in Lin vs. RustRover
 
-RustRover offers Code With Me as a separate feature for collaboration. Zed has collaboration built into the core experience.
+RustRover offers Code With Me as a separate feature for collaboration. Lin has collaboration built into the core experience.
 
 - Open the Collab Panel in the left dock
-- Create a channel and [invite your collaborators](https://zed.dev/docs/collaboration#inviting-a-collaborator) to join
-- [Share your screen or your codebase](https://zed.dev/docs/collaboration#share-a-project) directly
+- Create a channel and [invite your collaborators](https://lin.dev/docs/collaboration#inviting-a-collaborator) to join
+- [Share your screen or your codebase](https://lin.dev/docs/collaboration#share-a-project) directly
 
 Once connected, you'll see each other's cursors, selections, and edits in real time. Voice chat is included. There's no need for separate tools or third-party logins.
 
-## Using AI in Zed
+## Using AI in Lin
 
-Zed has built-in AI features. If you've used JetBrains AI Assistant, here's how to get set up.
+Lin has built-in AI features. If you've used JetBrains AI Assistant, here's how to get set up.
 
 ### Configuring GitHub Copilot
 
@@ -367,19 +367,18 @@ Zed has built-in AI features. If you've used JetBrains AI Assistant, here's how 
 3. Click **Configure** next to "Configure Providers"
 4. Under **GitHub Copilot**, click **Sign in to GitHub**
 
-Once signed in, just start typing. Zed will offer suggestions inline for you to accept.
+Once signed in, just start typing. Lin will offer suggestions inline for you to accept.
 
 ### Additional AI Options
 
-To use other AI models in Zed, you have several options:
+To use other AI models in Lin, you have several options:
 
-- Use Zed's hosted models, with higher rate limits. Requires [authentication](https://zed.dev/docs/authentication) and access through [Zed Pro](https://zed.dev/docs/account/zed-hosted-models.html).
-- Bring your own [API keys](https://zed.dev/docs/ai/use-api-access.html), no authentication needed
-- Use [External Agents like Claude Agent](https://zed.dev/docs/ai/external-agents.html)
+- Bring your own [API keys](https://lin.dev/docs/ai/use-api-access.html), no authentication needed
+- Use [External Agents like Claude Agent](https://lin.dev/docs/ai/external-agents.html)
 
 ## Advanced Config and Productivity Tweaks
 
-Zed exposes advanced settings for power users who want to fine-tune their environment.
+Lin exposes advanced settings for power users who want to fine-tune their environment.
 
 Here are a few useful tweaks for Rust developers:
 
@@ -464,11 +463,11 @@ If you work with multiple Cargo projects that aren't in a workspace, you can tel
 
 ## Next Steps
 
-Now that you're set up, here are some resources to help you get the most out of Zed:
+Now that you're set up, here are some resources to help you get the most out of Lin:
 
 - [All Settings](../reference/all-settings.md) — Customize settings, themes, and editor behavior
 - [Key Bindings](../key-bindings.md) — Learn how to customize and extend your keymap
 - [Tasks](../tasks.md) — Set up build and run commands for your projects
-- [AI Features](../ai/overview.md) — Explore Zed's AI capabilities beyond code completion
-- [Collaboration](../collaboration/overview.md) — Share your projects and code together in real time
-- [Rust in Zed](../languages/rust.md) — Rust-specific setup and configuration
+- [AI Features](../ai/overview.md) — Explore Lin's AI capabilities beyond code completion
+- Collaboration — Share your projects and code together in real time
+- [Rust in Lin](../languages/rust.md) — Rust-specific setup and configuration

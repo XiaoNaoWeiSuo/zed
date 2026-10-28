@@ -5,7 +5,7 @@ description: "Ship new versions of your published extension."
 
 # Updating an Extension {#updating-an-extension}
 
-To update an extension, open a PR to [the `zed-industries/extensions` repo](https://github.com/zed-industries/extensions).
+To update an extension, open a PR to [the `lin-editor/extensions` repo](https://github.com/lin-editor/extensions).
 
 > Update PRs are subject to the same [pull request rules](./publishing-guide.md#pull-request-rules) as new submissions.
 
@@ -23,6 +23,6 @@ to update your extension to the latest commit available in your remote repositor
 2. Update the `version` field for the extension in `extensions.toml`.
    - Make sure the `version` matches the one set in `extension.toml` at the particular commit.
 
-If you'd like to automate this process, there is a [community GitHub Action](https://github.com/huacnlee/zed-extension-action) you can use.
+If you'd like to automate this process, there is a [community GitHub Action](https://github.com/huacnlee/lin-extension-action) you can use.
 
 For questions around maintaining (or no longer maintaining) your extension, see the [FAQ](./faq.md).

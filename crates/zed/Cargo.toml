@@ -1,12 +1,12 @@
 [package]
-description = "The fast, collaborative code editor."
+description = "Lin, a local-first code editor and agent harness."
 edition.workspace = true
 name = "zed"
 version = "1.27.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
-authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+authors = ["Lin contributors"]
+default-run = "lin"
 
 [lints]
 workspace = true
@@ -55,7 +55,7 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "zed"
+name = "lin"
 path = "src/main.rs"
 
 [[bin]]
@@ -78,19 +78,15 @@ anyhow.workspace = true
 askpass.workspace = true
 assets.workspace = true
 audio.workspace = true
-auto_update.workspace = true
-auto_update_ui.workspace = true
 breadcrumbs.workspace = true
 call.workspace = true
 call_hierarchy.workspace = true
-channel.workspace = true
 chrono.workspace = true
 clap.workspace = true
 cli.workspace = true
 client.workspace = true
 clock = { workspace = true, optional = true }
 codestral.workspace = true
-collab_ui.workspace = true
 collections.workspace = true
 command_palette.workspace = true
 component_preview.workspace = true
@@ -112,7 +108,6 @@ extension.workspace = true
 extension_host.workspace = true
 extensions_ui.workspace = true
 feature_flags.workspace = true
-feedback.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
@@ -167,8 +162,6 @@ migrator.workspace = true
 mimalloc = { version = "0.1", optional = true }
 miniprofiler_ui.workspace = true
 node_runtime.workspace = true
-notifications.workspace = true
-onboarding.workspace = true
 outline.workspace = true
 outline_panel.workspace = true
 parking_lot.workspace = true
@@ -226,7 +219,6 @@ vim.workspace = true
 vim_mode_setting.workspace = true
 watch.workspace = true
 web_search.workspace = true
-web_search_providers.workspace = true
 which_key.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
@@ -260,6 +252,9 @@ image.workspace = true
 pkg-config = "0.3.22"
 
 [dev-dependencies]
+channel.workspace = true
+collab_ui.workspace = true
+notifications.workspace = true
 activity_indicator = { workspace = true, features = ["test-support"] }
 call = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
@@ -285,39 +280,39 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "local.lin.Lin-Dev"
+name = "Lin Dev"
 category = "Developer Tool"
 osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["lin"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.zed.Zed-Nightly"
-name = "Zed Nightly"
+identifier = "local.lin.Lin-Nightly"
+name = "Lin Nightly"
 category = "Developer Tool"
 osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["lin"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "dev.zed.Zed-Preview"
-name = "Zed Preview"
+identifier = "local.lin.Lin-Preview"
+name = "Lin Preview"
 category = "Developer Tool"
 osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["lin"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "dev.zed.Zed"
-name = "Zed"
+identifier = "local.lin.Lin"
+name = "Lin"
 category = "Developer Tool"
 osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["lin"]
 
 [package.metadata.cargo-shear]
 ignored = ["profiling", "tracing"]

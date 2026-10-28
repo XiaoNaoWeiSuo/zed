@@ -257,3 +257,19 @@ mod tests {
         assert!(*task_ran.borrow());
     }
 }
+
+/// Sets the application icon from PNG bytes.
+///
+/// This only affects the running process; bundle icons are configured by the
+/// packaging metadata.
+pub fn set_application_icon(png: &[u8]) {
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::set_application_icon(png);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = png;
+    }
+}

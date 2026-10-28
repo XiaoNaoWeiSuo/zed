@@ -126,12 +126,12 @@ static SUPPRESSED_EXTENSIONS: LazyLock<FxHashSet<&str>> = LazyLock::new(|| {
     ])
 });
 
-/// Returns the [`SchemaVersion`] range that is compatible with this version of Zed.
+/// Returns the [`SchemaVersion`] range that is compatible with this version of Lin.
 pub fn schema_version_range() -> RangeInclusive<SchemaVersion> {
     SchemaVersion::ZERO..=SchemaVersion::CURRENT
 }
 
-/// Returns whether the given extension version is compatible with this version of Zed.
+/// Returns whether the given extension version is compatible with this version of Lin.
 pub fn is_version_compatible(
     release_channel: ReleaseChannel,
     extension_version: &ExtensionMetadata,
@@ -739,7 +739,7 @@ impl ExtensionStore {
         self.fetch_extensions_from_api(&format!("/extensions/{extension_id}"), &[], cx)
     }
 
-    /// Installs any extensions that should be included with Zed by default.
+    /// Installs any extensions that should be included with Lin by default.
     ///
     /// This can be used to make certain functionality provided by extensions
     /// available out-of-the-box.

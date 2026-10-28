@@ -1,11 +1,11 @@
 ---
 title: Haskell
-description: "Configure Haskell language support in Zed, including language servers, formatting, and debugging."
+description: "Configure Haskell language support in Lin, including language servers, formatting, and debugging."
 ---
 
 # Haskell
 
-Haskell support is available through the [Haskell extension](https://github.com/zed-extensions/haskell).
+Haskell support is available through the [Haskell extension](https://github.com/lin-extensions/haskell).
 
 - Tree-sitter: [tree-sitter-haskell](https://github.com/tree-sitter/tree-sitter-haskell)
 - Language Server: [haskell-language-server](https://github.com/haskell/haskell-language-server)
@@ -22,7 +22,7 @@ which haskell-language-server-wrapper
 
 ## Configuring HLS
 
-If you need to configure haskell-language-server (hls) you can add configuration options to your Zed settings.json:
+If you need to configure haskell-language-server (hls) you can add configuration options to your Lin settings.json:
 
 ```json [settings]
 {

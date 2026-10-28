@@ -189,7 +189,12 @@ impl Telemetry {
         cx: &mut App,
     ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(TelemetryState {
-            settings: *TelemetrySettings::get_global(cx),
+            settings: {
+                let mut settings = *TelemetrySettings::get_global(cx);
+                settings.metrics = false;
+                settings.diagnostics = false;
+                settings
+            },
             architecture: env::consts::ARCH,
             release_channel: ReleaseChannel::try_global(cx),
             system_id: None,
@@ -229,6 +234,8 @@ impl Telemetry {
             move |cx| {
                 let mut state = state.lock();
                 state.settings = *TelemetrySettings::get_global(cx);
+                state.settings.metrics = false;
+                state.settings.diagnostics = false;
             }
         })
         .detach();

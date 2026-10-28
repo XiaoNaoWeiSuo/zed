@@ -1,17 +1,17 @@
 ---
-title: Helix Mode - Zed
-description: Helix-style keybindings and modal editing in Zed. Selection-first editing built on top of Vim mode.
+title: Helix Mode - Lin
+description: Helix-style keybindings and modal editing in Lin. Selection-first editing built on top of Vim mode.
 ---
 
 # Helix Mode
 
 _Work in progress. Not all Helix keybindings are implemented yet._
 
-Zed's Helix mode is an emulation layer that brings Helix-style keybindings and modal editing to Zed. It builds upon Zed's [Vim mode](./vim.md), so much of the core functionality is shared. Enabling `helix_mode` will also enable `vim_mode`.
+Lin's Helix mode is an emulation layer that brings Helix-style keybindings and modal editing to Lin. It builds upon Lin's [Vim mode](./vim.md), so much of the core functionality is shared. Enabling `helix_mode` will also enable `vim_mode`.
 
 For a guide on Vim-related features that are also available in Helix mode, please refer to our [Vim mode documentation](./vim.md).
 
-To check the current status of Helix mode, or to request a missing Helix feature, see the ["Are we Helix yet?" discussion](https://github.com/zed-industries/zed/discussions/33580).
+To check the current status of Helix mode, or to request a missing Helix feature, see the ["Are we Helix yet?" discussion](https://github.com/lin-editor/lin/discussions/33580).
 
 For a detailed list of Helix's default keybindings, please visit the [official Helix documentation](https://docs.helix-editor.com/keymap.html).
 

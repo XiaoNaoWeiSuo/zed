@@ -163,7 +163,7 @@ pub use workspace_settings::{
     RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
     closing_last_window_quits_app, observe_accessible_mode,
 };
-use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
+use zed_actions::{Spawn, theme::ToggleMode};
 
 use crate::{dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId};
 use crate::{
@@ -9697,11 +9697,6 @@ fn notify_if_database_failed(window: WindowHandle<MultiWorkspace>, cx: &mut Asyn
                         |cx| {
                             cx.new(|cx| {
                                 MessageNotification::new("Failed to load the database file.", cx)
-                                    .primary_message("File an Issue")
-                                    .primary_icon(IconName::Plus)
-                                    .primary_on_click(|window, cx| {
-                                        window.dispatch_action(Box::new(FileBugReport), cx)
-                                    })
                             })
                         },
                     );
@@ -10668,9 +10663,9 @@ actions!(
         /// Use `collab_panel::OpenSelectedChannelNotes` to open the channel notes for the selected
         /// channel in the collab panel.
         ///
-        /// If you want to open a specific channel, use `zed::OpenZedUrl` with a channel notes URL -
+        /// If you want to open a specific channel, use `zed::OpenLinUrl` with a channel notes URL -
         /// can be copied via "Copy link to section" in the context menu of the channel notes
-        /// buffer. These URLs look like `https://zed.dev/channel/channel-name-CHANNEL_ID/notes`.
+        /// buffer. These URLs look like `https://lin.dev/channel/channel-name-CHANNEL_ID/notes`.
         OpenChannelNotes,
         /// Mutes your microphone.
         Mute,
@@ -10698,9 +10693,9 @@ pub struct OpenChannelNotesById {
 actions!(
     zed,
     [
-        /// Opens the Zed log file.
+        /// Opens the Lin log file.
         OpenLog,
-        /// Reveals the Zed log file in the system file manager.
+        /// Reveals the Lin log file in the system file manager.
         RevealLogInFileManager
     ]
 );

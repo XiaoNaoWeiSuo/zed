@@ -5,6 +5,7 @@ pub(crate) mod mac_only_instance;
 mod migrate;
 #[cfg(target_os = "macos")]
 pub(crate) mod move_to_applications;
+mod multibuffer_hint;
 mod open_listener;
 mod open_url_modal;
 mod quick_action_bar;
@@ -22,7 +23,6 @@ pub use app_menus::*;
 use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
-use client::zed_urls;
 use collections::VecDeque;
 use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
@@ -54,7 +54,6 @@ use language_tools::lsp_log_view::LspLogToolbarItemView;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use migrate::{MigrationBanner, MigrationEvent, MigrationNotification, MigrationType};
 use migrator::migrate_keymap;
-use onboarding::multibuffer_hint::MultibufferHint;
 pub use open_listener::*;
 use outline_panel::OutlinePanel;
 use paths::{
@@ -103,16 +102,13 @@ use workspace::{
     WorkspaceSettings, create_and_open_local_file,
     notifications::simple_message_notification::MessageNotification, open_new,
 };
-use workspace::{CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace};
+use workspace::{CloseProject, CloseWindow, with_active_or_new_workspace};
 use workspace::{Pane, notifications::DetachAndPromptErr};
-use zed_actions::{
-    About, GetMerch, OpenAccountSettings, OpenBrowser, OpenDocs, OpenProjectTasks,
-    OpenServerSettings, OpenSettingsFile, OpenStatusPage, OpenZedUrl, Quit,
-};
 
-const DOCS_URL: &str = "https://zed.dev/docs/";
-const STATUS_URL: &str = "https://status.zed.dev";
-const MERCH_URL: &str = "https://merch.zed.dev/";
+use multibuffer_hint::MultibufferHint;
+use zed_actions::{
+    About, OpenBrowser, OpenProjectTasks, OpenServerSettings, OpenSettingsFile, OpenZedUrl, Quit,
+};
 
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
@@ -199,8 +195,6 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
 
-    cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
-
     cx.observe_flag::<PanicFeatureFlag, _>({
         let mut added = false;
         move |flag, cx| {
@@ -221,7 +215,7 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
-    // When Zed logs to stdout rather than the log file, avoid registering
+    // When Lin logs to stdout rather than the log file, avoid registering
     // handlers for both `OpenLog` and `RevealLogInFileManager`, as the log file
     // does not exist in that scenario and these actions would error.
     if !crate::stdout_is_a_pty() {
@@ -265,11 +259,6 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
-        });
-    })
-    .on_action(|_: &OpenAccountSettings, cx| {
-        with_active_or_new_workspace(cx, |_, _, cx| {
-            cx.open_url(&zed_urls::account_url(cx));
         });
     })
     .on_action(|_: &OpenTasks, cx| {
@@ -401,12 +390,10 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
         show: false,
         kind: WindowKind::Normal,
         is_movable: true,
-        // Zed draws its own titlebar and moves the window via [`Window::start_window_move`],
-        // so on macOS AppKit should not own titlebar dragging. This avoids the titlebar
-        // click delay from AppKit's drag disambiguation (first observed on macOS 27) while
-        // keeping the window movable and the Window-menu tiling items enabled. No-op on
-        // other platforms.
-        app_owns_titlebar_drag: true,
+        // Let AppKit own titlebar dragging. GPUI's custom drag path relies on
+        // `NSApplication.currentEvent` and silently does nothing in dev runs that are
+        // not launched from an app bundle.
+        app_owns_titlebar_drag: false,
         display_id: display.map(|display| display.id()),
         window_background: cx.theme().window_background_appearance(),
         app_id: Some(app_id.to_owned()),
@@ -781,8 +768,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        let channels_panel =
-            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -805,7 +790,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
@@ -919,9 +903,6 @@ fn register_actions(
     cx: &mut Context<Workspace>,
 ) {
     workspace
-        .register_action(|_, _: &OpenDocs, _, cx| cx.open_url(DOCS_URL))
-        .register_action(|_, _: &OpenStatusPage, _, cx| cx.open_url(STATUS_URL))
-        .register_action(|_, _: &GetMerch, _, cx| cx.open_url(MERCH_URL))
         .register_action(
             |workspace: &mut Workspace,
              _: &input_latency_ui::DumpInputLatencyHistogram,
@@ -1280,7 +1261,7 @@ fn register_actions(
                         Toast::new(
                             NotificationId::unique::<RegisterZedScheme>(),
                             format!(
-                                "zed:// links will now open in {}.",
+                                "lin:// links will now open in {}.",
                                 ReleaseChannel::global(cx).display_name()
                             ),
                         ),
@@ -1290,7 +1271,7 @@ fn register_actions(
                 Ok(())
             })
             .detach_and_prompt_err(
-                "Error registering zed:// scheme",
+                "Error registering lin:// scheme",
                 window,
                 cx,
                 |_, _, _| None,
@@ -1314,14 +1295,6 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 workspace.toggle_panel_focus::<OutlinePanel>(window, cx);
-            },
-        )
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &collab_ui::collab_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
             },
         )
         .register_action(
@@ -1718,7 +1691,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Lin".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
@@ -3880,7 +3853,7 @@ mod tests {
                     "parent": {"README.md": "", "src": {"README.md": ""}},
                     "local_settings": {
                         "README.md": "",
-                        ".zed": {
+                        ".lin": {
                             "settings.json": r#"{"on_new_window": "readme"}"#
                         }
                     },
@@ -5815,7 +5788,6 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             client::init(&app_state.client, cx);
             workspace::init(app_state.clone(), cx);
-            onboarding::init(cx);
             app_state
         })
     }
@@ -6209,7 +6181,6 @@ mod tests {
                 "app_menu",
                 "assistant",
                 "assistant2",
-                "auto_update",
                 "branch_picker",
                 "bedrock",
                 "branches",
@@ -6232,7 +6203,6 @@ mod tests {
                 "edit_prediction",
                 "editor",
                 "encoding_selector",
-                "feedback",
                 "file_finder",
                 "git",
                 "git_graph",
@@ -6243,7 +6213,6 @@ mod tests {
                 "highlights_tree_view",
                 "icon_theme_selector",
                 "image_viewer",
-                "inline_assistant",
                 "journal",
                 "keymap_editor",
                 "keystroke_input",
@@ -6257,7 +6226,6 @@ mod tests {
                 "multi_workspace",
                 "new_process_modal",
                 "notebook",
-                "onboarding",
                 "outline",
                 "outline_panel",
                 "pane",
@@ -6296,7 +6264,6 @@ mod tests {
                 "zed",
                 "zed_actions",
                 "zed_predict_onboarding",
-                "zeta",
             ];
             assert_eq!(
                 all_namespaces,
@@ -6497,14 +6464,8 @@ mod tests {
             );
             image_viewer::init(cx);
             language_model::init(cx);
-            client::RefreshLlmTokenListener::register(
-                app_state.client.clone(),
-                app_state.user_store.clone(),
-                cx,
-            );
             language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
             web_search::init(cx);
-            web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             let prompt_builder = PromptBuilder::load(app_state.fs.clone(), false, cx);
             project::AgentRegistryStore::init_global(
                 cx,
@@ -6598,14 +6559,14 @@ mod tests {
             .insert_tree(
                 Path::new("/root"),
                 json!({
-                    ".zed": {
+                    ".lin": {
                         "settings.json": settings_init
                     }
                 }),
             )
             .await;
 
-        eprintln!("Created project with .zed/settings.json containing UNIQUEVALUE");
+        eprintln!("Created project with .lin/settings.json containing UNIQUEVALUE");
 
         // 2. Create a project with the file system and load it
         let project = Project::test(app_state.fs.clone(), [Path::new("/root")], cx).await;
@@ -6613,7 +6574,7 @@ mod tests {
         // Save original settings content for comparison
         let original_settings = app_state
             .fs
-            .load(Path::new("/root/.zed/settings.json"))
+            .load(Path::new("/root/.lin/settings.json"))
             .await
             .unwrap();
 
@@ -6626,35 +6587,35 @@ mod tests {
             "Test setup failed - settings file doesn't contain our marker"
         );
 
-        // 3. Add .zed to file scan exclusions in user settings
+        // 3. Add .lin to file scan exclusions in user settings
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |worktree_settings| {
                 worktree_settings.project.worktree.file_scan_exclusions =
-                    Some(SplicingVec::from(vec![".zed".to_string()]));
+                    Some(SplicingVec::from(vec![".lin".to_string()]));
             });
         });
 
-        eprintln!("Added .zed to file_scan_exclusions in settings");
+        eprintln!("Added .lin to file_scan_exclusions in settings");
 
         // 4. Run tasks to apply settings
         cx.background_executor.run_until_parked();
 
-        // 5. Critical: Verify .zed is actually excluded from worktree
+        // 5. Critical: Verify .lin is actually excluded from worktree
         let worktree = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap());
 
         let has_zed_entry =
-            cx.update(|cx| worktree.read(cx).entry_for_path(rel_path(".zed")).is_some());
+            cx.update(|cx| worktree.read(cx).entry_for_path(rel_path(".lin")).is_some());
 
         eprintln!(
-            "Is .zed directory visible in worktree after exclusion: {}",
+            "Is .lin directory visible in worktree after exclusion: {}",
             has_zed_entry
         );
 
         // This assertion verifies the test is set up correctly to show the bug
-        // If .zed is not excluded, the test will fail here
+        // If .lin is not excluded, the test will fail here
         assert!(
             !has_zed_entry,
-            "Test precondition failed: .zed directory should be excluded but was found in worktree"
+            "Test precondition failed: .lin directory should be excluded but was found in worktree"
         );
 
         // 6. Create workspace and trigger the actual function that causes the bug
@@ -6679,7 +6640,7 @@ mod tests {
         // 8. Verify file contents after calling function
         let new_content = app_state
             .fs
-            .load(Path::new("/root/.zed/settings.json"))
+            .load(Path::new("/root/.lin/settings.json"))
             .await
             .unwrap();
 
