@@ -3,10 +3,11 @@ use collections::{HashMap, IndexMap};
 use credentials_provider::CredentialsProvider;
 use deepseek::DEEPSEEK_API_URL;
 
-use futures::Stream;
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
+use futures::{
+    AsyncReadExt as _, FutureExt, Stream, StreamExt, future::BoxFuture, stream::BoxStream,
+};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task};
-use http_client::{CustomHeaders, HttpClient};
+use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request};
 use language_model::{
     ApiKeyConfiguration, ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel,
     LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -14,14 +15,15 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
     LanguageModelToolChoiceSupport, LanguageModelToolResultContent, LanguageModelToolUse,
-    MessageContent, ModelRateLimiters, ProviderSettingsView, RateLimiter, Role, StopReason,
-    TokenUsage, env_var, unavailable_error,
+    MessageContent, ModelRateLimiters, ProviderSettingsView, ProviderUsage, RateLimiter, Role,
+    StopReason, TokenUsage, env_var, unavailable_error,
 };
 pub use settings::DeepseekAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
+use serde::Deserialize;
 use ui::IconName;
 
 use language_model::util::{fix_streamed_json, parse_tool_arguments};
@@ -212,6 +214,30 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
         self.state.update(cx, |state, cx| state.authenticate(cx))
+    }
+
+    fn usage(&self, cx: &mut App) -> Task<Option<ProviderUsage>> {
+        let api_url = Self::api_url(cx);
+        let Some(api_key) = self.state.read(cx).api_key_state.key(&api_url) else {
+            return Task::ready(None);
+        };
+        let http_client = self.http_client.clone();
+        let balance_url = format!(
+            "{}/user/balance",
+            api_url.trim_end_matches('/').trim_end_matches("/v1")
+        );
+        cx.background_spawn(async move {
+            match fetch_balance(http_client, api_key, &balance_url).await {
+                Ok(balance) => Some(ProviderUsage {
+                    balance: Some(balance),
+                    windows: Vec::new(),
+                }),
+                Err(error) => {
+                    log::debug!("failed to fetch DeepSeek balance: {error:#}");
+                    None
+                }
+            }
+        })
     }
 
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
@@ -756,4 +782,56 @@ mod tests {
         }
         Ok(())
     }
+}
+
+#[derive(Deserialize, Default)]
+struct BalanceResponse {
+    #[serde(default)]
+    is_available: bool,
+    #[serde(default)]
+    balance_infos: Vec<BalanceInfo>,
+}
+
+#[derive(Deserialize, Default)]
+struct BalanceInfo {
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    total_balance: String,
+}
+
+async fn fetch_balance(
+    http_client: Arc<dyn HttpClient>,
+    api_key: Arc<str>,
+    url: &str,
+) -> Result<String> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Accept", "application/json");
+    let mut response = http_client
+        .send(request.body(AsyncBody::empty())?)
+        .await
+        .map_err(|error| anyhow!("requesting DeepSeek balance: {error}"))?;
+    if !response.status().is_success() {
+        return Err(anyhow!("DeepSeek balance returned {}", response.status()));
+    }
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(|error| anyhow!("reading DeepSeek balance: {error}"))?;
+    let response: BalanceResponse = serde_json::from_str(&body)
+        .map_err(|error| anyhow!("parsing DeepSeek balance: {error}"))?;
+    if !response.is_available || response.balance_infos.is_empty() {
+        return Err(anyhow!("DeepSeek balance is unavailable"));
+    }
+    Ok(response
+        .balance_infos
+        .into_iter()
+        .map(|info| format!("{} {}", info.total_balance, info.currency))
+        .collect::<Vec<_>>()
+        .join(" · "))
 }

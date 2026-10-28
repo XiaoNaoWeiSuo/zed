@@ -1314,6 +1314,8 @@ pub struct Thread {
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    request_started_at: Option<Instant>,
+    first_token_at: Option<Instant>,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1463,6 +1465,8 @@ impl Thread {
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
+            request_started_at: None,
+            first_token_at: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1839,6 +1843,8 @@ impl Thread {
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
+            request_started_at: None,
+            first_token_at: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -3032,6 +3038,8 @@ impl Thread {
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
                 this.current_request_token_usage = TokenUsage::default();
+                this.request_started_at = Some(Instant::now());
+                this.first_token_at = None;
                 anyhow::Ok((model, provider, request))
             })??;
 
@@ -3621,6 +3629,52 @@ impl Thread {
     /// A helper method that's called on every streamed completion event.
     /// Returns an optional tool result task, which the main agentic loop will
     /// send back to the model when it resolves.
+    fn note_first_token(&mut self, cx: &mut Context<Self>) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Instant::now());
+            self.publish_run_metrics(cx, true);
+        }
+    }
+
+    fn publish_run_metrics(&self, cx: &mut Context<Self>, running: bool) {
+        let usage = self.current_request_token_usage;
+        let input_tokens =
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+        let cache_hit_rate =
+            (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
+        let elapsed = self
+            .first_token_at
+            .or(self.request_started_at)
+            .map(|started| started.elapsed())
+            .filter(|elapsed| elapsed.as_secs_f32() > 0.0);
+        let tokens_per_second =
+            elapsed.map(|elapsed| usage.output_tokens as f32 / elapsed.as_secs_f32());
+        let time_to_first_token = match (self.request_started_at, self.first_token_at) {
+            (Some(started), Some(first_token)) => Some(first_token.duration_since(started)),
+            _ => None,
+        };
+        let provider = self.model().map(|model| model.provider_id());
+        let model = self
+            .model()
+            .map(|model| SharedString::from(model.name().0.clone()));
+
+        let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
+        metrics.update(cx, |metrics, cx| {
+            metrics.update(cx, |metrics| {
+                metrics.running = running;
+                if provider.is_some() {
+                    metrics.provider = provider.clone();
+                }
+                if model.is_some() {
+                    metrics.model = model.clone();
+                }
+                metrics.cache_hit_rate = cache_hit_rate;
+                metrics.tokens_per_second = tokens_per_second;
+                metrics.time_to_first_token = time_to_first_token;
+            });
+        });
+    }
+
     fn handle_completion_event(
         &mut self,
         event: LanguageModelCompletionEvent,
@@ -3636,8 +3690,12 @@ impl Thread {
                 self.flush_pending_message(cx);
                 self.pending_message = Some(AgentMessage::default());
             }
-            Text(new_text) => self.handle_text_event(new_text, event_stream),
+            Text(new_text) => {
+                self.note_first_token(cx);
+                self.handle_text_event(new_text, event_stream)
+            }
             Thinking { text, signature } => {
+                self.note_first_token(cx);
                 self.handle_thinking_event(text, signature, event_stream)
             }
             RedactedThinking { data } => self.handle_redacted_thinking_event(data),
@@ -3654,6 +3712,7 @@ impl Thread {
                 }
             }
             ToolUse(tool_use) => {
+                self.note_first_token(cx);
                 return Ok(self.handle_tool_use_event(tool_use, event_stream, cancellation_rx, cx));
             }
             ToolUseJsonParseError {
@@ -3692,11 +3751,26 @@ impl Thread {
                     telemetry.emit("succeeded", None, Some(total_input_tokens(usage)));
                 }
                 self.update_token_usage(usage, cx);
+                self.publish_run_metrics(cx, true);
             }
-            Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
-            Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
-            Stop(StopReason::ToolUse | StopReason::EndTurn) => {}
-            Started | Queued { .. } | Compaction(_) => {}
+            Stop(StopReason::Refusal) => {
+                self.publish_run_metrics(cx, false);
+                return Err(CompletionError::Refusal.into());
+            }
+            Stop(StopReason::MaxTokens) => {
+                self.publish_run_metrics(cx, false);
+                return Err(CompletionError::MaxTokens.into());
+            }
+            Stop(StopReason::ToolUse | StopReason::EndTurn) => {
+                self.publish_run_metrics(cx, false);
+            }
+            Started => {
+                if self.request_started_at.is_none() {
+                    self.request_started_at = Some(Instant::now());
+                }
+                self.publish_run_metrics(cx, true);
+            }
+            Queued { .. } | Compaction(_) => {}
         }
 
         Ok(None)

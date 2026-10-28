@@ -1,18 +1,19 @@
 use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
-use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
+use futures::{AsyncReadExt as _, FutureExt as _};
 
 use gpui::{App, AsyncApp, Context, Entity, SharedString, Task, Window};
-use http_client::HttpClient;
+use http_client::{AsyncBody, HttpClient, Method, Request};
 use language_model::{
     AuthenticateError, CompactionResult, FastModeConfirmation, IconOrSvg, InlineDescription,
     LanguageModel, LanguageModelClient, LanguageModelCompletionError,
     LanguageModelCompletionStream, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest, ModelRateLimiters,
-    ProviderSettingsView, unavailable_error,
+    ProviderSettingsView, ProviderUsage, ProviderUsageWindow, unavailable_error,
 };
 use openai_subscribed::{ChatGptModel, PROVIDER_ID, PROVIDER_NAME, State, language_model};
+use serde::Deserialize;
 use std::sync::Arc;
 use ui::{ConfiguredApiCard, prelude::*};
 
@@ -128,6 +129,22 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
         } else {
             Task::ready(Err(AuthenticateError::CredentialsNotFound))
         }
+    }
+
+    fn usage(&self, cx: &mut App) -> Task<Option<ProviderUsage>> {
+        let Some((access_token, account_id)) = self.state.read(cx).usage_credentials() else {
+            return Task::ready(None);
+        };
+        let http_client = self.state.read(cx).usage_http_client();
+        cx.background_spawn(async move {
+            match fetch_codex_usage(http_client, access_token, account_id).await {
+                Ok(usage) => Some(usage),
+                Err(error) => {
+                    log::debug!("failed to fetch ChatGPT usage: {error:#}");
+                    None
+                }
+            }
+        })
     }
 
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
@@ -442,4 +459,106 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
+}
+
+#[derive(Deserialize, Default)]
+struct CodexUsage {
+    #[serde(default)]
+    rate_limit: Option<CodexRateLimit>,
+    #[serde(default)]
+    credits: Option<CodexCredits>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexRateLimit {
+    #[serde(default)]
+    primary_window: Option<CodexWindow>,
+    #[serde(default)]
+    secondary_window: Option<CodexWindow>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexWindow {
+    #[serde(default)]
+    used_percent: f64,
+    #[serde(default)]
+    reset_at: Option<i64>,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexCredits {
+    #[serde(default)]
+    has_credits: bool,
+    #[serde(default)]
+    unlimited: bool,
+    #[serde(default)]
+    balance: Option<f64>,
+}
+
+async fn fetch_codex_usage(
+    http_client: Arc<dyn HttpClient>,
+    access_token: String,
+    account_id: Option<String>,
+) -> Result<ProviderUsage> {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("https://chatgpt.com/backend-api/wham/usage")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Accept", "application/json");
+    if let Some(account_id) = account_id {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let mut response = http_client
+        .send(request.body(AsyncBody::empty())?)
+        .await
+        .map_err(|error| anyhow!("requesting ChatGPT usage: {error}"))?;
+    if !response.status().is_success() {
+        return Err(anyhow!("ChatGPT usage returned {}", response.status()));
+    }
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(|error| anyhow!("reading ChatGPT usage: {error}"))?;
+    let usage: CodexUsage =
+        serde_json::from_str(&body).map_err(|error| anyhow!("parsing ChatGPT usage: {error}"))?;
+
+    let mut windows = Vec::new();
+    if let Some(rate_limit) = usage.rate_limit {
+        for window in [rate_limit.primary_window, rate_limit.secondary_window]
+            .into_iter()
+            .flatten()
+        {
+            let label = match window.limit_window_seconds {
+                Some(18_000) => "5h".to_string(),
+                Some(604_800) => "Weekly".to_string(),
+                Some(seconds) if seconds % 3_600 == 0 => format!("{}h", seconds / 3_600),
+                Some(seconds) => format!("{}m", seconds / 60),
+                None => "Limit".to_string(),
+            };
+            windows.push(ProviderUsageWindow {
+                label,
+                used_percent: window.used_percent as f32,
+                resets_at_unix: window.reset_at,
+            });
+        }
+    }
+
+    let balance = usage.credits.and_then(|credits| {
+        if credits.unlimited {
+            Some("Unlimited credits".to_string())
+        } else if credits.has_credits {
+            credits
+                .balance
+                .map(|balance| format!("{balance:.0} credits"))
+        } else {
+            None
+        }
+    });
+
+    Ok(ProviderUsage { balance, windows })
 }

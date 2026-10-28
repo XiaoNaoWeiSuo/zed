@@ -184,6 +184,20 @@ impl State {
         }
     }
 
+    /// Returns the OAuth access token and optional account id for read-only usage queries.
+    pub fn usage_credentials(&self) -> Option<(String, Option<String>)> {
+        self.credentials.as_ref().map(|credentials| {
+            (
+                credentials.access_token.clone(),
+                credentials.account_id.clone(),
+            )
+        })
+    }
+
+    pub fn usage_http_client(&self) -> Arc<dyn HttpClient> {
+        self.http_client.clone()
+    }
+
     pub fn is_authenticated(&self) -> bool {
         self.credentials.is_some()
     }

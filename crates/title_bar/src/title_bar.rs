@@ -1,7 +1,9 @@
+mod agent_usage;
 mod application_menu;
 pub mod collab;
 mod title_bar_settings;
 
+use crate::agent_usage::AgentUsageIndicator;
 use crate::application_menu::{ApplicationMenu, show_menus};
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
@@ -180,6 +182,7 @@ fn set_window_layout(layout: WindowLayout, cx: &App) {
 
 pub struct TitleBar {
     platform_titlebar: Entity<PlatformTitleBar>,
+    agent_usage: Entity<AgentUsageIndicator>,
     project: Entity<Project>,
     user_store: Entity<UserStore>,
     workspace: WeakEntity<Workspace>,
@@ -329,7 +332,14 @@ impl Render for TitleBar {
         children.push(
             h_flex()
                 .pr_1()
-                .gap_1()
+                .gap_2()
+                .child(self.agent_usage.clone())
+                .child(
+                    IconButton::new("open-settings", IconName::Settings)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Settings"))
+                        .on_click(|_, _window, cx| cx.dispatch_action(&zed_actions::OpenSettings)),
+                )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         );
@@ -442,6 +452,7 @@ impl TitleBar {
 
         Self {
             platform_titlebar,
+            agent_usage: cx.new(AgentUsageIndicator::new),
             application_menu,
             workspace: workspace.weak_handle(),
             multi_workspace,

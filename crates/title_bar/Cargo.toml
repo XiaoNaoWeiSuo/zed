@@ -29,6 +29,9 @@ test-support = [
 ]
 
 [dependencies]
+language_model.workspace = true
+chrono.workspace = true
+agent.workspace = true
 agent_settings.workspace = true
 fs.workspace = true
 platform_title_bar.workspace = true

@@ -544,6 +544,23 @@ pub trait LanguageModelClient: 'static {
     }
 }
 
+/// Provider-reported account limits or balance, when the provider exposes them.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderUsage {
+    /// A preformatted balance, e.g. `"$12.34"` or `"110.00 CNY"`.
+    pub balance: Option<String>,
+    pub windows: Vec<ProviderUsageWindow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderUsageWindow {
+    pub label: String,
+    /// Percentage of the window already used, from 0 to 100.
+    pub used_percent: f32,
+    /// Unix timestamp at which the window resets.
+    pub resets_at_unix: Option<i64>,
+}
+
 pub trait LanguageModelProvider: LanguageModelClient {
     fn id(&self) -> LanguageModelProviderId;
     fn name(&self) -> LanguageModelProviderName;
@@ -564,6 +581,12 @@ pub trait LanguageModelProvider: LanguageModelClient {
 
     fn set_api_key(&self, _key: Option<String>, _cx: &mut App) -> Task<Result<()>> {
         Task::ready(Ok(()))
+    }
+
+    /// Fetches the provider's current balance or rate-limit windows, when the
+    /// provider exposes an API for it.
+    fn usage(&self, _cx: &mut App) -> Task<Option<ProviderUsage>> {
+        Task::ready(None)
     }
 
     /// Copy shown when this provider rejects a request as unauthenticated
