@@ -13,7 +13,6 @@ use language_model::{
     ProviderSettingsView, ProviderUsage, ProviderUsageWindow, unavailable_error,
 };
 use openai_subscribed::{ChatGptModel, PROVIDER_ID, PROVIDER_NAME, State, language_model};
-use serde::Deserialize;
 use std::sync::Arc;
 use ui::{ConfiguredApiCard, prelude::*};
 
@@ -132,15 +131,15 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
     }
 
     fn usage(&self, cx: &mut App) -> Task<Option<ProviderUsage>> {
-        let Some((access_token, account_id)) = self.state.read(cx).usage_credentials() else {
-            return Task::ready(None);
-        };
-        let http_client = self.state.read(cx).usage_http_client();
-        cx.background_spawn(async move {
+        let credentials = self
+            .state
+            .update(cx, |state, cx| state.fresh_usage_credentials(cx));
+        cx.spawn(async move |_| {
+            let (http_client, access_token, account_id) = credentials.await?;
             match fetch_codex_usage(http_client, access_token, account_id).await {
                 Ok(usage) => Some(usage),
                 Err(error) => {
-                    log::debug!("failed to fetch ChatGPT usage: {error:#}");
+                    log::warn!("failed to fetch ChatGPT usage: {error:#}");
                     None
                 }
             }
@@ -461,40 +460,43 @@ mod tests {
     }
 }
 
-#[derive(Deserialize, Default)]
-struct CodexUsage {
-    #[serde(default)]
-    rate_limit: Option<CodexRateLimit>,
-    #[serde(default)]
-    credits: Option<CodexCredits>,
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
-#[derive(Deserialize, Default)]
-struct CodexRateLimit {
-    #[serde(default)]
-    primary_window: Option<CodexWindow>,
-    #[serde(default)]
-    secondary_window: Option<CodexWindow>,
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
-#[derive(Deserialize, Default)]
-struct CodexWindow {
-    #[serde(default)]
-    used_percent: f64,
-    #[serde(default)]
-    reset_at: Option<i64>,
-    #[serde(default)]
-    limit_window_seconds: Option<i64>,
-}
-
-#[derive(Deserialize, Default)]
-struct CodexCredits {
-    #[serde(default)]
-    has_credits: bool,
-    #[serde(default)]
-    unlimited: bool,
-    #[serde(default)]
-    balance: Option<f64>,
+fn parse_window(value: &serde_json::Value) -> Option<ProviderUsageWindow> {
+    let used_percent = json_f64(value.get("used_percent")?)? as f32;
+    let limit_window_seconds = value.get("limit_window_seconds").and_then(json_i64);
+    let resets_at_unix = value.get("reset_at").and_then(json_i64).or_else(|| {
+        let after = value.get("reset_after_seconds").and_then(json_i64)?;
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or_default()
+                + after,
+        )
+    });
+    let label = match limit_window_seconds {
+        Some(18_000) => "5h".to_string(),
+        Some(604_800) => "Weekly".to_string(),
+        Some(seconds) if seconds % 3_600 == 0 => format!("{}h", seconds / 3_600),
+        Some(seconds) => format!("{}m", seconds / 60),
+        None => "Limit".to_string(),
+    };
+    Some(ProviderUsageWindow {
+        label,
+        used_percent,
+        resets_at_unix,
+    })
 }
 
 async fn fetch_codex_usage(
@@ -515,48 +517,49 @@ async fn fetch_codex_usage(
         .send(request.body(AsyncBody::empty())?)
         .await
         .map_err(|error| anyhow!("requesting ChatGPT usage: {error}"))?;
-    if !response.status().is_success() {
-        return Err(anyhow!("ChatGPT usage returned {}", response.status()));
-    }
+    let status = response.status();
     let mut body = String::new();
     response
         .body_mut()
         .read_to_string(&mut body)
         .await
         .map_err(|error| anyhow!("reading ChatGPT usage: {error}"))?;
-    let usage: CodexUsage =
-        serde_json::from_str(&body).map_err(|error| anyhow!("parsing ChatGPT usage: {error}"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "ChatGPT usage returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    let root: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        anyhow!(
+            "parsing ChatGPT usage: {error}; body: {}",
+            body.chars().take(300).collect::<String>()
+        )
+    })?;
 
+    let rate_limit = root
+        .get("rate_limit")
+        .or_else(|| root.get("rate_limits"))
+        .unwrap_or(&serde_json::Value::Null);
     let mut windows = Vec::new();
-    if let Some(rate_limit) = usage.rate_limit {
-        for window in [rate_limit.primary_window, rate_limit.secondary_window]
-            .into_iter()
-            .flatten()
-        {
-            let label = match window.limit_window_seconds {
-                Some(18_000) => "5h".to_string(),
-                Some(604_800) => "Weekly".to_string(),
-                Some(seconds) if seconds % 3_600 == 0 => format!("{}h", seconds / 3_600),
-                Some(seconds) => format!("{}m", seconds / 60),
-                None => "Limit".to_string(),
-            };
-            windows.push(ProviderUsageWindow {
-                label,
-                used_percent: window.used_percent as f32,
-                resets_at_unix: window.reset_at,
-            });
+    for key in ["primary_window", "secondary_window"] {
+        if let Some(window) = rate_limit.get(key).and_then(parse_window) {
+            windows.push(window);
         }
     }
 
-    let balance = usage.credits.and_then(|credits| {
-        if credits.unlimited {
-            Some("Unlimited credits".to_string())
-        } else if credits.has_credits {
-            credits
-                .balance
-                .map(|balance| format!("{balance:.0} credits"))
+    let balance = root.get("credits").and_then(|credits| {
+        if credits.get("unlimited").and_then(|v| v.as_bool()) == Some(true) {
+            return Some("Unlimited credits".to_string());
+        }
+        if credits.get("has_credits").and_then(|v| v.as_bool()) != Some(true) {
+            return None;
+        }
+        let balance = credits.get("balance")?;
+        if let Some(balance) = balance.as_str() {
+            Some(balance.to_string())
         } else {
-            None
+            balance.as_f64().map(|balance| format!("${balance:.2}"))
         }
     });
 

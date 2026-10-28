@@ -198,6 +198,28 @@ impl State {
         self.http_client.clone()
     }
 
+    /// Returns refreshed credentials and the HTTP client for a usage query.
+    pub fn fresh_usage_credentials(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<(Arc<dyn HttpClient>, String, Option<String>)>> {
+        let weak = cx.weak_entity();
+        let http_client = self.http_client.clone();
+        cx.spawn(async move |_this, cx| {
+            match get_fresh_credentials(&weak, &http_client, cx).await {
+                Ok(credentials) => Some((
+                    http_client,
+                    credentials.access_token,
+                    credentials.account_id,
+                )),
+                Err(error) => {
+                    log::warn!("ChatGPT usage credential refresh failed: {error}");
+                    None
+                }
+            }
+        })
+    }
+
     pub fn is_authenticated(&self) -> bool {
         self.credentials.is_some()
     }

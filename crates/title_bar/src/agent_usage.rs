@@ -79,8 +79,15 @@ impl AgentUsageIndicator {
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let usage = usage_task.await;
             this.update(cx, |this, cx| {
+                let fetched = usage.is_some();
                 this.usage = usage;
-                this.last_usage_fetch = Some(Instant::now());
+                if fetched {
+                    this.last_usage_fetch = Some(Instant::now());
+                } else {
+                    // Retry later instead of caching a transient failure.
+                    this.usage_provider = None;
+                    this.last_usage_fetch = None;
+                }
                 cx.notify();
             })
             .ok();
