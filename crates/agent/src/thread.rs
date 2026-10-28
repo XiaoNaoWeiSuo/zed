@@ -1318,6 +1318,7 @@ pub struct Thread {
     first_token_at: Option<Instant>,
     streamed_output_chars: u64,
     last_metrics_publish: Option<Instant>,
+    permission_tier: crate::permission_tier::PermissionTier,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1471,6 +1472,7 @@ impl Thread {
             first_token_at: None,
             streamed_output_chars: 0,
             last_metrics_publish: None,
+            permission_tier: Default::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1721,7 +1723,8 @@ impl Thread {
                 cancellation_rx,
                 self.sandbox_grants.clone(),
                 Some(cx.weak_entity()),
-            );
+            )
+            .with_permission_tier(self.permission_tier);
             tool.replay(input, output, tool_event_stream, cx).log_err();
         }
 
@@ -1851,6 +1854,7 @@ impl Thread {
             first_token_at: None,
             streamed_output_chars: 0,
             last_metrics_publish: None,
+            permission_tier: Default::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -2079,6 +2083,19 @@ impl Thread {
         if let Some(model) = resolved {
             self.set_model(model, cx);
         }
+    }
+
+    pub fn permission_tier(&self) -> crate::permission_tier::PermissionTier {
+        self.permission_tier
+    }
+
+    pub fn set_permission_tier(
+        &mut self,
+        tier: crate::permission_tier::PermissionTier,
+        cx: &mut Context<Self>,
+    ) {
+        self.permission_tier = tier;
+        cx.notify();
     }
 
     pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
@@ -4018,7 +4035,8 @@ impl Thread {
             cancellation_rx,
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
-        );
+        )
+        .with_permission_tier(self.permission_tier);
         tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
         let supports_images = self.model().is_some_and(|model| model.supports_images());
         let tool_result = tool.run(tool_input, tool_event_stream, cx);
@@ -5957,6 +5975,7 @@ pub struct ToolCallEventStream {
     /// sandbox grant is recorded so it survives reopening. `None` in tests and
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
+    permission_tier: crate::permission_tier::PermissionTier,
 }
 
 impl ToolCallEventStream {
@@ -6041,7 +6060,16 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             thread,
+            permission_tier: Default::default(),
         }
+    }
+
+    fn with_permission_tier(
+        mut self,
+        permission_tier: crate::permission_tier::PermissionTier,
+    ) -> Self {
+        self.permission_tier = permission_tier;
+        self
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -6202,18 +6230,33 @@ impl ToolCallEventStream {
         context: ToolPermissionContext,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        use crate::permission_tier::PermissionTier;
+
+        if self.permission_tier == PermissionTier::FullAccess {
+            return Task::ready(Ok(()));
+        }
+        if self.permission_tier == PermissionTier::Assisted
+            && PermissionTier::assisted_auto_approve(&context.tool_name, &context.input_values)
+        {
+            return Task::ready(Ok(()));
+        }
+
         let title = title.into();
         let options = context.build_permission_options();
 
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
+        let read_only = self.permission_tier == PermissionTier::ReadOnly;
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                decide_permission_from_settings(
+                match decide_permission_from_settings(
                     &tool_name,
                     &input_values,
                     agent_settings::AgentSettings::get_global(cx),
-                )
+                ) {
+                    ToolPermissionDecision::Allow if read_only => ToolPermissionDecision::Confirm,
+                    decision => decision,
+                }
             });
 
         self.run_authorization_loop(title, options, Some(context), Some(check_settings), cx)
@@ -6230,6 +6273,9 @@ impl ToolCallEventStream {
         context: ToolPermissionContext,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        if self.permission_tier == crate::permission_tier::PermissionTier::FullAccess {
+            return Task::ready(Ok(()));
+        }
         let title = title.into();
         let options = context.build_permission_options();
         self.run_authorization_loop(title, options, Some(context), None, cx)
@@ -6249,6 +6295,9 @@ impl ToolCallEventStream {
         reason: String,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        if self.permission_tier == crate::permission_tier::PermissionTier::FullAccess {
+            return Task::ready(Ok(()));
+        }
         if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
             return Task::ready(Ok(()));
         }

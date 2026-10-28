@@ -5298,6 +5298,7 @@ impl ThreadView {
                                     .children(self.render_activity_status_label(cx))
                                     .children(discard_draft_button)
                                     .children(self.render_token_usage(cx))
+                                    .children(self.render_permission_tier_selector(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
@@ -12323,6 +12324,35 @@ impl ThreadView {
                     cx,
                 );
             }))
+    }
+
+    fn render_permission_tier_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use agent::permission_tier::PermissionTier;
+
+        let thread = self.as_native_thread(cx)?;
+        let current = thread.read(cx).permission_tier();
+
+        let button = |tier: PermissionTier| {
+            let thread = thread.clone();
+            let label = tier.label();
+            ui::ToggleButtonSimple::new(label, move |_, _, cx| {
+                thread.update(cx, |thread, cx| thread.set_permission_tier(tier, cx));
+            })
+        };
+
+        Some(
+            ui::ToggleButtonGroup::single_row(
+                "permission-tier",
+                [
+                    button(PermissionTier::ReadOnly),
+                    button(PermissionTier::Assisted),
+                    button(PermissionTier::FullAccess),
+                ],
+            )
+            .selected_index(current.index())
+            .auto_width()
+            .label_size(LabelSize::XSmall),
+        )
     }
 
     fn open_model_selector_button(&self, cx: &mut Context<Self>) -> impl IntoElement {

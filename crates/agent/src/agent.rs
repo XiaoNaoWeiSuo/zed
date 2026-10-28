@@ -3,6 +3,7 @@ mod legacy_thread;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
+pub mod permission_tier;
 pub mod run_metrics;
 mod sandboxing;
 mod templates;
