@@ -25,6 +25,8 @@ pub struct DropdownMenu {
     trigger_size: ButtonSize,
     trigger_tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
     trigger_icon: Option<IconName>,
+    label_size: LabelSize,
+    label_color: Color,
     style: DropdownStyle,
     menu: Entity<ContextMenu>,
     full_width: bool,
@@ -51,6 +53,8 @@ impl DropdownMenu {
             trigger_size: ButtonSize::Default,
             trigger_tooltip: None,
             trigger_icon: Some(IconName::ChevronUpDown),
+            label_size: LabelSize::Default,
+            label_color: Color::Default,
             style: DropdownStyle::default(),
             menu,
             full_width: false,
@@ -77,6 +81,8 @@ impl DropdownMenu {
             trigger_size: ButtonSize::Default,
             trigger_tooltip: None,
             trigger_icon: Some(IconName::ChevronUpDown),
+            label_size: LabelSize::Default,
+            label_color: Color::Default,
             style: DropdownStyle::default(),
             menu,
             full_width: false,
@@ -112,6 +118,16 @@ impl DropdownMenu {
 
     pub fn trigger_icon(mut self, icon: IconName) -> Self {
         self.trigger_icon = Some(icon);
+        self
+    }
+
+    pub fn label_size(mut self, size: LabelSize) -> Self {
+        self.label_size = size;
+        self
+    }
+
+    pub fn label_color(mut self, color: Color) -> Self {
+        self.label_color = color;
         self
     }
 
@@ -229,6 +245,8 @@ impl RenderOnce for DropdownMenu {
             LabelKind::Text(text) => (
                 Some(
                     a11y_actions(Button::new(self.id.clone(), text))
+                        .label_size(self.label_size)
+                        .color(self.label_color)
                         .aria_role(Role::ComboBox)
                         .when_some(self.aria_label, |this, label| this.aria_label(label))
                         .when_some(aria_description, |this, description| {

@@ -12349,7 +12349,9 @@ impl ThreadView {
         Some(
             ui::DropdownMenu::new("permission-tier", current.label(), menu)
                 .style(ui::DropdownStyle::Ghost)
-                .trigger_size(ButtonSize::Compact)
+                .label_size(LabelSize::Small)
+                .label_color(Color::Muted)
+                .attach(gpui::Anchor::BottomRight)
                 .trigger_icon(IconName::ChevronDown),
         )
     }

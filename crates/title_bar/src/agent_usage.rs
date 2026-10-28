@@ -121,7 +121,6 @@ impl Render for AgentUsageIndicator {
             children.push(
                 Label::new(format!("Cache {:.0}%", cache_hit_rate * 100.0))
                     .size(LabelSize::Small)
-                    .color(Color::Muted)
                     .into_any_element(),
             );
         }
@@ -129,7 +128,6 @@ impl Render for AgentUsageIndicator {
             children.push(
                 Label::new(format!("{tokens_per_second:.0} tok/s"))
                     .size(LabelSize::Small)
-                    .color(Color::Muted)
                     .into_any_element(),
             );
         }
@@ -137,7 +135,6 @@ impl Render for AgentUsageIndicator {
             children.push(
                 Label::new(format!("{:.2}s TTFT", time_to_first_token.as_secs_f32()))
                     .size(LabelSize::Small)
-                    .color(Color::Muted)
                     .into_any_element(),
             );
         }
@@ -147,7 +144,6 @@ impl Render for AgentUsageIndicator {
                 children.push(
                     Label::new(balance.clone())
                         .size(LabelSize::Small)
-                        .color(Color::Muted)
                         .into_any_element(),
                 );
             }
