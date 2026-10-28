@@ -52,14 +52,15 @@ impl AgentUsageIndicator {
             let metrics = self.metrics.read(cx);
             (metrics.running, metrics.provider.clone())
         };
-        if !running {
-            return;
-        }
         let Some(provider_id) = provider_id else {
             return;
         };
 
-        let cache_is_fresh = self.usage_provider.as_ref() == Some(&provider_id)
+        let provider_changed = self.usage_provider.as_ref() != Some(&provider_id);
+        if !running && !provider_changed {
+            return;
+        }
+        let cache_is_fresh = !provider_changed
             && self
                 .last_usage_fetch
                 .is_some_and(|fetched| fetched.elapsed() < USAGE_REFRESH_INTERVAL);
@@ -70,6 +71,9 @@ impl AgentUsageIndicator {
         let Some(provider) = LanguageModelRegistry::read_global(cx).provider(&provider_id) else {
             return;
         };
+        if provider_changed {
+            self.usage = None;
+        }
         let usage_task = provider.usage(cx);
         self.usage_provider = Some(provider_id);
         self.fetch_task = Some(cx.spawn(async move |this, cx| {

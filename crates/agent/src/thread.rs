@@ -1316,6 +1316,8 @@ pub struct Thread {
     current_request_token_usage: TokenUsage,
     request_started_at: Option<Instant>,
     first_token_at: Option<Instant>,
+    streamed_output_chars: u64,
+    last_metrics_publish: Option<Instant>,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1467,6 +1469,8 @@ impl Thread {
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
             first_token_at: None,
+            streamed_output_chars: 0,
+            last_metrics_publish: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1845,6 +1849,8 @@ impl Thread {
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
             first_token_at: None,
+            streamed_output_chars: 0,
+            last_metrics_publish: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -2085,6 +2091,8 @@ impl Thread {
         }
         self.prompt_capabilities_tx.send(new_caps).log_err();
         cx.emit(ModelChanged);
+        let running = self.running_turn.is_some();
+        self.publish_run_metrics(cx, running);
 
         for subagent in &self.running_subagents {
             subagent
@@ -3040,6 +3048,8 @@ impl Thread {
                 this.current_request_token_usage = TokenUsage::default();
                 this.request_started_at = Some(Instant::now());
                 this.first_token_at = None;
+                this.streamed_output_chars = 0;
+                this.last_metrics_publish = None;
                 anyhow::Ok((model, provider, request))
             })??;
 
@@ -3636,19 +3646,37 @@ impl Thread {
         }
     }
 
-    fn publish_run_metrics(&self, cx: &mut Context<Self>, running: bool) {
+    /// Publishes throughput often enough to feel live while avoiding a UI
+    /// notification for every streamed chunk.
+    fn record_streamed_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.streamed_output_chars = self
+            .streamed_output_chars
+            .saturating_add(text.chars().count() as u64);
+        if self
+            .last_metrics_publish
+            .is_none_or(|published| published.elapsed() >= Duration::from_millis(100))
+        {
+            self.publish_run_metrics(cx, true);
+        }
+    }
+
+    fn publish_run_metrics(&mut self, cx: &mut Context<Self>, running: bool) {
         let usage = self.current_request_token_usage;
         let input_tokens =
             usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
+        // Providers often report usage only at the end of a stream. Estimate
+        // from streamed characters so the rate updates while text arrives.
+        let output_tokens = usage.output_tokens.max(self.streamed_output_chars / 4);
         let elapsed = self
             .first_token_at
             .or(self.request_started_at)
             .map(|started| started.elapsed())
             .filter(|elapsed| elapsed.as_secs_f32() > 0.0);
-        let tokens_per_second =
-            elapsed.map(|elapsed| usage.output_tokens as f32 / elapsed.as_secs_f32());
+        let tokens_per_second = (output_tokens > 0)
+            .then(|| elapsed.map(|elapsed| output_tokens as f32 / elapsed.as_secs_f32()))
+            .flatten();
         let time_to_first_token = match (self.request_started_at, self.first_token_at) {
             (Some(started), Some(first_token)) => Some(first_token.duration_since(started)),
             _ => None,
@@ -3658,6 +3686,7 @@ impl Thread {
             .model()
             .map(|model| SharedString::from(model.name().0.clone()));
 
+        self.last_metrics_publish = Some(Instant::now());
         let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
         metrics.update(cx, |metrics, cx| {
             metrics.update(cx, |metrics| {
@@ -3668,9 +3697,17 @@ impl Thread {
                 if model.is_some() {
                     metrics.model = model.clone();
                 }
-                metrics.cache_hit_rate = cache_hit_rate;
-                metrics.tokens_per_second = tokens_per_second;
-                metrics.time_to_first_token = time_to_first_token;
+                // Never replace a good reading with an empty one: a new request
+                // starts with no usage data, but the last rate stays useful.
+                if let Some(cache_hit_rate) = cache_hit_rate {
+                    metrics.cache_hit_rate = Some(cache_hit_rate);
+                }
+                if let Some(tokens_per_second) = tokens_per_second {
+                    metrics.tokens_per_second = Some(tokens_per_second);
+                }
+                if let Some(time_to_first_token) = time_to_first_token {
+                    metrics.time_to_first_token = Some(time_to_first_token);
+                }
             });
         });
     }
@@ -3692,10 +3729,12 @@ impl Thread {
             }
             Text(new_text) => {
                 self.note_first_token(cx);
+                self.record_streamed_text(&new_text, cx);
                 self.handle_text_event(new_text, event_stream)
             }
             Thinking { text, signature } => {
                 self.note_first_token(cx);
+                self.record_streamed_text(&text, cx);
                 self.handle_thinking_event(text, signature, event_stream)
             }
             RedactedThinking { data } => self.handle_redacted_thinking_event(data),
