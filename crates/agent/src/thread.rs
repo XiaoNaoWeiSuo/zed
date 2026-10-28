@@ -3666,8 +3666,6 @@ impl Thread {
             usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
-        // Providers often report usage only at the end of a stream. Estimate
-        // from streamed characters so the rate updates while text arrives.
         let output_tokens = usage.output_tokens.max(self.streamed_output_chars / 4);
         let elapsed = self
             .first_token_at
@@ -3677,38 +3675,46 @@ impl Thread {
         let tokens_per_second = (output_tokens > 0)
             .then(|| elapsed.map(|elapsed| output_tokens as f32 / elapsed.as_secs_f32()))
             .flatten();
-        let time_to_first_token = match (self.request_started_at, self.first_token_at) {
-            (Some(started), Some(first_token)) => Some(first_token.duration_since(started)),
+        let time_to_first_token_ms = match (self.request_started_at, self.first_token_at) {
+            (Some(started), Some(first_token)) => {
+                Some(first_token.duration_since(started).as_millis() as u64)
+            }
             _ => None,
         };
-        let provider = self.model().map(|model| model.provider_id());
-        let model = self
-            .model()
-            .map(|model| SharedString::from(model.name().0.clone()));
+
+        let mut snapshot = crate::run_metrics::AgentMetricsSnapshot {
+            running,
+            provider: self.model().map(|model| model.provider_id().to_string()),
+            model: self.model().map(|model| model.name().0.to_string()),
+            cache_hit_rate: None,
+            tokens_per_second: None,
+            time_to_first_token_ms: None,
+        };
+        let session_id = self.id.to_string();
+        if let Some(metrics) = crate::run_metrics::AgentRunMetrics::global(cx)
+            .read(cx)
+            .snapshot_for(&session_id)
+        {
+            if metrics.provider == snapshot.provider {
+                snapshot.cache_hit_rate = metrics.cache_hit_rate;
+                snapshot.tokens_per_second = metrics.tokens_per_second;
+                snapshot.time_to_first_token_ms = metrics.time_to_first_token_ms;
+            }
+        }
+        if let Some(cache_hit_rate) = cache_hit_rate {
+            snapshot.cache_hit_rate = Some(cache_hit_rate);
+        }
+        if let Some(tokens_per_second) = tokens_per_second {
+            snapshot.tokens_per_second = Some(tokens_per_second);
+        }
+        if let Some(time_to_first_token_ms) = time_to_first_token_ms {
+            snapshot.time_to_first_token_ms = Some(time_to_first_token_ms);
+        }
 
         self.last_metrics_publish = Some(Instant::now());
         let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
         metrics.update(cx, |metrics, cx| {
-            metrics.update(cx, |metrics| {
-                metrics.running = running;
-                if provider.is_some() {
-                    metrics.provider = provider.clone();
-                }
-                if model.is_some() {
-                    metrics.model = model.clone();
-                }
-                // Never replace a good reading with an empty one: a new request
-                // starts with no usage data, but the last rate stays useful.
-                if let Some(cache_hit_rate) = cache_hit_rate {
-                    metrics.cache_hit_rate = Some(cache_hit_rate);
-                }
-                if let Some(tokens_per_second) = tokens_per_second {
-                    metrics.tokens_per_second = Some(tokens_per_second);
-                }
-                if let Some(time_to_first_token) = time_to_first_token {
-                    metrics.time_to_first_token = Some(time_to_first_token);
-                }
-            });
+            metrics.update_session(session_id, snapshot, !running, cx);
         });
     }
 

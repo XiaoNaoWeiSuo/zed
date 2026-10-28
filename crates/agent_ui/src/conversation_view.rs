@@ -909,6 +909,15 @@ impl ConversationView {
             .and_then(|connected| connected.conversation.read(cx).updated_at)
     }
 
+    fn sync_active_session_metrics(&self, cx: &mut Context<Self>) {
+        let Some(active_thread) = self.active_thread() else {
+            return;
+        };
+        let session_id = active_thread.read(cx).session_id.to_string();
+        let metrics = agent::run_metrics::AgentRunMetrics::global(cx);
+        metrics.update(cx, |metrics, cx| metrics.set_active_session(session_id, cx));
+    }
+
     pub fn navigate_to_thread(
         &mut self,
         session_id: acp_v2::SessionId,
@@ -920,6 +929,7 @@ impl ConversationView {
         };
 
         connected.navigate_to_thread(session_id);
+        self.sync_active_session_metrics(cx);
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
         }
@@ -3947,6 +3957,7 @@ impl ConversationView {
 
 impl Render for ConversationView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_active_session_metrics(cx);
         self.sync_request_elicitation_states(window, cx);
         let request_elicitation_connection = self.request_elicitation_connection();
         let active_thread_renders_request_elicitations =

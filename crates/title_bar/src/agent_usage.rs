@@ -50,7 +50,10 @@ impl AgentUsageIndicator {
     fn refresh_usage(&mut self, cx: &mut Context<Self>) {
         let (running, provider_id) = {
             let metrics = self.metrics.read(cx);
-            (metrics.running, metrics.provider.clone())
+            metrics
+                .active_snapshot()
+                .map(|snapshot| (snapshot.running, snapshot.provider_id()))
+                .unwrap_or((false, None))
         };
         let Some(provider_id) = provider_id else {
             return;
@@ -103,19 +106,15 @@ impl AgentUsageIndicator {
 
 impl Render for AgentUsageIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (running, model, cache_hit_rate, tokens_per_second, time_to_first_token) = {
-            let metrics = self.metrics.read(cx);
-            (
-                metrics.running,
-                metrics.model.clone(),
-                metrics.cache_hit_rate,
-                metrics.tokens_per_second,
-                metrics.time_to_first_token,
-            )
+        let Some(snapshot) = self.metrics.read(cx).active_snapshot().cloned() else {
+            return div().into_any_element();
         };
-        if !running && model.is_none() {
+        if !snapshot.running && snapshot.model.is_none() {
             return div().into_any_element();
         }
+        let cache_hit_rate = snapshot.cache_hit_rate;
+        let tokens_per_second = snapshot.tokens_per_second;
+        let time_to_first_token = snapshot.time_to_first_token();
 
         let mut children: Vec<AnyElement> = Vec::new();
         if let Some(cache_hit_rate) = cache_hit_rate {
