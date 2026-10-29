@@ -16,9 +16,8 @@ use settings::{
     OpenAiCompatibleModelCapabilities, OpenAiCompatibleSettingsContent, OpenAiReasoningEffort,
 };
 use ui::{
-    ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Divider, DividerColor, DropdownMenu,
-    DropdownStyle, IconPosition, PopoverMenu, SelectMenu, SelectMenuOption, ToggleState,
-    prelude::*,
+    ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Disclosure, Divider, DividerColor,
+    DropdownMenu, DropdownStyle, IconPosition, PopoverMenu, ToggleState, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -142,50 +141,92 @@ pub(crate) fn render_add_llm_provider_popover(
         })
 }
 
-fn render_provider_models_menu(
+fn render_provider_models_list(
     provider: &Arc<dyn LanguageModelProvider>,
+    is_open: bool,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let provider_id = provider.id();
-    let models = provider.provided_models(cx);
+    let mut models = provider.provided_models(cx);
     if models.is_empty() {
         return div().into_any_element();
     }
+    models.sort_by_key(|model| model.name.0.to_lowercase());
 
     let registry = LanguageModelRegistry::read_global(cx);
-    let options = models
-        .into_iter()
-        .map(|model| {
-            let enabled = !registry.is_model_disabled(&model);
-            let provider_key = provider_id.0.to_string();
-            let model_id = model.id.0.to_string();
-            SelectMenuOption::new(model.name.0.clone(), enabled, move |_, cx| {
-                let fs = <dyn fs::Fs>::global(cx);
-                let provider_key = provider_key.clone();
-                let model_id = model_id.clone();
-                settings::update_settings_file(fs, cx, move |settings, _| {
-                    let language_models = settings.language_models.get_or_insert_default();
-                    let disabled = language_models.disabled_models.get_or_insert_default();
-                    let entries = disabled
-                        .entry(Arc::from(provider_key.as_str()))
-                        .or_default();
-                    if let Some(index) = entries.iter().position(|id| id == &model_id) {
-                        entries.remove(index);
-                    } else {
-                        entries.push(model_id);
-                    }
-                });
-            })
-        })
-        .collect();
+    let enabled_count = models
+        .iter()
+        .filter(|model| !registry.is_model_disabled(model))
+        .count();
+    let disclosure_id = format!("provider-models-disclosure-{}", provider_id.0);
+    let disclosure_provider_id = provider_id.clone();
 
-    SelectMenu::new(
-        format!("provider-models-{}", provider_id.0),
-        "Models",
-        options,
-    )
-    .tooltip("Enable or disable models from the model picker")
-    .into_any_element()
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Disclosure::new(disclosure_id, is_open).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if !this.expanded_model_lists.remove(&disclosure_provider_id) {
+                                this.expanded_model_lists
+                                    .insert(disclosure_provider_id.clone());
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(Label::new("Models").size(LabelSize::Small))
+                .child(
+                    Label::new(format!("{enabled_count}/{} enabled", models.len()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+        .when(is_open, |this| {
+            this.child(
+                v_flex()
+                    .pl_6()
+                    .gap_1()
+                    .children(models.iter().enumerate().map(|(index, model)| {
+                        let enabled = !registry.is_model_disabled(model);
+                        let provider_key = provider_id.0.to_string();
+                        let model_id = model.id.0.to_string();
+                        Checkbox::new(
+                            ElementId::Name(
+                                format!("provider-model-{}-{index}", provider_id.0).into(),
+                            ),
+                            enabled.into(),
+                        )
+                        .label(model.name.0.clone())
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(
+                            move |_, checked: &ToggleState, _, cx| {
+                                let fs = <dyn fs::Fs>::global(cx);
+                                let provider_key = provider_key.clone();
+                                let model_id = model_id.clone();
+                                let enabled = checked.selected();
+                                settings::update_settings_file(fs, cx, move |settings, _| {
+                                    let language_models =
+                                        settings.language_models.get_or_insert_default();
+                                    let disabled =
+                                        language_models.disabled_models.get_or_insert_default();
+                                    let entries = disabled
+                                        .entry(Arc::from(provider_key.as_str()))
+                                        .or_default();
+                                    if enabled {
+                                        entries.retain(|id| id != &model_id);
+                                    } else if !entries.contains(&model_id) {
+                                        entries.push(model_id);
+                                    }
+                                });
+                            },
+                        ))
+                    })),
+            )
+        })
+        .into_any_element()
 }
 
 fn render_provider_section(
@@ -229,7 +270,11 @@ fn render_provider_section(
         .gap_1p5()
         .child(render_provider_header(provider_name, provider.icon(), cx))
         .child(body)
-        .child(render_provider_models_menu(provider, cx))
+        .child(render_provider_models_list(
+            provider,
+            settings_window.expanded_model_lists.contains(&provider_id),
+            cx,
+        ))
         .into_any_element()
 }
 
