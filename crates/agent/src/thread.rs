@@ -1500,7 +1500,7 @@ pub struct Thread {
     current_request_token_usage: TokenUsage,
     request_started_at: Option<Instant>,
     first_token_at: Option<Instant>,
-    streamed_output_chars: u64,
+    throughput: TokenThroughput,
     last_metrics_publish: Option<Instant>,
     permission_tier: Rc<PermissionTierState>,
     goal: Option<ThreadGoal>,
@@ -1541,6 +1541,76 @@ pub struct Thread {
     /// already-granted permissions skip the approval prompt.
     /// Never persisted — lives and dies with this thread.
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+}
+
+/// Tracks provider-reported output tokens over time.
+///
+/// Providers may send a single usage snapshot at the end of a request, and
+/// some send none until after the last event. Measuring `tokens / time since
+/// first token` therefore produces impossible rates when the first token and
+/// the usage snapshot arrive together. This tracker measures deltas between
+/// consecutive usage reports, falls back to the whole request duration, and
+/// rejects implausible samples.
+#[derive(Default)]
+struct TokenThroughput {
+    started_at: Option<Instant>,
+    last_sample_at: Option<Instant>,
+    last_tokens: u64,
+    rate: Option<f32>,
+}
+
+impl TokenThroughput {
+    const MAX_PLAUSIBLE_TOKENS_PER_SECOND: f32 = 5_000.0;
+
+    fn start(&mut self, started_at: Instant) {
+        self.started_at = Some(started_at);
+        self.last_sample_at = None;
+        self.last_tokens = 0;
+        self.rate = None;
+    }
+
+    fn record(&mut self, tokens: u64, now: Instant) -> Option<f32> {
+        let started_at = self.started_at.unwrap_or(now);
+        if tokens < self.last_tokens {
+            // A new request (or a provider that resets its counter) starts a
+            // fresh measurement window.
+            self.last_tokens = 0;
+            self.last_sample_at = Some(started_at);
+        }
+        let delta = tokens.saturating_sub(self.last_tokens);
+        self.last_tokens = tokens.max(self.last_tokens);
+        if delta == 0 {
+            return self.rate;
+        }
+
+        let sample_elapsed = self
+            .last_sample_at
+            .map_or_else(
+                || now.duration_since(started_at),
+                |last| now.duration_since(last),
+            )
+            .as_secs_f32();
+        self.last_sample_at = Some(now);
+
+        let mut sample_rate = delta as f32 / sample_elapsed.max(0.2);
+        if sample_rate > Self::MAX_PLAUSIBLE_TOKENS_PER_SECOND {
+            let total_elapsed = now.duration_since(started_at).as_secs_f32();
+            sample_rate = self.last_tokens as f32 / total_elapsed.max(0.2);
+        }
+        if sample_rate <= 0.0 || sample_rate > Self::MAX_PLAUSIBLE_TOKENS_PER_SECOND {
+            return self.rate;
+        }
+
+        self.rate = Some(match self.rate {
+            Some(previous) => previous * 0.6 + sample_rate * 0.4,
+            None => sample_rate,
+        });
+        self.rate
+    }
+
+    fn rate(&self) -> Option<f32> {
+        self.rate
+    }
 }
 
 impl Thread {
@@ -1597,7 +1667,7 @@ impl Thread {
         model: Option<LanguageModel>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let thread = Self::new_internal(
+        Self::new_internal(
             project.clone(),
             project_context,
             context_server_registry,
@@ -1605,12 +1675,14 @@ impl Thread {
             model,
             cx.new(|_cx| ActionLog::new(project)),
             cx,
-        );
-        Self::prime_checkpoint_context(&thread.project, cx);
-        thread
+        )
     }
 
-    fn prime_checkpoint_context(project: &Entity<Project>, cx: &mut Context<Self>) {
+    fn restore_checkpoint_context(
+        project: &Entity<Project>,
+        session_id: String,
+        cx: &mut Context<Self>,
+    ) {
         let project = project.read(cx);
         if !project.is_local()
             || TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx)
@@ -1626,24 +1698,34 @@ impl Thread {
             })
             .collect::<Vec<_>>();
         cx.spawn(async move |thread, cx| {
-            let context = cx.background_spawn(async move { crate::load_checkpoint_context(&roots) }).await;
-            let context = match context {
-                Ok(context) => context.unwrap_or_default(),
-                Err(error) => {
-                    log::error!("Failed to load project checkpoint: {error:#}");
-                    "Project checkpoints could not be loaded; their contents and freshness are unknown.".into()
+            let context = cx
+                .background_spawn(async move {
+                    crate::load_checkpoint_context_for_session(&roots, Some(&session_id))
+                })
+                .await;
+            match context {
+                Ok(Some(context)) => {
+                    thread
+                        .update(cx, |thread, cx| {
+                            if thread.checkpoint_context.is_none()
+                                && thread.running_turn.is_none()
+                                && thread.project.read(cx).is_local()
+                                && !TrustedWorktrees::has_restricted_worktrees(
+                                    &thread.project.read(cx).worktree_store(),
+                                    cx,
+                                )
+                            {
+                                thread.checkpoint_context = Some(context);
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
                 }
-            };
-            thread.update(cx, |thread, cx| {
-                if thread.checkpoint_context.is_none() && thread.running_turn.is_none()
-                    && thread.project.read(cx).is_local()
-                    && !TrustedWorktrees::has_restricted_worktrees(&thread.project.read(cx).worktree_store(), cx)
-                {
-                    thread.checkpoint_context = Some(context);
-                    cx.notify();
-                }
-            }).log_err();
-        }).detach();
+                Ok(None) => {}
+                Err(error) => log::error!("Failed to restore session checkpoint: {error:#}"),
+            }
+        })
+        .detach();
     }
 
     fn new_internal(
@@ -1699,7 +1781,7 @@ impl Thread {
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
             first_token_at: None,
-            streamed_output_chars: 0,
+            throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(Default::default())),
             goal: None,
@@ -2098,7 +2180,7 @@ impl Thread {
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
         if db_thread.subagent_context.is_none() {
-            Self::prime_checkpoint_context(&project, cx);
+            Self::restore_checkpoint_context(&project, id.0.to_string(), cx);
         }
 
         Self {
@@ -2125,7 +2207,7 @@ impl Thread {
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
             first_token_at: None,
-            streamed_output_chars: 0,
+            throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(db_thread.permission_tier)),
             deferred_questions: db_thread.deferred_questions,
@@ -3122,7 +3204,7 @@ impl Thread {
             return Task::ready(());
         };
 
-        let checkpoints = self.automatic_checkpoint_inputs(true, cx);
+        let checkpoints = self.automatic_checkpoint_inputs(true, false, cx);
         let roots = checkpoints
             .iter()
             .map(|checkpoint| crate::CheckpointRoot {
@@ -3130,6 +3212,7 @@ impl Thread {
                 git: checkpoint.git.clone(),
             })
             .collect::<Vec<_>>();
+        let session_id = self.id.0.to_string();
         let prompt_id = running_turn.prompt_id.clone();
         let turn_task = running_turn.cancel();
 
@@ -3147,7 +3230,8 @@ impl Thread {
                                 failed = true;
                             }
                         }
-                        match crate::load_checkpoint_context(&roots) {
+                        match crate::load_checkpoint_context_for_session(&roots, Some(&session_id))
+                        {
                             Ok(context) if !failed => context.unwrap_or_default(),
                             Ok(context) => {
                                 let mut entries = context
@@ -3195,6 +3279,7 @@ impl Thread {
     fn automatic_checkpoint_inputs(
         &self,
         interrupted: bool,
+        compaction: bool,
         cx: &App,
     ) -> Vec<crate::AutomaticCheckpoint> {
         let project = self.project.read(cx);
@@ -3218,7 +3303,7 @@ impl Thread {
         ).any(|message| message.content.iter().any(|content| matches!(content,
             AgentMessageContent::ToolUse(tool_use) if matches!(tool_use.name.as_ref(), "edit_file" | "write_file" | "move_path" | "copy_path" | "delete_path" | "create_directory" | "rename")
         )));
-        if !interrupted && !has_terminal_activity && !has_edit_activity {
+        if !compaction && !interrupted && !has_terminal_activity && !has_edit_activity {
             return Vec::new();
         }
         let session_id = self.id.0.to_string();
@@ -3264,7 +3349,12 @@ impl Thread {
                         ))
                     })
                     .collect::<BTreeMap<_, _>>();
-                if files.is_empty() && !has_terminal_activity && !has_edit_activity {
+                if !compaction
+                    && files.is_empty()
+                    && !has_terminal_activity
+                    && !has_edit_activity
+                    && evidence.is_empty()
+                {
                     return None;
                 }
                 let git = crate::checkpoint_git_snapshot(project, &root, cx);
@@ -3780,6 +3870,7 @@ impl Thread {
         let task = cx.spawn({
             let prompt_id = self.prompt_id.clone();
             let user_message_id = self.last_user_message_id();
+            let session_id = self.id.0.to_string();
             let event_stream = event_stream.clone();
             async move |this, cx| {
                 log::debug!("Starting agent turn execution");
@@ -3805,7 +3896,7 @@ impl Thread {
                 _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
 
                 let (checkpoints, roots) = this.read_with(cx, |this, cx| {
-                    let checkpoints = this.automatic_checkpoint_inputs(turn_result.is_err(), cx);
+                    let checkpoints = this.automatic_checkpoint_inputs(turn_result.is_err(), false, cx);
                     let checkpoint_used = this.messages.iter().skip(message_ix).filter_map(|message| message.as_agent_message()).any(|message| message.content.iter().any(|content| matches!(content, AgentMessageContent::ToolUse(tool_use) if tool_use.name.as_ref() == crate::ProjectCheckpointTool::NAME)));
                     let project = this.project.read(cx);
                     let roots = ((!checkpoints.is_empty() || checkpoint_used) && project.is_local()
@@ -3826,7 +3917,7 @@ impl Thread {
                                 failures.push(error.to_string());
                             }
                         }
-                        let context = crate::load_checkpoint_context(&roots);
+                        let context = crate::load_checkpoint_context_for_session(&roots, Some(&session_id));
                         (failures, context)
                     }).await;
                     if *cancellation_rx.borrow() { return; }
@@ -3894,6 +3985,7 @@ impl Thread {
         let roots = this.read_with(cx, |thread, cx| {
             let project = thread.project.read(cx);
             (thread.parent_thread_id().is_none()
+                && thread.project_checkpoint_context().is_some()
                 && project.is_local()
                 && !TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx))
             .then(|| {
@@ -3908,8 +4000,11 @@ impl Thread {
             })
         })?;
         if let Some(roots) = roots {
+            let session_id = this.read_with(cx, |thread, _| thread.id.0.to_string())?;
             let context = cx
-                .background_spawn(async move { crate::load_checkpoint_context(&roots) })
+                .background_spawn(async move {
+                    crate::load_checkpoint_context_for_session(&roots, Some(&session_id))
+                })
                 .await;
             let context = match context {
                 Ok(context) => context.unwrap_or_default(),
@@ -4054,7 +4149,7 @@ impl Thread {
                 this.current_request_token_usage = TokenUsage::default();
                 this.request_started_at = Some(Instant::now());
                 this.first_token_at = None;
-                this.streamed_output_chars = 0;
+                this.throughput.start(Instant::now());
                 this.last_metrics_publish = None;
                 anyhow::Ok((model, provider, request))
             })??;
@@ -4456,7 +4551,7 @@ impl Thread {
 
         Self::stream_compaction(
             this,
-            event_stream,
+            &event_stream,
             cancellation_rx,
             model,
             request,
@@ -4560,6 +4655,8 @@ impl Thread {
                 acp_thread::ContextCompactionStatus::Completed,
             );
 
+            let checkpoints = this.read_with(cx, |thread, cx| thread.automatic_checkpoint_inputs(false, true, cx))?;
+            let checkpoint_summary = summary.clone();
             this.update(cx, |this, cx| {
                 let compaction =
                     Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
@@ -4578,6 +4675,27 @@ impl Thread {
                 }
                 cx.notify();
             })?;
+
+            let failure_message = "Context was compacted, but its project checkpoint could not be saved. The conversation summary remains available in this session.";
+            let checkpoint_task = cx.background_spawn({
+                let checkpoint_summary = checkpoint_summary.clone();
+                async move {
+                    let mut failed = false;
+                    for checkpoint in checkpoints {
+                        if let Err(error) = checkpoint.save_compaction(checkpoint_summary.clone()) {
+                            log::error!("Failed to save compaction checkpoint: {error:#}");
+                            failed = true;
+                        }
+                    }
+                    failed.then_some(failure_message)
+                }
+            });
+            cx.spawn(async move |_cx| {
+                if let Some(message) = checkpoint_task.await {
+                    log::warn!("{message}");
+                }
+            })
+            .detach();
 
             Ok(ControlFlow::Continue(()))
         }
@@ -4714,12 +4832,9 @@ impl Thread {
         }
     }
 
-    /// Publishes throughput often enough to feel live while avoiding a UI
+    /// Publishes metrics often enough to feel live while avoiding a UI
     /// notification for every streamed chunk.
-    fn record_streamed_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.streamed_output_chars = self
-            .streamed_output_chars
-            .saturating_add(text.chars().count() as u64);
+    fn note_stream_activity(&mut self, cx: &mut Context<Self>) {
         if self
             .last_metrics_publish
             .is_none_or(|published| published.elapsed() >= Duration::from_millis(100))
@@ -4734,19 +4849,7 @@ impl Thread {
             usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
-        // Only use the provider-reported output token count. Estimated
-        // characters include streamed text that is not model output (for
-        // example echoed tool arguments), which produced implausibly high
-        // throughput when tools ran.
-        let output_tokens = usage.output_tokens;
-        let elapsed = self
-            .first_token_at
-            .or(self.request_started_at)
-            .map(|started| started.elapsed())
-            .filter(|elapsed| elapsed.as_secs_f32() > 0.0);
-        let tokens_per_second = (output_tokens > 0)
-            .then(|| elapsed.map(|elapsed| output_tokens as f32 / elapsed.as_secs_f32()))
-            .flatten();
+        let tokens_per_second = self.throughput.rate();
         let time_to_first_token_ms = match (self.request_started_at, self.first_token_at) {
             (Some(started), Some(first_token)) => {
                 Some(first_token.duration_since(started).as_millis() as u64)
@@ -4809,12 +4912,12 @@ impl Thread {
             }
             Text(new_text) => {
                 self.note_first_token(cx);
-                self.record_streamed_text(&new_text, cx);
+                self.note_stream_activity(cx);
                 self.handle_text_event(new_text, event_stream)
             }
             Thinking { text, signature } => {
                 self.note_first_token(cx);
-                self.record_streamed_text(&text, cx);
+                self.note_stream_activity(cx);
                 self.handle_thinking_event(text, signature, event_stream)
             }
             RedactedThinking { data } => self.handle_redacted_thinking_event(data),
@@ -4882,6 +4985,7 @@ impl Thread {
                     telemetry.emit("succeeded", None, Some(total_input_tokens(usage)));
                 }
                 self.update_token_usage(usage, cx);
+                self.throughput.record(usage.output_tokens, Instant::now());
                 self.publish_run_metrics(cx, true);
             }
             Stop(StopReason::Refusal) => {
@@ -8858,6 +8962,17 @@ mod tests {
         ThreadEventStream,
         Arc<FakeLanguageModelProvider>,
     ) {
+        setup_thread_for_test_with_root(None, cx).await
+    }
+
+    async fn setup_thread_for_test_with_root(
+        root: Option<&std::path::Path>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Thread>,
+        ThreadEventStream,
+        Arc<FakeLanguageModelProvider>,
+    ) {
         let fake = cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -8867,7 +8982,10 @@ mod tests {
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
         let templates = Templates::new();
-        let project = Project::test(fs.clone(), [], cx).await;
+        if let Some(root) = root {
+            fs.insert_tree(root, serde_json::json!({})).await;
+        }
+        let project = Project::test(fs.clone(), root.into_iter(), cx).await;
 
         cx.update(|cx| {
             let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
@@ -9569,6 +9687,95 @@ mod tests {
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_compaction_is_saved_by_lifecycle(cx: &mut TestAppContext) {
+        check_compaction_checkpoint_lifecycle(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_compaction_survives_persistence_failure(cx: &mut TestAppContext) {
+        check_compaction_checkpoint_lifecycle(true, cx).await;
+    }
+
+    async fn check_compaction_checkpoint_lifecycle(
+        fail_persistence: bool,
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().expect("project directory");
+        if fail_persistence {
+            std::fs::write(
+                root.path().join(paths::local_settings_folder_name()),
+                "not a directory",
+            )
+            .expect("block checkpoint database creation");
+        }
+        let (thread, _event_stream, fake) =
+            setup_thread_for_test_with_root(Some(root.path()), cx).await;
+        let model = fake.model("fake");
+        let session_id = thread.read_with(cx, |thread, _| thread.id().to_string());
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.messages.push(user_text_message(
+                ClientUserMessageId::new(),
+                "task context",
+            ));
+            thread.messages.push(agent_text_message("prior response"));
+        });
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.compact(ClientUserMessageId::new(), cx)
+            })
+            .expect("start compaction");
+        cx.run_until_parked();
+        let request = fake
+            .pending_completions()
+            .pop()
+            .expect("compaction request");
+        fake.send_text(&model, &request, "Preserve the current task decision");
+        fake.end_stream(&model, &request);
+        cx.run_until_parked();
+        assert!(fake.pending_completions().is_empty());
+        thread.read_with(cx, |thread, _| {
+            assert!(matches!(thread.messages.last().map(AsRef::as_ref),
+                Some(Message::Compaction(CompactionInfo::Summary(summary)))
+                    if summary.as_ref() == "Preserve the current task decision"));
+        });
+        if fail_persistence {
+            assert!(
+                !root
+                    .path()
+                    .join(paths::local_settings_folder_name())
+                    .join("checkpoints.sqlite3")
+                    .exists()
+            );
+            return;
+        }
+        let store = crate::ProjectCheckpointStore::open_existing(root.path())
+            .expect("read database")
+            .expect("lifecycle saved database");
+        let checkpoint = store
+            .latest(&format!(
+                "{}{}",
+                crate::COMPACTION_CHECKPOINT_SCOPE_PREFIX,
+                session_id
+            ))
+            .expect("read summary")
+            .expect("saved summary");
+        assert!(
+            checkpoint
+                .decisions
+                .iter()
+                .any(|summary| summary.contains("Preserve the current task decision"))
+        );
+        assert!(checkpoint.completed.is_empty());
+        assert!(
+            store
+                .latest_handoff_for_session(&session_id)
+                .expect("read handoff")
+                .is_none()
+        );
     }
 
     #[gpui::test]
@@ -11641,5 +11848,55 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::TokenThroughput;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn computes_rate_from_usage_deltas() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+
+        assert_eq!(
+            throughput.record(1_000, started + Duration::from_secs(2)),
+            Some(500.0)
+        );
+        assert_eq!(
+            throughput.record(2_000, started + Duration::from_secs(3)),
+            Some(700.0)
+        );
+        assert_eq!(
+            throughput.record(2_000, started + Duration::from_secs(4)),
+            Some(700.0)
+        );
+    }
+
+    #[test]
+    fn ignores_implausible_samples() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+
+        assert_eq!(
+            throughput.record(100_000, started + Duration::from_millis(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_request_duration_for_a_single_late_sample() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+
+        assert_eq!(
+            throughput.record(2_000, started + Duration::from_secs(4)),
+            Some(500.0)
+        );
     }
 }

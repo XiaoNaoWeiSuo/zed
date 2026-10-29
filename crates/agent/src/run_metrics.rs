@@ -79,6 +79,14 @@ impl AgentRunMetrics {
                     return;
                 };
                 snapshot.running = false;
+                // Older builds could persist an absurd throughput derived from
+                // character estimates. Drop it rather than showing bad data.
+                if snapshot
+                    .tokens_per_second
+                    .is_some_and(|rate| !rate.is_finite() || rate > 5_000.0)
+                {
+                    snapshot.tokens_per_second = None;
+                }
                 this.update(cx, |this, cx| {
                     this.snapshots.entry(session_id).or_insert(snapshot);
                     cx.notify();
