@@ -2641,6 +2641,56 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_unicode_slash_completion_does_not_panic(cx: &mut TestAppContext) {
+        init_test(cx);
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/project", json!({"file": ""}))
+            .await;
+        let project = Project::test(filesystem, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let message_editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                MessageEditor::new(
+                    workspace.downgrade(),
+                    project.downgrade(),
+                    None,
+                    Default::default(),
+                    "Test Agent".into(),
+                    "Test",
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        let editor = message_editor.update(cx, |message_editor, _| message_editor.editor.clone());
+        for input in ["/测试，", "/help 中文", "前文 /help 🦀"] {
+            let task = editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(input, window, cx);
+                let buffer = editor.buffer().read(cx).as_singleton().expect("buffer");
+                let provider = editor.completion_provider().expect("completion provider");
+                provider.completions(
+                    &buffer,
+                    text::Anchor::max_for_buffer(buffer.read(cx).remote_id()),
+                    CompletionContext {
+                        trigger_kind: CompletionTriggerKind::INVOKED,
+                        trigger_character: None,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            task.await.expect("completion request");
+        }
+    }
+
+    #[gpui::test]
     async fn test_at_mention_removal(cx: &mut TestAppContext) {
         init_test(cx);
 

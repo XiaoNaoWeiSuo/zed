@@ -1436,8 +1436,16 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
 
         let project = workspace.read(cx).project().clone();
         let snapshot = buffer.read(cx).snapshot();
-        let source_range = snapshot.anchor_before(state.source_range().start)
-            ..snapshot.anchor_after(state.source_range().end);
+        let source_range = state.source_range();
+        if source_range.start > source_range.end
+            || snapshot.clip_offset(source_range.start, text::Bias::Left) != source_range.start
+            || snapshot.clip_offset(source_range.end, text::Bias::Left) != source_range.end
+        {
+            log::error!("Prompt completion produced an invalid text range: {source_range:?}");
+            return Task::ready(Ok(Vec::new()));
+        }
+        let source_range =
+            snapshot.anchor_before(source_range.start)..snapshot.anchor_after(source_range.end);
 
         let source = self.source.clone();
         let editor = self.editor.clone();
@@ -2060,11 +2068,7 @@ impl SlashCommandCompletion {
 
         Some(Self {
             source_range: last_command_start + offset_to_line
-                ..line
-                    .rfind(|c: char| !c.is_whitespace())
-                    .unwrap_or_else(|| line.len())
-                    + 1
-                    + offset_to_line,
+                ..line.trim_end().len() + offset_to_line,
             command,
             argument,
         })
@@ -2932,7 +2936,7 @@ mod tests {
         assert_eq!(
             SlashCommandCompletion::try_parse("/拿不到命令 拿不到命令 ", 0),
             Some(SlashCommandCompletion {
-                source_range: 0..30,
+                source_range: 0..32,
                 command: Some("拿不到命令".to_string()),
                 argument: Some("拿不到命令".to_string()),
             })
@@ -2979,6 +2983,19 @@ mod tests {
         assert_eq!(SlashCommandCompletion::try_parse("Lorem/", 0), None);
 
         assert_eq!(SlashCommandCompletion::try_parse("/ ", 0), None);
+    }
+
+    #[test]
+    fn slash_command_ranges_end_on_unicode_boundaries() {
+        for line in ["/测试，", "/help 中文 ", "中文 /help 🦀", "/help e\u{301}"] {
+            let offset = 13;
+            let completion = SlashCommandCompletion::try_parse(line, offset).expect("command");
+            let range =
+                completion.source_range.start - offset..completion.source_range.end - offset;
+            assert!(line.is_char_boundary(range.start));
+            assert!(line.is_char_boundary(range.end));
+            assert_eq!(range.end, line.trim_end().len());
+        }
     }
 
     #[test]
