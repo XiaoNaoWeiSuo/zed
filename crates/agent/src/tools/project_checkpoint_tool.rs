@@ -49,7 +49,19 @@ pub struct ProjectCheckpointInput {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointSaveReceipt {
+    pub id: String,
+    pub scope: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub file_count: usize,
+    pub files_requiring_review: usize,
+    pub evidence_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectCheckpointOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<CheckpointSaveReceipt>,
     pub scopes: Vec<crate::CheckpointScopeSummary>,
     pub next_offset: Option<usize>,
     pub checkpoint: Option<ProjectCheckpoint>,
@@ -146,7 +158,7 @@ impl AgentTool for ProjectCheckpointTool {
                     let observations = thread.retained_tool_results()
                         .filter(|(_, result, _)| result.tool_name.as_ref() != Self::NAME)
                         .map(|(id, result, tool_use)| CheckpointEvidence {
-                            description: format!("{}: {} (execution result only; relevance and freshness require review)", result.tool_name, if result.is_error { "failed" } else { "succeeded" }),
+                            description: format!("{}: {} (execution result only; relevance and freshness require review)", result.tool_name, if result.is_error { "tool error" } else { "returned a result" }),
                             source: format!("session:{session_id}/tool:{id}"),
                             observed_at: None,
                             revision: None,
@@ -162,7 +174,7 @@ impl AgentTool for ProjectCheckpointTool {
                         ProjectCheckpointStore::open_existing(&root)?
                     };
                     let Some(store) = store else {
-                        return Ok(ProjectCheckpointOutput { scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
                     };
                     if input.action == "list" {
                         let limit = input.limit.unwrap_or(10).clamp(1, 20);
@@ -171,7 +183,7 @@ impl AgentTool for ProjectCheckpointTool {
                             scopes.truncate(limit);
                             Some(input.offset.saturating_add(scopes.len()))
                         } else { None };
-                        return Ok(ProjectCheckpointOutput { scopes, next_offset, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes, next_offset, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
                     }
                     if input.action == "read" {
                         let checkpoint = store.latest(&input.scope)?;
@@ -192,7 +204,7 @@ impl AgentTool for ProjectCheckpointTool {
                         let mut new_dirty_files = checkpoint.as_ref().and_then(|checkpoint| git.as_ref().map(|git| git.dirty_files.iter().filter(|path| !checkpoint.changed_files.iter().any(|file| &file.path == *path)).cloned().collect::<Vec<_>>()));
                         let new_dirty_files_truncated = new_dirty_files.as_ref().is_some_and(|files| files.len() > 50);
                         if let Some(files) = &mut new_dirty_files { files.truncate(50); }
-                        return Ok(ProjectCheckpointOutput { scopes: Vec::new(), next_offset: None, checkpoint, changed_since_checkpoint: changed, files_not_checked: unknown, current_revision_changed: revision_changed, current_branch_changed: branch_changed, new_dirty_files, new_dirty_files_truncated, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint, changed_since_checkpoint: changed, files_not_checked: unknown, current_revision_changed: revision_changed, current_branch_changed: branch_changed, new_dirty_files, new_dirty_files_truncated, error: None });
                     }
                     let mut changed_files = Vec::new();
                     for (path, unsaved) in files {
@@ -211,10 +223,18 @@ impl AgentTool for ProjectCheckpointTool {
                         next_steps: input.next_steps, changed_files, evidence, interrupted: false,
                     };
                     store.save(&checkpoint)?;
-                    Ok(ProjectCheckpointOutput { scopes: Vec::new(), next_offset: None, checkpoint: Some(checkpoint), changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None })
+                    let saved = CheckpointSaveReceipt {
+                        id: checkpoint.id,
+                        scope: checkpoint.scope,
+                        created_at: checkpoint.created_at,
+                        file_count: checkpoint.changed_files.len(),
+                        files_requiring_review: checkpoint.changed_files.iter().filter(|file| file.unsaved || file.observation_error.is_some()).count(),
+                        evidence_count: checkpoint.evidence.len(),
+                    };
+                    Ok(ProjectCheckpointOutput { saved: Some(saved), scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None })
                 }).await
             }.await;
-            result.map_err(|error: anyhow::Error| ProjectCheckpointOutput { scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: Some(format!("{error:#}")) })
+            result.map_err(|error: anyhow::Error| ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: Some(format!("{error:#}")) })
         })
     }
 }

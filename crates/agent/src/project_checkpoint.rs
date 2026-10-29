@@ -58,10 +58,21 @@ impl CheckpointFile {
                     resolved.starts_with(&root),
                     "Checkpoint file resolves outside the project"
                 );
+                let metadata = std::fs::metadata(&resolved)?;
+                ensure!(
+                    metadata.is_file(),
+                    "Checkpoint fingerprints require a regular file"
+                );
+                const MAX_FINGERPRINT_BYTES: u64 = 8 * 1024 * 1024;
+                ensure!(
+                    metadata.len() <= MAX_FINGERPRINT_BYTES,
+                    "Checkpoint file exceeds the 8 MiB fingerprint limit"
+                );
                 let mut file = std::fs::File::open(&resolved)
                     .with_context(|| format!("Could not read {}", full_path.display()))?;
                 let mut digest = Sha256::new();
                 let mut buffer = [0_u8; 65536];
+                let mut bytes_read = 0_u64;
                 loop {
                     let count = file
                         .read(&mut buffer)
@@ -69,6 +80,11 @@ impl CheckpointFile {
                     if count == 0 {
                         break;
                     }
+                    bytes_read += count as u64;
+                    ensure!(
+                        bytes_read <= MAX_FINGERPRINT_BYTES,
+                        "Checkpoint file exceeds the 8 MiB fingerprint limit"
+                    );
                     digest.update(&buffer[..count]);
                 }
                 Some(format!("{:x}", digest.finalize()))
@@ -213,6 +229,20 @@ impl AutomaticCheckpoint {
     }
 }
 
+fn is_checkpoint_database_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.parent() == Some(Path::new(paths::local_settings_folder_name()))
+        && matches!(
+            file_name,
+            "checkpoints.sqlite3"
+                | "checkpoints.sqlite3-journal"
+                | "checkpoints.sqlite3-wal"
+                | "checkpoints.sqlite3-shm"
+        )
+}
+
 pub fn checkpoint_git_snapshot(
     project: &project::Project,
     root: &Path,
@@ -234,9 +264,7 @@ pub fn checkpoint_git_snapshot(
                     }
                     let absolute = snapshot.repo_path_to_abs_path(&entry.repo_path);
                     let relative = absolute.strip_prefix(root).ok()?;
-                    if relative.components().next().is_some_and(|component| {
-                        component.as_os_str() == paths::local_settings_folder_name()
-                    }) {
+                    if is_checkpoint_database_path(relative) {
                         return None;
                     }
                     Some(relative.to_path_buf())
@@ -602,6 +630,58 @@ mod tests {
         assert!(observed.has_changed(root.path())?);
         assert!(CheckpointFile::observe(root.path(), Path::new("../outside")).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn reading_missing_checkpoints_does_not_create_project_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        assert!(ProjectCheckpointStore::open_existing(root.path())?.is_none());
+        assert!(
+            load_checkpoint_context(&[CheckpointRoot {
+                path: root.path().to_path_buf(),
+                git: None,
+            }])?
+            .is_none()
+        );
+        assert!(
+            !root
+                .path()
+                .join(paths::local_settings_folder_name())
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprints_skip_large_and_non_regular_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("directory"))?;
+        assert!(CheckpointFile::observe(root.path(), Path::new("directory")).is_err());
+        let file = std::fs::File::create(root.path().join("large"))?;
+        file.set_len(8 * 1024 * 1024 + 1)?;
+        assert!(CheckpointFile::observe(root.path(), Path::new("large")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn git_tracking_excludes_only_checkpoint_database_files() {
+        for name in [
+            "checkpoints.sqlite3",
+            "checkpoints.sqlite3-journal",
+            "checkpoints.sqlite3-wal",
+            "checkpoints.sqlite3-shm",
+        ] {
+            assert!(is_checkpoint_database_path(&Path::new(".lin").join(name)));
+        }
+        for path in [
+            ".lin/settings.json",
+            ".lin/tasks.json",
+            ".lin/checkpoints.sqlite3.backup",
+            "nested/.lin/checkpoints.sqlite3",
+            "checkpoints.sqlite3",
+        ] {
+            assert!(!is_checkpoint_database_path(Path::new(path)));
+        }
     }
 
     #[cfg(unix)]

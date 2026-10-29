@@ -281,6 +281,33 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     );
     fake.end_last(&model);
     cx.run_until_parked();
+    acp_thread.read_with(cx, |thread, _| {
+        let output = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .raw_output
+                    .as_ref()
+                    .filter(|output| output.get("saved").is_some()),
+                _ => None,
+            })
+            .expect("save receipt");
+        assert_eq!(output["saved"]["scope"], "agent.questions");
+        assert!(
+            output["saved"]["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert!(
+            output["saved"]["evidence_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert!(output["checkpoint"].is_null());
+        assert!(!output.to_string().contains("Implemented form"));
+        assert!(!output.to_string().contains("session:"));
+    });
     fake.send_last_text(&model, "Saved.");
     fake.end_last(&model);
     send.await.expect("turn completed");

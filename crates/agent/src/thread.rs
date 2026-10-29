@@ -3232,9 +3232,9 @@ impl Thread {
                     "{}: {} (execution result only; relevance and freshness require review)",
                     result.tool_name,
                     if result.is_error {
-                        "failed"
+                        "tool error"
                     } else {
-                        "succeeded"
+                        "returned a result"
                     }
                 ),
                 source: format!("session:{session_id}/tool:{id}"),

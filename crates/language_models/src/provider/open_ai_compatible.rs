@@ -406,7 +406,10 @@ fn chat_completion_max_tokens_parameter(
 }
 
 fn supports_none_reasoning_effort(model: &AvailableModel) -> bool {
-    model.reasoning_effort.is_some()
+    // Only an explicit `none` configuration guarantees that the endpoint
+    // accepts "none". Models configured with low/high/... may reject it (for
+    // example gpt-6.1-sol), so leave the field out instead.
+    model.reasoning_effort == Some(open_ai::ReasoningEffort::None)
 }
 
 fn chat_completion_reasoning_effort(
@@ -539,10 +542,7 @@ mod tests {
         );
 
         request.thinking_allowed = false;
-        assert_eq!(
-            chat_completion_reasoning_effort(&request, &model),
-            Some(open_ai::ReasoningEffort::None)
-        );
+        assert_eq!(chat_completion_reasoning_effort(&request, &model), None);
     }
 
     #[test]
@@ -677,13 +677,37 @@ mod tests {
 
     #[test]
     fn configured_reasoning_effort_supports_none_reasoning_effort() {
-        assert!(supports_none_reasoning_effort(&available_model(Some(
+        assert!(!supports_none_reasoning_effort(&available_model(Some(
             open_ai::ReasoningEffort::Medium
         ))));
         assert!(supports_none_reasoning_effort(&available_model(Some(
             open_ai::ReasoningEffort::None
         ))));
         assert!(!supports_none_reasoning_effort(&available_model(None)));
+    }
+
+    #[test]
+    fn disabled_thinking_omits_effort_for_models_without_none_support() {
+        let model = available_model(Some(open_ai::ReasoningEffort::High));
+        let request = LanguageModelRequest {
+            thinking_allowed: false,
+            ..Default::default()
+        };
+
+        assert_eq!(chat_completion_reasoning_effort(&request, &model), None);
+        let request = into_open_ai_response(
+            request,
+            &model.name,
+            model.capabilities.parallel_tool_calls,
+            model.capabilities.prompt_cache_key,
+            model.max_output_tokens,
+            default_thinking_reasoning_effort(&model),
+            supports_none_reasoning_effort(&model),
+            &LanguageModelProviderId::new("test-compatible-provider"),
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(serialized.get("reasoning"), None);
     }
 
     #[test]
