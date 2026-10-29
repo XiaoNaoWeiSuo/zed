@@ -96,7 +96,7 @@ impl SessionCapabilities {
         !self.available_commands.is_empty() || !self.available_skills.is_empty()
     }
 
-    fn supported_modes(&self, has_thread_store: bool) -> Vec<PromptContextType> {
+    pub(crate) fn supported_modes(&self, has_thread_store: bool) -> Vec<PromptContextType> {
         let mut supported = vec![PromptContextType::File, PromptContextType::Symbol];
         if self.supports_embedded_context() {
             if has_thread_store {

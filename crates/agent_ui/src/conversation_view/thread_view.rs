@@ -51,7 +51,8 @@ use util::markdown::source_position_from_fragment;
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
 use super::elicitation::{
-    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
+    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, ElicitationInputContext,
+    should_render_elicitation,
 };
 use super::subagent_card::{SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card};
 use super::*;
@@ -615,6 +616,7 @@ pub struct ThreadView {
     pub agent_display_name: SharedString,
     pub focus_handle: FocusHandle,
     pub workspace: WeakEntity<Workspace>,
+    input_thread_store: Option<Entity<ThreadStore>>,
     pub entry_view_state: Entity<EntryViewState>,
     pub title_editor: Entity<Editor>,
     title_editor_sync_version: Option<(gpui::EntityId, clock::Global)>,
@@ -954,6 +956,7 @@ impl ThreadView {
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
 
+        let input_thread_store = thread_store.clone();
         let message_editor = cx.new(|cx| {
             let mut editor = MessageEditor::new(
                 workspace.clone(),
@@ -1163,6 +1166,7 @@ impl ThreadView {
             agent_id,
             agent_display_name,
             workspace,
+            input_thread_store,
             entry_view_state,
             title_editor,
             title_editor_sync_version,
@@ -3269,8 +3273,11 @@ impl ThreadView {
             && let Some(schema) = schema
             && !self.elicitation_form_states.contains_key(&id)
         {
-            self.elicitation_form_states
-                .insert(id, ElicitationFormState::new(&schema, window, cx));
+            let input_context = self.elicitation_input_context();
+            self.elicitation_form_states.insert(
+                id,
+                ElicitationFormState::new_with_context(&schema, Some(&input_context), window, cx),
+            );
         } else if !is_pending {
             self.elicitation_form_states.remove(&id);
         }
@@ -13102,6 +13109,15 @@ impl ThreadView {
         metrics.update(cx, |metrics, cx| {
             metrics.update_session(session_id, snapshot, !running, cx);
         });
+    }
+
+    fn elicitation_input_context(&self) -> ElicitationInputContext {
+        ElicitationInputContext {
+            workspace: self.workspace.clone(),
+            project: self.project.clone(),
+            thread_store: self.input_thread_store.clone(),
+            session_capabilities: self.session_capabilities.clone(),
+        }
     }
 
     fn render_permission_tier_selector(

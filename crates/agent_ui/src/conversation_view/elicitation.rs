@@ -1,16 +1,97 @@
+use crate::completion_provider::{
+    AvailableCommand, AvailableSkill, PromptCompletionProvider, PromptCompletionProviderDelegate,
+    PromptContextType,
+};
+use crate::mention_set::MentionSet;
+use crate::message_editor::SharedSessionCapabilities;
 use acp_thread::{Elicitation, ElicitationEntryId, ElicitationStatus};
+use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp;
 use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
 use editor::Editor;
 use futures::channel::oneshot;
 use gpui::{AnyElement, App, Div, Empty, Entity, Focusable, Role, SharedString, Window, div};
+use project::Project;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use ui::{
     Button, Checkbox, ChoiceCard, Color, Icon, IconName, IconSize, Label, LabelSize, ToggleState,
     prelude::*,
 };
+use workspace::Workspace;
+
+/// The editor context needed to offer the same @ and / completions as the
+/// message editor.
+#[derive(Clone)]
+pub(crate) struct ElicitationInputContext {
+    pub(crate) workspace: gpui::WeakEntity<Workspace>,
+    pub(crate) project: gpui::WeakEntity<Project>,
+    pub(crate) thread_store: Option<Entity<ThreadStore>>,
+    pub(crate) session_capabilities: SharedSessionCapabilities,
+}
+
+struct ElicitationCompletionDelegate {
+    session_capabilities: SharedSessionCapabilities,
+    has_thread_store: bool,
+}
+
+impl PromptCompletionProviderDelegate for ElicitationCompletionDelegate {
+    fn supports_images(&self, _cx: &App) -> bool {
+        self.session_capabilities.read().supports_images()
+    }
+
+    fn supported_modes(&self, _cx: &App) -> Vec<PromptContextType> {
+        self.session_capabilities
+            .read()
+            .supported_modes(self.has_thread_store)
+    }
+
+    fn available_commands(&self, _cx: &App) -> Vec<AvailableCommand> {
+        self.session_capabilities.read().completion_commands()
+    }
+
+    fn available_skills(&self, _cx: &App) -> Vec<AvailableSkill> {
+        self.session_capabilities.read().completion_skills()
+    }
+
+    fn confirm_command(&self, _cx: &mut App) {}
+}
+
+fn new_text_editor(
+    default: Option<&String>,
+    context: Option<&ElicitationInputContext>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    let editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        if let Some(default) = default {
+            editor.set_text(default.clone(), window, cx);
+        }
+        editor
+    });
+
+    if let Some(context) = context {
+        let mention_set =
+            cx.new(|_| MentionSet::new(context.project.clone(), context.thread_store.clone()));
+        let provider = Rc::new(PromptCompletionProvider::new(
+            ElicitationCompletionDelegate {
+                session_capabilities: context.session_capabilities.clone(),
+                has_thread_store: context.thread_store.is_some(),
+            },
+            editor.downgrade(),
+            mention_set,
+            context.workspace.clone(),
+        ));
+        editor.update(cx, |editor, _cx| {
+            editor.set_show_completions_on_input(Some(true));
+            editor.set_completion_provider(Some(provider));
+        });
+    }
+
+    editor
+}
 
 #[derive(Clone)]
 struct ElicitationOption {
@@ -47,6 +128,15 @@ pub(crate) struct ElicitationFormState {
 
 impl ElicitationFormState {
     pub(crate) fn new(schema: &acp::ElicitationSchema, window: &mut Window, cx: &mut App) -> Self {
+        Self::new_with_context(schema, None, window, cx)
+    }
+
+    pub(crate) fn new_with_context(
+        schema: &acp::ElicitationSchema,
+        input_context: Option<&ElicitationInputContext>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
         let required = schema.required.as_deref().unwrap_or_default();
         let mut fields = HashMap::default();
 
@@ -56,14 +146,12 @@ impl ElicitationFormState {
                 acp::ElicitationPropertySchema::String(schema) => {
                     let options = single_select_options(schema);
                     if options.is_empty() {
-                        let editor = cx.new(|cx| {
-                            let mut editor = Editor::single_line(window, cx);
-                            if let Some(default) = &schema.default {
-                                editor.set_text(default.clone(), window, cx);
-                            }
-                            editor
-                        });
-                        ElicitationFieldState::Text(editor)
+                        ElicitationFieldState::Text(new_text_editor(
+                            schema.default.as_ref(),
+                            input_context,
+                            window,
+                            cx,
+                        ))
                     } else {
                         let value = single_select_default_value(schema, &options).or_else(|| {
                             is_required

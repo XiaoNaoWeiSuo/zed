@@ -14,7 +14,9 @@ use crate::{
 
 /// Save a concise handoff at a meaningful work boundary, retrieve one by scope,
 /// or list saved scopes when changing work areas. Listed summaries are historical;
-/// read the relevant scope and verify uncertain details before relying on them.
+/// reuse supplied summaries when sufficient. Read a scope or its evidence only to
+/// resolve a specific missing fact needed by the current request, not merely to
+/// restate supplied history. Verify uncertain details before relying on them.
 /// The editor records changed buffers and the latest available Git status snapshot.
 /// Git scanning can lag and unsaved buffers require verification. Summaries are
 /// assessments, not proof of completion.

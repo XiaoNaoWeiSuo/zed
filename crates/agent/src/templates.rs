@@ -137,6 +137,14 @@ mod tests {
             };
             let rendered = templates.0.render(name, &template).expect("prompt");
             assert!(rendered.contains("supplied conversation only"));
+            assert!(rendered.contains("For a greeting alone, reply only to the greeting"));
+            assert!(
+                rendered.contains("do not mention, offer to resume, or ask about historical tasks")
+            );
+            assert!(
+                rendered
+                    .contains("do not read full checkpoints or tool evidence merely to restate")
+            );
             assert!(!rendered.contains("## Tools and verification"));
             template.available_tools = vec!["ask_user".into(), "manage_goal".into()];
             let rendered = templates
@@ -144,6 +152,8 @@ mod tests {
                 .render(name, &template)
                 .expect("prompt with tools");
             assert!(rendered.contains("Defer a question"));
+            assert!(rendered.contains("For a greeting alone, reply only to the greeting"));
+            assert!(rendered.contains("Retrieve details only to resolve a specific missing fact"));
             assert!(rendered.contains("audit every criterion"));
             assert!(!rendered.contains("Delegate only"));
             assert!(!rendered.contains("1-2 focused attempts"));
