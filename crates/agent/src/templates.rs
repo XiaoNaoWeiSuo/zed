@@ -111,7 +111,7 @@ mod tests {
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
-        assert!(rendered.contains("You are the Zed coding agent"));
+        assert!(rendered.contains("You are the Lin coding agent"));
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Tools and verification"));
         assert!(!rendered.contains("ask_user"));
@@ -137,14 +137,8 @@ mod tests {
             };
             let rendered = templates.0.render(name, &template).expect("prompt");
             assert!(rendered.contains("supplied conversation only"));
-            assert!(rendered.contains("For a greeting alone, reply only to the greeting"));
-            assert!(
-                rendered.contains("do not mention, offer to resume, or ask about historical tasks")
-            );
-            assert!(
-                rendered
-                    .contains("do not read full checkpoints or tool evidence merely to restate")
-            );
+            assert!(!rendered.contains("For a greeting alone"));
+            assert!(!rendered.contains("Use `project_checkpoint`"));
             assert!(!rendered.contains("## Tools and verification"));
             template.available_tools = vec!["ask_user".into(), "manage_goal".into()];
             let rendered = templates
@@ -152,8 +146,14 @@ mod tests {
                 .render(name, &template)
                 .expect("prompt with tools");
             assert!(rendered.contains("Defer a question"));
-            assert!(rendered.contains("For a greeting alone, reply only to the greeting"));
-            assert!(rendered.contains("Retrieve details only to resolve a specific missing fact"));
+            assert!(!rendered.contains("Use `project_checkpoint`"));
+            template.available_tools.push("project_checkpoint".into());
+            let rendered = templates
+                .0
+                .render(name, &template)
+                .expect("checkpoint workflow");
+            assert!(rendered.contains("when saved task history would resolve a gap"));
+            assert!(rendered.contains("recheck changed inputs or missing coverage"));
             assert!(rendered.contains("audit every criterion"));
             assert!(!rendered.contains("Delegate only"));
             assert!(!rendered.contains("1-2 focused attempts"));
