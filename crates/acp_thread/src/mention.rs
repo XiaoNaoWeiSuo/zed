@@ -147,7 +147,7 @@ impl MentionUri {
                     })
                 }
             }
-            "zed" => {
+            "lin" | "zed" => {
                 if let Some(thread_id) = path.strip_prefix("/agent/thread/") {
                     let name = single_query_param(&url, "name")?.context("Missing thread name")?;
                     Ok(Self::Thread {
@@ -1356,6 +1356,19 @@ mod tests {
             _ => panic!("Expected Thread variant"),
         }
         assert_eq!(parsed.to_uri().to_string(), thread_uri);
+    }
+
+    #[test]
+    fn test_legacy_zed_thread_uri_remains_readable() {
+        let parsed = MentionUri::parse(
+            "zed:///agent/thread/session123?name=Thread+name",
+            PathStyle::local(),
+        )
+        .expect("legacy mention");
+        assert_eq!(
+            parsed.to_uri().to_string(),
+            "lin:///agent/thread/session123?name=Thread+name"
+        );
     }
 
     #[test]

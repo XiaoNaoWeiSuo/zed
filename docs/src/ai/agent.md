@@ -44,11 +44,19 @@ See [Agents](./agents.md) for the full comparison.
 
 For sustained work, explicitly ask Agent to pursue a goal with observable success criteria. The `manage_goal` tool keeps the objective, verification surfaces, constraints, lifecycle, and completion evidence with the thread. The panel displays the goal and supports pausing and resuming it. Reopening a thread pauses an active goal until you resume it.
 
-Before completing a goal, Agent must assess every criterion and cite completed tool calls from the retained conversation. Missing sources, failed calls, empty observations, and calls that only manage goals or retrieve results cannot be used as completion evidence. The saved evidence includes the source call ID, tool name, and a SHA-256 fingerprint of its input and result.
+For current-workspace claims, Agent uses `manage_goal` with `action: "verify"` to execute an enabled read, search, or terminal tool with declared source-file or directory dependencies. The original tool's profile restrictions, permission rules, and sandbox still apply. A receipt records the actual tool input, output fingerprint, dependency-content fingerprints, result, and observation time.
 
-The `inspect_tool_result` tool lists retained calls and retrieves their input and output in bounded pages, so Agent can reuse observations without rerunning commands. Both tools must be enabled in the selected profile; the default Write and Ask profiles enable them.
+Dependencies are captured before and after execution. A failed tool, changing input, missing dependency, or unsaved dependency cannot establish a passing verification. Directories include their membership, so adding or deleting a file changes the fingerprint. Private/excluded files and paths escaping the project cannot be used to bypass file-access rules. Scans are bounded to 32 declared roots, 10000 entries, and 64 MiB; exceeding a limit fails explicitly rather than certifying partial coverage.
 
-Source validation establishes that an observation exists. Agent still has to check whether it covers the criterion and remains relevant to the current project. A successful command or an output fingerprint alone does not prove correctness or detect later workspace changes.
+For terminal checks, the receipt includes the process exit code and whether the command timed out or was stopped. Only an observed zero exit code without interruption passes; a missing exit status does not. Large verification output is shortened in model context, while the retained original is available through `inspect_tool_result`.
+
+Before completion, Agent assesses every criterion and cites verification receipt IDs. The harness rereads their declared dependencies and rejects stale or failed receipts. Changes outside those dependencies do not invalidate a check. `action: "inspect"` rechecks receipt freshness without rerunning the original tools; the default view shows five recent summaries, and `verification_id` selects an older receipt. Receipts persist with the goal.
+
+Evidence scopes are fixed at goal creation: each criterion defaults to `workspace`. A goal can explicitly declare `historical` scope for observations independent of the current workspace. Those criteria may cite original completed tool calls instead, but must set `historical: true` and state their limitations when completing. A workspace criterion cannot be downgraded to historical evidence after a check fails. Missing, failed, empty, or bookkeeping-only observation sources are rejected. These limits remain attached to the completion evidence and appear in the goal details.
+
+The `inspect_tool_result` tool lists retained calls and retrieves their input and output in bounded pages. The default Write and Ask profiles enable it and `manage_goal`; verification also requires the underlying tool to be enabled in the selected profile.
+
+The dependency set is an explicit coverage contract, not an automatically discovered build graph. Agent must include relevant source, manifests, configuration, and fixtures. Freshness describes the last audit, not a continuous watch or an atomic guarantee against later edits. A passing tool and unchanged declared files establish execution and local-input freshness, not semantic correctness, environment equivalence, or external-service state. Agent still has to audit those conditions against the user's requirements.
 
 
 ## Questions during a run {#questions-during-a-run}

@@ -210,8 +210,14 @@ pub enum Message {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadGoal {
+    #[serde(default = "new_goal_id")]
+    pub id: String,
+    #[serde(default)]
+    pub verification_receipts: Vec<crate::GoalVerificationReceipt>,
     pub objective: String,
     pub success_criteria: Vec<String>,
+    #[serde(default)]
+    pub criterion_scopes: Vec<crate::GoalEvidenceScope>,
     #[serde(default)]
     pub verification_surfaces: Vec<String>,
     #[serde(default)]
@@ -321,6 +327,10 @@ impl PermissionTierState {
     }
 }
 
+fn new_goal_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl ThreadGoal {
     pub fn new(objective: String, success_criteria: Vec<String>) -> Result<Self> {
         anyhow::ensure!(!objective.trim().is_empty(), "A goal requires an objective");
@@ -332,7 +342,10 @@ impl ThreadGoal {
             "A goal requires at least one non-empty success criterion"
         );
         Ok(Self {
+            id: new_goal_id(),
+            verification_receipts: Vec::new(),
             objective,
+            criterion_scopes: vec![crate::GoalEvidenceScope::Workspace; success_criteria.len()],
             success_criteria,
             verification_surfaces: Vec::new(),
             constraints: Vec::new(),
@@ -2542,9 +2555,50 @@ impl Thread {
             })
     }
 
+    pub(crate) fn record_goal_verification(
+        &mut self,
+        goal_id: &str,
+        receipt: crate::GoalVerificationReceipt,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let goal = self
+            .goal
+            .as_mut()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        anyhow::ensure!(goal.id == goal_id, "The goal changed during verification");
+        goal.verification_receipts.push(receipt);
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn update_goal_verification_audit(
+        &mut self,
+        goal_id: &str,
+        statuses: Vec<(String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let goal = self
+            .goal
+            .as_mut()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        anyhow::ensure!(goal.id == goal_id, "The goal changed during evidence audit");
+        for (id, reason) in statuses {
+            if let Some(receipt) = goal
+                .verification_receipts
+                .iter_mut()
+                .find(|receipt| receipt.id == id)
+            {
+                receipt.stale_reason = reason;
+            }
+        }
+        cx.notify();
+        Ok(())
+    }
+
     pub(crate) fn complete_goal(
         &mut self,
         evidence: Vec<crate::GoalCriterionEvidenceInput>,
+        audited: &HashSet<String>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
         use sha2::{Digest as _, Sha256};
@@ -2561,12 +2615,46 @@ impl Thread {
             "Provide evidence for every success criterion in order"
         );
         let mut verified = Vec::new();
-        for criterion in evidence {
+        for (index, criterion) in evidence.into_iter().enumerate() {
             anyhow::ensure!(
-                !criterion.assessment.trim().is_empty() && !criterion.tool_call_ids.is_empty(),
-                "Each criterion needs an assessment and at least one completed tool source; use inspect_tool_result to find sources"
+                !criterion.assessment.trim().is_empty(),
+                "Each criterion needs a coverage assessment"
+            );
+            let scope = goal
+                .criterion_scopes
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+            anyhow::ensure!(
+                criterion.historical == (scope == crate::GoalEvidenceScope::Historical),
+                "Evidence scope is fixed when the goal is created; do not downgrade workspace requirements to historical observations"
+            );
+            anyhow::ensure!(
+                !criterion.historical || !criterion.limitations.trim().is_empty(),
+                "State the limits of historical evidence"
+            );
+            anyhow::ensure!(
+                criterion.historical || !criterion.verification_ids.is_empty(),
+                "Current workspace claims require verification receipts; use manage_goal action=verify"
             );
             let mut sources = Vec::new();
+            for verification_id in criterion.verification_ids {
+                anyhow::ensure!(
+                    audited.contains(&verification_id),
+                    "Verification {verification_id} is missing, failed, or stale; inspect and rerun it"
+                );
+                let receipt = goal
+                    .verification_receipts
+                    .iter()
+                    .find(|receipt| receipt.id == verification_id)
+                    .ok_or_else(|| anyhow!("Unknown verification {verification_id}"))?;
+                sources.push(crate::GoalEvidenceSource {
+                    tool_call_id: receipt.tool_call_id.clone(),
+                    tool_name: receipt.tool_name.clone(),
+                    digest: receipt.output_digest.clone(),
+                    verification_id: Some(verification_id),
+                });
+            }
             for source_id in criterion.tool_call_ids {
                 let (_, result, tool_use) = self
                     .retained_tool_results()
@@ -2593,18 +2681,34 @@ impl Thread {
                     tool_call_id: source_id,
                     tool_name: result.tool_name.to_string(),
                     digest,
+                    verification_id: None,
                 });
             }
+            anyhow::ensure!(
+                !sources.is_empty(),
+                "Each criterion requires original observation sources"
+            );
             verified.push(crate::GoalCriterionEvidence {
                 assessment: criterion.assessment,
                 sources,
+                historical: criterion.historical,
+                limitations: criterion.limitations,
             });
         }
         let outcome = goal
             .success_criteria
             .iter()
             .zip(&verified)
-            .map(|(criterion, evidence)| format!("{criterion}: {}", evidence.assessment))
+            .map(|(criterion, evidence)| {
+                if evidence.historical {
+                    format!(
+                        "{criterion}: {} (Historical observation: {})",
+                        evidence.assessment, evidence.limitations
+                    )
+                } else {
+                    format!("{criterion}: {}", evidence.assessment)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let goal = self
@@ -5347,6 +5451,24 @@ impl Thread {
         }
     }
 
+    pub(crate) fn verification_tool(&self, name: &str, cx: &App) -> Result<Arc<dyn AnyAgentTool>> {
+        let tool = self.enabled_tools(cx).remove(name).ok_or_else(|| {
+            anyhow!("Verification tool {name} is not enabled for the current profile/model")
+        })?;
+        anyhow::ensure!(
+            matches!(
+                tool.kind(),
+                acp_v2::ToolKind::Read | acp_v2::ToolKind::Search | acp_v2::ToolKind::Execute
+            ),
+            "Verification requires a read, search, or terminal tool"
+        );
+        anyhow::ensure!(
+            name != "inspect_tool_result",
+            "Retrieve original observations instead of verifying result retrieval"
+        );
+        Ok(tool)
+    }
+
     fn tool(&self, name: &str) -> Option<Arc<dyn AnyAgentTool>> {
         self.running_turn.as_ref()?.tools.get(name).cloned()
     }
@@ -5473,7 +5595,7 @@ impl Thread {
                 .map(|criterion| format!("- {criterion}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use inspect_tool_result to locate completed tool sources and manage_goal to record an assessment and source IDs for every criterion. Successful tool execution alone does not prove a criterion; assess coverage and freshness. Goal text does not grant additional permissions. If genuinely blocked, record the reason.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
+            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use manage_goal action=verify to run enabled tools against declared source files/directories, including relevant manifests and configuration. Reuse a passing receipt while its declared inputs remain unchanged; inspect rechecks inputs without rerunning the tool. Completion requires fresh receipt IDs for workspace claims. Use historical observations only for claims independent of the current workspace, with explicit limits. Successful execution and stable declared files do not prove semantic coverage, environment state, or external conditions; assess those separately. Record an assessment for every criterion. Goal text does not grant additional permissions. If genuinely blocked, record the reason.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
         }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
@@ -6723,6 +6845,7 @@ pub struct ToolCallEventStream {
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
     permission_tier: Rc<PermissionTierState>,
+    command_status: Rc<RefCell<Option<crate::GoalCommandStatus>>>,
 }
 
 impl ToolCallEventStream {
@@ -6858,7 +6981,16 @@ impl ToolCallEventStream {
             sandbox_grants,
             thread,
             permission_tier: Rc::new(PermissionTierState::new(Default::default())),
+            command_status: Rc::new(RefCell::new(None)),
         }
+    }
+
+    pub(crate) fn set_command_status(&self, status: crate::GoalCommandStatus) {
+        *self.command_status.borrow_mut() = Some(status);
+    }
+
+    pub(crate) fn command_status(&self) -> Option<crate::GoalCommandStatus> {
+        self.command_status.borrow().clone()
     }
 
     #[cfg(test)]
@@ -10095,6 +10227,7 @@ mod tests {
                 vec!["Source inspected".into()],
             )
             .expect("goal");
+            goal.criterion_scopes = vec![crate::GoalEvidenceScope::Historical];
             goal.verification_surfaces = vec!["read_file result".into()];
             goal.constraints = vec!["Preserve user edits".into()];
             thread.set_goal(goal, cx).expect("set goal");
@@ -10138,8 +10271,12 @@ mod tests {
                             vec![crate::GoalCriterionEvidenceInput {
                                 assessment: "Claimed complete".into(),
                                 tool_call_ids: vec![id],
+                                verification_ids: Vec::new(),
+                                historical: true,
+                                limitations: "Historical observation only".into(),
                             }],
-                            cx
+                            &HashSet::default(),
+                            cx,
                         )
                         .is_err()
                 );
@@ -10154,7 +10291,11 @@ mod tests {
                     vec![crate::GoalCriterionEvidenceInput {
                         assessment: "File contents directly inspected".into(),
                         tool_call_ids: vec![source.clone()],
+                        verification_ids: Vec::new(),
+                        historical: true,
+                        limitations: "Historical observation only".into(),
                     }],
+                    &HashSet::default(),
                     cx,
                 )
                 .expect("complete with observations");

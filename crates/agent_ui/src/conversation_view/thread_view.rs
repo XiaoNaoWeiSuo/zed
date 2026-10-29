@@ -5388,7 +5388,16 @@ impl ThreadView {
             "Success criteria:\n{}",
             goal.success_criteria
                 .iter()
-                .map(|criterion| format!("• {criterion}"))
+                .enumerate()
+                .map(|(index, criterion)| {
+                    if goal.criterion_scopes.get(index)
+                        == Some(&agent::GoalEvidenceScope::Historical)
+                    {
+                        format!("• {criterion} (historical observation)")
+                    } else {
+                        format!("• {criterion}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         );
@@ -5410,10 +5419,63 @@ impl ThreadView {
                 index + 1,
                 evidence.assessment
             ));
+            if evidence.historical {
+                details.push_str(&format!(
+                    "\nHistorical observation — {}",
+                    evidence.limitations
+                ));
+            }
             for source in &evidence.sources {
                 details.push_str(&format!(
-                    "\n{} · {} · SHA-256 {}",
-                    source.tool_name, source.tool_call_id, source.digest
+                    "\n{} · {} · SHA-256 {}{}",
+                    source.tool_name,
+                    source.tool_call_id,
+                    source.digest,
+                    if source.verification_id.is_none() {
+                        " · observation only"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        for receipt in goal.verification_receipts.iter().rev().take(5) {
+            let state = receipt
+                .stale_reason
+                .as_deref()
+                .unwrap_or(match receipt.outcome {
+                    agent::GoalVerificationOutcome::Passed => "Passed at last audit",
+                    agent::GoalVerificationOutcome::Failed => "Failed",
+                    agent::GoalVerificationOutcome::Changed => "Inputs changed during verification",
+                });
+            details.push_str(&format!(
+                "\n\nVerification {} · {}\n{}\nDependencies: {}",
+                receipt.id,
+                receipt.tool_name,
+                state,
+                receipt
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            if let Some(status) = &receipt.command_status {
+                details.push_str(&format!(
+                    "\nExit code: {}{}{}",
+                    status
+                        .exit_code
+                        .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                    if status.timed_out {
+                        " · timed out"
+                    } else {
+                        ""
+                    },
+                    if status.user_stopped {
+                        " · stopped by user"
+                    } else {
+                        ""
+                    },
                 ));
             }
         }

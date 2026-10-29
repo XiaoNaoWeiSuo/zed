@@ -998,31 +998,31 @@ async fn run_terminal_tool(
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
-    match timeout {
+    let exit_status = match timeout {
         Some(timeout) => {
             let timeout_task = cx.background_executor().timer(timeout);
 
             futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
+                status = wait_for_exit.clone().fuse() => status,
                 _ = timeout_task.fuse() => {
                     timed_out = true;
                     terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    wait_for_exit.await
                 }
                 _ = event_stream.cancelled_by_user().fuse() => {
                     user_stopped_via_signal = true;
                     terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    wait_for_exit.await
                 }
             }
         }
         None => {
             futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
+                status = wait_for_exit.clone().fuse() => status,
                 _ = event_stream.cancelled_by_user().fuse() => {
                     user_stopped_via_signal = true;
                     terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    wait_for_exit.await
                 }
             }
         }
@@ -1032,7 +1032,20 @@ async fn run_terminal_tool(
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
     let user_stopped = user_stopped_via_signal || user_stopped_via_terminal;
 
-    let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
+    let mut output = terminal.current_output(cx).map_err(|e| e.to_string())?;
+    if output.exit_status.is_none() {
+        output.exit_status = Some(exit_status);
+    }
+
+    event_stream.set_command_status(super::goal_verification::GoalCommandStatus {
+        exit_code: output
+            .exit_status
+            .as_ref()
+            .and_then(|status| status.exit_code)
+            .map(i64::from),
+        timed_out,
+        user_stopped,
+    });
 
     let result = process_content(output, &input.command, timed_out, user_stopped, selection);
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
@@ -3613,6 +3626,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         persistent: agent_settings::SandboxPermissions,
         grants: crate::sandboxing::ThreadSandboxGrants,
+        exit_code: u32,
     ) -> (
         std::sync::Arc<SandboxedTerminalTool>,
         crate::ToolCallEventStream,
@@ -3637,7 +3651,7 @@ mod tests {
 
         let environment = std::rc::Rc::new(cx.update(|cx| {
             crate::tests::FakeThreadEnvironment::default().with_terminal(
-                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, exit_code),
             )
         }));
         #[allow(clippy::arc_with_non_send_sync)]
@@ -3660,19 +3674,54 @@ mod tests {
             ..Default::default()
         });
         let (tool, event_stream, _receiver, environment) =
-            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants).await;
+            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants, 0).await;
 
         let input: SandboxedTerminalToolInput = serde_json::from_value(serde_json::json!({
             "command": "echo hi",
             "cd": "root",
         }))
         .unwrap();
-        let task = cx.update(|cx| tool.run(crate::ToolInput::resolved(input), event_stream, cx));
+        let task =
+            cx.update(|cx| tool.run(crate::ToolInput::resolved(input), event_stream.clone(), cx));
         let result = task.await.expect("bare command should run");
+        assert_eq!(
+            event_stream
+                .command_status()
+                .and_then(|status| status.exit_code),
+            Some(0)
+        );
         assert_eq!(environment.terminal_creation_count(), 1);
         assert!(
             result.contains("WITHOUT an OS sandbox"),
             "a bare command in an unsandboxed thread must run unsandboxed: {result}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reports_nonzero_exit_status_to_verification(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut grants = crate::sandboxing::ThreadSandboxGrants::default();
+        grants.record(&crate::sandboxing::SandboxRequest {
+            unsandboxed: true,
+            ..Default::default()
+        });
+        let (tool, event_stream, _receiver, _) =
+            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants, 7).await;
+        let input: SandboxedTerminalToolInput =
+            serde_json::from_value(serde_json::json!({"command": "false", "cd": "root"}))
+                .expect("input");
+        let task =
+            cx.update(|cx| tool.run(crate::ToolInput::resolved(input), event_stream.clone(), cx));
+        let output = task
+            .await
+            .expect("terminal reports command failures in output");
+        assert!(output.contains("exit code 7"));
+        assert_eq!(
+            event_stream
+                .command_status()
+                .and_then(|status| status.exit_code),
+            Some(7)
         );
     }
 
@@ -3687,7 +3736,7 @@ mod tests {
             ..Default::default()
         });
         let (tool, event_stream, _receiver, environment) =
-            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants).await;
+            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants, 0).await;
 
         let input: SandboxedTerminalToolInput = serde_json::from_value(serde_json::json!({
             "command": "touch build/out",
@@ -3727,6 +3776,7 @@ mod tests {
             cx,
             persistent,
             crate::sandboxing::ThreadSandboxGrants::default(),
+            0,
         )
         .await;
 
@@ -3758,7 +3808,7 @@ mod tests {
             ..Default::default()
         });
         let (tool, event_stream, _receiver, environment) =
-            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants).await;
+            floor_test_tool(cx, agent_settings::SandboxPermissions::default(), grants, 0).await;
 
         let input: SandboxedTerminalToolInput = serde_json::from_value(serde_json::json!({
             "command": "curl https://github.com",

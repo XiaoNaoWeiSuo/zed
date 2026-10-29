@@ -6374,8 +6374,11 @@ async fn test_active_goal_continues_until_completed(cx: &mut TestAppContext) {
         action: "create".into(),
         objective: "Finish the task".into(),
         success_criteria: vec!["Project files inspected".into()],
+        criterion_scopes: vec![GoalEvidenceScope::Historical],
         evidence: String::new(),
         criterion_evidence: Vec::new(),
+        verification: None,
+        verification_id: None,
         verification_surfaces: vec!["list_directory output for a".into()],
         constraints: Vec::new(),
     };
@@ -6408,8 +6411,11 @@ async fn test_active_goal_continues_until_completed(cx: &mut TestAppContext) {
         action: "complete".into(),
         objective: String::new(),
         success_criteria: Vec::new(),
+        criterion_scopes: Vec::new(),
         evidence: String::new(),
         criterion_evidence: Vec::new(),
+        verification: None,
+        verification_id: None,
         verification_surfaces: Vec::new(),
         constraints: Vec::new(),
     };
@@ -6495,13 +6501,20 @@ async fn test_active_goal_continues_until_completed(cx: &mut TestAppContext) {
         action: "complete".into(),
         objective: String::new(),
         success_criteria: Vec::new(),
+        criterion_scopes: Vec::new(),
         evidence: "Tests passed".into(),
         criterion_evidence: vec![GoalCriterionEvidenceInput {
             assessment: "Observed project files".into(),
             tool_call_ids: vec![evidence_id],
+            verification_ids: Vec::new(),
+            historical: true,
+            limitations:
+                "Only the observed listing is established, not the current contents of files".into(),
         }],
         verification_surfaces: Vec::new(),
         constraints: Vec::new(),
+        verification: None,
+        verification_id: None,
     };
     fake.send_last_event(
         &model,

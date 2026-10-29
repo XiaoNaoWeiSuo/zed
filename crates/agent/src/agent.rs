@@ -10081,6 +10081,547 @@ mod internal_tests {
         replay_target.read_with(cx, |thread, _| assert_eq!(messages(thread), expected));
     }
 
+    #[gpui::test]
+    async fn restored_deferred_question_reaches_conversation_and_saves_response(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (_connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let original = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        original.update(cx, |thread, cx| {
+            thread
+                .register_deferred_question(
+                    "restored-choice".into(),
+                    acp_v2::ToolCallId::new("0:question"),
+                    "Choose a direction".into(),
+                    &acp_v2::ElicitationSchema::new().string("direction", true),
+                    cx,
+                )
+                .expect("question");
+        });
+        let saved = original.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let saved: DbThread =
+            serde_json::from_slice(&serde_json::to_vec(&saved).expect("serialize"))
+                .expect("deserialize");
+        let (context, registry, templates) = original.read_with(cx, |thread, _| {
+            (
+                thread.project_context().clone(),
+                thread.context_server_registry.clone(),
+                thread.templates.clone(),
+            )
+        });
+        let restored = cx.new(|cx| {
+            Thread::from_db(
+                session_id.clone(),
+                saved,
+                project,
+                context,
+                registry,
+                templates,
+                cx,
+            )
+        });
+        agent.update(cx, |agent, _| {
+            agent.sessions.get_mut(&session_id).expect("session").thread = restored.clone();
+        });
+        let events = restored.update(cx, |thread, cx| thread.replay(cx));
+        cx.update(|cx| {
+            NativeAgentConnection::handle_thread_events(
+                events,
+                acp_thread.downgrade(),
+                Some(agent.downgrade()),
+                cx,
+            )
+        })
+        .await
+        .expect("replay");
+        cx.run_until_parked();
+        let entry_id = acp_thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .expect("restored form in conversation")
+        });
+        acp_thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([("direction".into(), "B".into())]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |thread, _| {
+            let response = thread
+                .deferred_question("restored-choice")
+                .expect("question")
+                .response
+                .as_ref()
+                .expect("saved response");
+            assert!(response.to_string().contains("B"));
+        });
+        let saved_again = restored.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert!(
+            saved_again
+                .deferred_questions
+                .get("restored-choice")
+                .expect("persisted question")
+                .response
+                .is_some()
+        );
+    }
+
+    struct VerificationFixtureTool {
+        filesystem: Arc<dyn fs::Fs>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct VerificationFixtureInput {
+        fail: bool,
+    }
+
+    impl crate::AgentTool for VerificationFixtureTool {
+        type Input = VerificationFixtureInput;
+        type Output = String;
+        const NAME: &'static str = "verification_fixture";
+        fn kind() -> acp_v2::ToolKind {
+            acp_v2::ToolKind::Read
+        }
+        fn initial_title(
+            &self,
+            _: Result<Self::Input, serde_json::Value>,
+            _: &mut App,
+        ) -> SharedString {
+            "Controlled verification fixture".into()
+        }
+        fn run(
+            self: Arc<Self>,
+            input: crate::ToolInput<Self::Input>,
+            _: crate::ToolCallEventStream,
+            cx: &mut App,
+        ) -> Task<Result<String, String>> {
+            cx.spawn(async move |_cx| {
+                let input = input.recv().await.map_err(|error| error.to_string())?;
+                if input.fail {
+                    return Err("The verification check failed".into());
+                }
+                self.filesystem
+                    .write(Path::new("/a/source.txt"), b"changed during verification")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok("Tool succeeded after a concurrent source change".into())
+            })
+        }
+    }
+
+    struct VerificationCommandFixture;
+
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct VerificationCommandInput {
+        exit_code: Option<i64>,
+        timed_out: bool,
+        report_status: bool,
+    }
+
+    impl crate::AgentTool for VerificationCommandFixture {
+        type Input = VerificationCommandInput;
+        type Output = String;
+        const NAME: &'static str = "verification_command_fixture";
+        fn kind() -> acp_v2::ToolKind {
+            acp_v2::ToolKind::Execute
+        }
+        fn initial_title(
+            &self,
+            _: Result<Self::Input, serde_json::Value>,
+            _: &mut App,
+        ) -> SharedString {
+            "Controlled command".into()
+        }
+        fn run(
+            self: Arc<Self>,
+            input: crate::ToolInput<Self::Input>,
+            event_stream: crate::ToolCallEventStream,
+            cx: &mut App,
+        ) -> Task<Result<String, String>> {
+            cx.spawn(async move |_cx| {
+                let input = input.recv().await.map_err(|error| error.to_string())?;
+                if input.report_status {
+                    event_stream.set_command_status(crate::GoalCommandStatus {
+                        exit_code: input.exit_code,
+                        timed_out: input.timed_out,
+                        user_stopped: false,
+                    });
+                }
+                Ok("The terminal tool returned normally".into())
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn goal_verification_never_accepts_failed_or_changed_checks(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+        let fake = init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let filesystem = project.read_with(cx, |project, _| project.fs().clone());
+        filesystem
+            .write(Path::new("/a/source.txt"), b"before")
+            .await
+            .expect("source");
+        cx.update(|cx| settings::SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(&json!({"agent":{"profiles":{"verify-test":{"name":"Verify test","tools":{"manage_goal":true,"verification_fixture":true,"verification_command_fixture":true}}}}}).to_string(), cx).result().expect("profile");
+        }));
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let native = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("controlled-verification");
+        native.update(cx, |thread, cx| {
+            thread.add_tool(VerificationFixtureTool {
+                filesystem: filesystem.clone(),
+            });
+            thread.add_tool(VerificationCommandFixture);
+            thread.set_model(model.clone(), cx);
+            thread.set_profile(agent_settings::AgentProfileId("verify-test".into()), cx);
+        });
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["Verify the current source".into()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let call = |id: &str, input: serde_json::Value| {
+            fake.send_last_event(
+                &model,
+                LanguageModelCompletionEvent::ToolUse(language_model::LanguageModelToolUse {
+                    id: id.into(),
+                    name: "manage_goal".into(),
+                    raw_input: input.to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(input),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            );
+            fake.end_last(&model);
+        };
+        call(
+            "create",
+            json!({"action":"create","objective":"Verified source","success_criteria":["Check passes on stable source"],"verification_surfaces":["Controlled check"]}),
+        );
+        cx.run_until_parked();
+        for (id, fail, expected) in [
+            ("changed", false, crate::GoalVerificationOutcome::Changed),
+            ("failed", true, crate::GoalVerificationOutcome::Failed),
+        ] {
+            call(
+                id,
+                json!({"action":"verify","verification":{"tool_name":"verification_fixture","tool_input":{"fail":fail},"dependencies":["a/source.txt"]}}),
+            );
+            cx.run_until_parked();
+            let receipt_id = native.read_with(cx, |thread, _| {
+                let receipt = thread
+                    .goal()
+                    .expect("goal")
+                    .verification_receipts
+                    .last()
+                    .expect("receipt");
+                assert_eq!(receipt.outcome, expected);
+                receipt.id.clone()
+            });
+            acp_thread.read_with(cx, |thread, _| assert!(thread.entries().iter().any(|entry| matches!(entry,
+                acp_thread::AgentThreadEntry::ToolCall(call) if call.id.to_string().ends_with(&format!(":{id}")) && call.status() == acp_thread::ToolCallStatus::Failed))));
+            call(
+                "reject-completion",
+                json!({"action":"complete","criterion_evidence":[{"assessment":"Tool output is insufficient","verification_ids":[receipt_id]}]}),
+            );
+            cx.run_until_parked();
+            native.read_with(cx, |thread, _| {
+                assert_eq!(
+                    thread.goal().expect("goal").status,
+                    crate::ThreadGoalStatus::Active
+                )
+            });
+        }
+        for (id, code, timed_out, report_status, expected) in [
+            (
+                "command-failed",
+                Some(1),
+                false,
+                true,
+                crate::GoalVerificationOutcome::Failed,
+            ),
+            (
+                "command-timeout",
+                Some(0),
+                true,
+                true,
+                crate::GoalVerificationOutcome::Failed,
+            ),
+            (
+                "command-unknown",
+                None,
+                false,
+                false,
+                crate::GoalVerificationOutcome::Failed,
+            ),
+            (
+                "command-passed",
+                Some(0),
+                false,
+                true,
+                crate::GoalVerificationOutcome::Passed,
+            ),
+        ] {
+            call(
+                id,
+                json!({"action":"verify","verification":{"tool_name":"verification_command_fixture","tool_input":{"exit_code":code,"timed_out":timed_out,"report_status":report_status},"dependencies":["a/source.txt"]}}),
+            );
+            cx.run_until_parked();
+            native.read_with(cx, |thread, _| {
+                let receipt = thread
+                    .goal()
+                    .expect("goal")
+                    .verification_receipts
+                    .last()
+                    .expect("command receipt");
+                assert_eq!(receipt.outcome, expected);
+                assert_eq!(
+                    receipt
+                        .command_status
+                        .as_ref()
+                        .and_then(|status| status.exit_code),
+                    code
+                );
+            });
+        }
+        call("pause", json!({"action":"pause"}));
+        cx.run_until_parked();
+        fake.send_last_text(&model, "The checks did not establish completion.");
+        fake.end_last(&model);
+        send.await.expect("paused goal");
+    }
+
+    #[gpui::test]
+    async fn goal_verification_receipts_reject_stale_results_and_reuse_unaffected_checks(
+        cx: &mut TestAppContext,
+    ) {
+        let fake = init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let filesystem = project.read_with(cx, |project, _| project.fs().clone());
+        filesystem
+            .create_dir(Path::new("/a/src"))
+            .await
+            .expect("source directory");
+        filesystem
+            .write(Path::new("/a/src/source.txt"), b"original")
+            .await
+            .expect("source");
+        filesystem
+            .write(Path::new("/a/notes.txt"), b"notes")
+            .await
+            .expect("notes");
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let native = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("verification");
+        native.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.set_profile(agent_settings::AgentProfileId("ask".into()), cx);
+        });
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["Pursue a goal: inspect the current source".into()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let call = |id: &str, input: serde_json::Value| {
+            fake.send_last_event(
+                &model,
+                LanguageModelCompletionEvent::ToolUse(language_model::LanguageModelToolUse {
+                    id: id.into(),
+                    name: "manage_goal".into(),
+                    raw_input: input.to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(input),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            );
+            fake.end_last(&model);
+        };
+        call(
+            "create",
+            json!({"action":"create", "objective":"Inspect current source", "success_criteria":["Current source inspected"], "verification_surfaces":["read_file a/src/source.txt"]}),
+        );
+        cx.run_until_parked();
+        let verify = json!({"action":"verify", "verification":{"tool_name":"read_file", "tool_input":{"path":"a/src/source.txt"}, "dependencies":["a/src"]}});
+        call("verify-first", verify.clone());
+        cx.run_until_parked();
+        let first = native.read_with(cx, |thread, _| {
+            let receipt = thread
+                .goal()
+                .expect("goal")
+                .verification_receipts
+                .last()
+                .expect("receipt");
+            assert_eq!(receipt.outcome, crate::GoalVerificationOutcome::Passed);
+            receipt.id.clone()
+        });
+        filesystem
+            .write(Path::new("/a/notes.txt"), b"unrelated change")
+            .await
+            .expect("notes edit");
+        call(
+            "inspect-unrelated",
+            json!({"action":"inspect", "verification_id": first}),
+        );
+        cx.run_until_parked();
+        native.read_with(cx, |thread, _| {
+            assert!(
+                thread
+                    .goal()
+                    .expect("goal")
+                    .verification_receipts
+                    .first()
+                    .expect("receipt")
+                    .stale_reason
+                    .is_none()
+            )
+        });
+        filesystem
+            .write(Path::new("/a/src/source.txt"), b"changed")
+            .await
+            .expect("source edit");
+        let completion = |id: &str| json!({"action":"complete", "criterion_evidence":[{"assessment":"The read covers the source dependency", "verification_ids":[id]}]});
+        call("reject-stale", completion(&first));
+        cx.run_until_parked();
+        native.read_with(cx, |thread, _| {
+            let goal = thread.goal().expect("goal");
+            assert_eq!(goal.status, crate::ThreadGoalStatus::Active);
+            assert!(
+                goal.verification_receipts
+                    .first()
+                    .expect("receipt")
+                    .stale_reason
+                    .is_some()
+            );
+        });
+        call(
+            "historical-bypass",
+            json!({"action":"complete", "criterion_evidence":[{"assessment":"Downgraded claim", "historical":true, "limitations":"Source may have changed", "tool_call_ids":[]}]}),
+        );
+        cx.run_until_parked();
+        native.read_with(cx, |thread, _| {
+            let (_, result, _) = thread
+                .retained_tool_results()
+                .find(|(_, _, tool_use)| tool_use.id.to_string() == "historical-bypass")
+                .expect("scope rejection");
+            assert!(result.is_error && result.text_contents().contains("scope is fixed"));
+        });
+        call(
+            "disabled-tool",
+            json!({"action":"verify", "verification":{"tool_name":"terminal", "tool_input":{"command":"touch forbidden", "cd":"a"}, "dependencies":["a/src"]}}),
+        );
+        cx.run_until_parked();
+        assert!(
+            !filesystem.is_file(Path::new("/a/forbidden")).await,
+            "verify must honor the selected profile"
+        );
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.tools.insert(
+                "terminal".into(),
+                agent_settings::ToolRules {
+                    default: Some(settings::ToolPermissionMode::Deny),
+                    always_allow: Vec::new(),
+                    always_deny: Vec::new(),
+                    always_confirm: Vec::new(),
+                    invalid_patterns: Vec::new(),
+                },
+            );
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        native.update(cx, |thread, cx| {
+            thread.set_profile(agent_settings::AgentProfileId("write".into()), cx)
+        });
+        call(
+            "denied-terminal",
+            json!({"action":"verify", "verification":{"tool_name":"terminal", "tool_input":{"command":"touch denied_verifier", "cd":"a", "timeout_ms":1000}, "dependencies":["a/src"]}}),
+        );
+        cx.run_until_parked();
+        native.read_with(cx, |thread, _| {
+            let receipt = thread
+                .goal()
+                .expect("goal")
+                .verification_receipts
+                .last()
+                .expect("denied receipt");
+            assert_eq!(receipt.outcome, crate::GoalVerificationOutcome::Failed);
+            assert!(
+                receipt.preview.contains("blocked")
+                    || receipt.preview.contains("denied")
+                    || receipt.preview.contains("disabled"),
+                "{}",
+                receipt.preview
+            );
+        });
+        assert!(
+            !filesystem.is_file(Path::new("/a/denied_verifier")).await,
+            "verification cannot bypass terminal denials"
+        );
+        native.update(cx, |thread, cx| {
+            thread.set_profile(agent_settings::AgentProfileId("ask".into()), cx)
+        });
+        call("verify-again", verify);
+        cx.run_until_parked();
+        let second = native.read_with(cx, |thread, _| {
+            thread
+                .goal()
+                .expect("goal")
+                .verification_receipts
+                .last()
+                .expect("new receipt")
+                .id
+                .clone()
+        });
+        assert_ne!(first, second);
+        call("finish", completion(&second));
+        cx.run_until_parked();
+        native.read_with(cx, |thread, _| {
+            let goal = thread.goal().expect("goal");
+            assert_eq!(goal.status, crate::ThreadGoalStatus::Completed);
+            assert_eq!(
+                goal.evidence
+                    .first()
+                    .expect("criterion")
+                    .sources
+                    .first()
+                    .expect("source")
+                    .verification_id
+                    .as_deref(),
+                Some(second.as_str())
+            );
+        });
+        fake.send_last_text(&model, "Verified the current source.");
+        fake.end_last(&model);
+        send.await.expect("completed goal");
+        let saved = native.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let restored: DbThread =
+            serde_json::from_slice(&serde_json::to_vec(&saved).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(
+            saved.goal, restored.goal,
+            "receipts and source fingerprints survive reload"
+        );
+    }
+
     struct StreamingTurn {
         fake: Arc<FakeLanguageModelProvider>,
         model: LanguageModel,
