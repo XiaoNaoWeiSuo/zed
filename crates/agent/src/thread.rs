@@ -1597,7 +1597,7 @@ impl Thread {
         model: Option<LanguageModel>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let thread = Self::new_internal(
+        Self::new_internal(
             project.clone(),
             project_context,
             context_server_registry,
@@ -1605,45 +1605,7 @@ impl Thread {
             model,
             cx.new(|_cx| ActionLog::new(project)),
             cx,
-        );
-        Self::prime_checkpoint_context(&thread.project, cx);
-        thread
-    }
-
-    fn prime_checkpoint_context(project: &Entity<Project>, cx: &mut Context<Self>) {
-        let project = project.read(cx);
-        if !project.is_local()
-            || TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx)
-        {
-            return;
-        }
-        let roots = project
-            .visible_worktrees(cx)
-            .map(|worktree| {
-                let path = worktree.read(cx).abs_path().to_path_buf();
-                let git = crate::checkpoint_git_snapshot(project, &path, cx);
-                crate::CheckpointRoot { path, git }
-            })
-            .collect::<Vec<_>>();
-        cx.spawn(async move |thread, cx| {
-            let context = cx.background_spawn(async move { crate::load_checkpoint_context(&roots) }).await;
-            let context = match context {
-                Ok(context) => context.unwrap_or_default(),
-                Err(error) => {
-                    log::error!("Failed to load project checkpoint: {error:#}");
-                    "Project checkpoints could not be loaded; their contents and freshness are unknown.".into()
-                }
-            };
-            thread.update(cx, |thread, cx| {
-                if thread.checkpoint_context.is_none() && thread.running_turn.is_none()
-                    && thread.project.read(cx).is_local()
-                    && !TrustedWorktrees::has_restricted_worktrees(&thread.project.read(cx).worktree_store(), cx)
-                {
-                    thread.checkpoint_context = Some(context);
-                    cx.notify();
-                }
-            }).log_err();
-        }).detach();
+        )
     }
 
     fn new_internal(
@@ -2096,10 +2058,6 @@ impl Thread {
             watch::channel(Self::prompt_capabilities(model.as_model()));
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
-
-        if db_thread.subagent_context.is_none() {
-            Self::prime_checkpoint_context(&project, cx);
-        }
 
         Self {
             id,
@@ -3891,54 +3849,6 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        let roots = this.read_with(cx, |thread, cx| {
-            let project = thread.project.read(cx);
-            (thread.parent_thread_id().is_none()
-                && project.is_local()
-                && !TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx))
-            .then(|| {
-                project
-                    .visible_worktrees(cx)
-                    .map(|worktree| {
-                        let path = worktree.read(cx).abs_path().to_path_buf();
-                        let git = crate::checkpoint_git_snapshot(project, &path, cx);
-                        crate::CheckpointRoot { path, git }
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })?;
-        if let Some(roots) = roots {
-            let context = cx
-                .background_spawn(async move { crate::load_checkpoint_context(&roots) })
-                .await;
-            let context = match context {
-                Ok(context) => context.unwrap_or_default(),
-                Err(error) => {
-                    log::error!("Failed to load project checkpoint: {error:#}");
-                    "Project checkpoints could not be loaded; their contents and freshness are unknown.".into()
-                }
-            };
-            this.update(cx, |thread, cx| {
-                if &thread.prompt_id == prompt_id {
-                    thread.checkpoint_context = if thread.project.read(cx).is_local()
-                        && !TrustedWorktrees::has_restricted_worktrees(
-                            &thread.project.read(cx).worktree_store(),
-                            cx,
-                        ) {
-                        Some(context)
-                    } else {
-                        None
-                    };
-                    cx.notify();
-                }
-            })?;
-        } else {
-            this.update(cx, |thread, cx| {
-                if &thread.prompt_id == prompt_id && thread.checkpoint_context.take().is_some() {
-                    cx.notify();
-                }
-            })?;
-        }
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         let mut last_goal_response: Option<String> = None;
@@ -4734,7 +4644,11 @@ impl Thread {
             usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
-        let output_tokens = usage.output_tokens.max(self.streamed_output_chars / 4);
+        // Only use the provider-reported output token count. Estimated
+        // characters include streamed text that is not model output (for
+        // example echoed tool arguments), which produced implausibly high
+        // throughput when tools ran.
+        let output_tokens = usage.output_tokens;
         let elapsed = self
             .first_token_at
             .or(self.request_started_at)
