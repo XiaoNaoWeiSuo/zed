@@ -200,13 +200,13 @@ async fn test_finished_tool_turn_saves_automatic_checkpoint(cx: &mut TestAppCont
         .expect("read checkpoint")
         .expect("automatic checkpoint");
     assert!(!checkpoint.interrupted);
-    assert!(
-        checkpoint
-            .evidence
-            .iter()
-            .any(|entry| entry.description.contains("failed")
-                && entry.source.contains("invalid-terminal"))
-    );
+    let evidence = checkpoint
+        .evidence
+        .iter()
+        .find(|entry| entry.source.contains("invalid-terminal"))
+        .expect("invalid terminal evidence");
+    assert!(evidence.description.contains("tool error"));
+    assert!(!evidence.description.contains("succeeded"));
 }
 
 #[gpui::test]
@@ -388,7 +388,20 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     cx.run_until_parked();
     let requests = fake.pending_completions_for(&model);
     let request = requests.last().expect("next request");
-    assert!(request.messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content| matches!(content, MessageContent::Text(text) if text.contains("Verify recovery") && text.contains("historical")))));
+    let handoff = request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            MessageContent::Text(text) if text.contains("Verify recovery") => Some(text),
+            _ => None,
+        })
+        .expect("historical handoff in next session request");
+    assert!(handoff.contains("Historical background"));
+    assert!(handoff.contains("automatically supplied by the harness"));
+    assert!(handoff.contains("not authored by the user"));
+    assert!(handoff.contains("does not replace the current user request"));
     let list_input = json!({"action":"list", "limit":1});
     fake.send_last_event(
         &model,
