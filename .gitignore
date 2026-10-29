@@ -62,3 +62,5 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+# Local Lin state (checkpoints, databases)
+/.lin/
