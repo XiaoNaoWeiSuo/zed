@@ -75,6 +75,7 @@ fn all_models(cx: &App) -> GroupedModels {
             provider
                 .recommended_models(cx)
                 .into_iter()
+                .filter(|model| !lm_registry.is_model_disabled(model))
                 .map(|model| ModelInfo::new(&**provider, model, &favorites_index))
         })
         .collect();
@@ -85,6 +86,7 @@ fn all_models(cx: &App) -> GroupedModels {
             provider
                 .provided_models(cx)
                 .into_iter()
+                .filter(|model| !lm_registry.is_model_disabled(model))
                 .map(|model| ModelInfo::new(&**provider, model, &favorites_index))
         })
         .collect();
