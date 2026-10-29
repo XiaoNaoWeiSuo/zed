@@ -5074,6 +5074,52 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_project_checkpoint_card_expands_and_collapses(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let server = cx.update(|cx| {
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            NativeAgentServer::new(fs, thread_store)
+        });
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let native_thread = conversation_view
+            .read_with(cx, |view, cx| view.as_native_thread(cx))
+            .expect("native thread");
+        native_thread.update(cx, |thread, cx| thread.set_project_checkpoint_context_for_test(
+            serde_json::json!([{"root":"project", "scope":"agent", "remaining":["Verify recovery"], "evidence":[{"description":"Previous test", "source":"session:missing/tool:missing"}]}]).to_string(), cx
+        ));
+        cx.run_until_parked();
+        let card = cx
+            .debug_bounds("project-checkpoint")
+            .expect("checkpoint card");
+        assert!(cx.debug_bounds("project-checkpoint-details").is_none());
+        cx.simulate_click(
+            point(card.origin.x + px(30.), card.center().y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("project-checkpoint-details").is_some());
+        let evidence = cx
+            .debug_bounds("checkpoint-evidence-0")
+            .expect("evidence button");
+        cx.simulate_click(evidence.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("checkpoint-evidence-output").is_some());
+        let card = cx
+            .debug_bounds("project-checkpoint")
+            .expect("expanded checkpoint card");
+        cx.simulate_click(
+            point(card.origin.x + px(30.), card.origin.y + px(10.)),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("project-checkpoint-details").is_none());
+    }
+
+    #[gpui::test]
     async fn test_queued_message_steer_defaults_off_and_toggles(cx: &mut TestAppContext) {
         init_test(cx);
 

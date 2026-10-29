@@ -55,10 +55,165 @@ use std::{
 use util::path;
 
 #[gpui::test]
+async fn test_canceled_terminal_turn_saves_interruption_checkpoint(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"checkpoint-test": {"name": "Checkpoint", "tools": {"terminal": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let root = tempfile::tempdir().expect("project directory");
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(root.path(), json!({})).await;
+    let project = Project::test(fs.clone(), [root.path()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[root.path()]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("interruption");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("checkpoint-test".into()), cx);
+    });
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(
+            acp_thread.clone(),
+            vec!["Run a command".into()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let input = json!({"command": "echo test"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "terminal".into(),
+            name: "terminal".into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+    cancel.await;
+    send.await.expect("canceled turn");
+    let store = ProjectCheckpointStore::open_existing(root.path())
+        .expect("checkpoint database")
+        .expect("interruption saved");
+    let checkpoint = store
+        .latest_automatic()
+        .expect("read interruption")
+        .expect("interruption");
+    assert!(checkpoint.interrupted);
+    assert_eq!(checkpoint.session_id, session_id.0.to_string());
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread
+                .project_checkpoint_context()
+                .is_some_and(|context| context.contains("\"interrupted\":true"))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_finished_tool_turn_saves_automatic_checkpoint(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"checkpoint-test": {"name": "Checkpoint", "tools": {"terminal": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let root = tempfile::tempdir().expect("project directory");
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(root.path(), json!({})).await;
+    let project = Project::test(fs.clone(), [root.path()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[root.path()]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("automatic-checkpoint");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("checkpoint-test".into()), cx);
+    });
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(
+            acp_thread.clone(),
+            vec!["Run a command".into()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let input = json!({"command": 42});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "invalid-terminal".into(),
+            name: "terminal".into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    fake.send_last_text(&model, "The command input was invalid.");
+    fake.end_last(&model);
+    send.await.expect("finished turn");
+    let store = ProjectCheckpointStore::open_existing(root.path())
+        .expect("checkpoint database")
+        .expect("checkpoint saved");
+    let checkpoint = store
+        .latest_automatic()
+        .expect("read checkpoint")
+        .expect("automatic checkpoint");
+    assert!(!checkpoint.interrupted);
+    assert!(
+        checkpoint
+            .evidence
+            .iter()
+            .any(|entry| entry.description.contains("failed")
+                && entry.source.contains("invalid-terminal"))
+    );
+}
+
+#[gpui::test]
 async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) {
     let fake = init_test(cx);
     cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
-        store.set_user_settings(&json!({"agent": {"profiles": {"checkpoint-test": {"name": "Checkpoint", "tools": {"project_checkpoint": true}}}}}).to_string(), cx).result().expect("settings");
+        store.set_user_settings(&json!({"agent": {"profiles": {"checkpoint-test": {"name": "Checkpoint", "tools": {"project_checkpoint": true, "list_directory": true, "inspect_tool_result": true}}}}}).to_string(), cx).result().expect("settings");
     }));
     let root = tempfile::tempdir().expect("project directory");
     let fs = FakeFs::new(cx.executor());
@@ -97,6 +252,21 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
         )
     });
     cx.run_until_parked();
+    let directory_input =
+        json!({"path": root.path().file_name().expect("root name").to_string_lossy()});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "inspect-root".into(),
+            name: ListDirectoryTool::NAME.into(),
+            raw_input: directory_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(directory_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
     let input = json!({"action": "save", "scope": "agent.questions", "completed": ["Implemented form"], "remaining": ["Verify recovery"]});
     fake.send_last_event(
         &model,
@@ -114,6 +284,13 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     fake.send_last_text(&model, "Saved.");
     fake.end_last(&model);
     send.await.expect("turn completed");
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread
+                .project_checkpoint_context()
+                .is_some_and(|context| context.contains("Verify recovery"))
+        );
+    });
     let checkpoint = ProjectCheckpointStore::open(root.path())
         .expect("checkpoint store")
         .latest("agent.questions")
@@ -121,6 +298,34 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
         .expect("saved checkpoint");
     assert_eq!(checkpoint.completed, ["Implemented form"]);
     assert_eq!(checkpoint.remaining, ["Verify recovery"]);
+    assert!(
+        checkpoint
+            .evidence
+            .iter()
+            .any(|entry| entry.description.contains("list_directory")
+                && entry.source.contains("inspect-root")
+                && entry.observed_at.is_none())
+    );
+    let evidence_source = checkpoint
+        .evidence
+        .iter()
+        .find(|entry| entry.source.contains("inspect-root"))
+        .expect("evidence source")
+        .source
+        .clone();
+    let saved_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    let database = cx
+        .update(ThreadsDatabase::connect)
+        .await
+        .expect("thread database");
+    database
+        .save_thread(
+            session_id.clone(),
+            saved_thread,
+            PathList::new(&[root.path()]),
+        )
+        .await
+        .expect("save source session");
     let next_session = cx
         .update(|cx| {
             connection
@@ -138,6 +343,14 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
             .thread
             .clone()
     });
+    cx.run_until_parked();
+    next_thread.read_with(cx, |thread, _| {
+        assert!(
+            thread
+                .project_checkpoint_context()
+                .is_some_and(|context| context.contains("Verify recovery"))
+        );
+    });
     next_thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
         thread.set_profile(AgentProfileId("checkpoint-test".into()), cx);
@@ -149,6 +362,189 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     let requests = fake.pending_completions_for(&model);
     let request = requests.last().expect("next request");
     assert!(request.messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content| matches!(content, MessageContent::Text(text) if text.contains("Verify recovery") && text.contains("historical")))));
+    let list_input = json!({"action":"list", "limit":1});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "list-checkpoints".into(),
+            name: ProjectCheckpointTool::NAME.into(),
+            raw_input: list_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(list_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        let result = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call.raw_output.as_ref().filter(|output| {
+                    output["scopes"]
+                        .as_array()
+                        .is_some_and(|scopes| !scopes.is_empty())
+                }),
+                _ => None,
+            })
+            .expect("checkpoint scope list");
+        assert_eq!(result["scopes"][0]["scope"], "agent.questions");
+        assert!(result["next_offset"].is_null());
+    });
+    let read_input = json!({"action":"read", "scope":"agent.questions"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "read-checkpoint".into(),
+            name: ProjectCheckpointTool::NAME.into(),
+            raw_input: read_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(read_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        let result = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call.raw_output.as_ref().filter(|output| {
+                    output
+                        .get("checkpoint")
+                        .is_some_and(|checkpoint| checkpoint.is_object())
+                }),
+                _ => None,
+            })
+            .expect("checkpoint read result");
+        assert!(result["current_revision_changed"].is_null());
+        assert!(result["new_dirty_files"].is_null());
+        assert_eq!(result["checkpoint"]["scope"], "agent.questions");
+    });
+    let evidence_input = json!({"checkpoint_source": evidence_source.clone(), "checkpoint_scope": "agent.questions"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "read-evidence".into(),
+            name: InspectToolResultTool::NAME.into(),
+            raw_input: evidence_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(evidence_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        let result = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .raw_output
+                    .as_ref()
+                    .filter(|output| output.get("text").and_then(|text| text.as_str()).is_some()),
+                _ => None,
+            })
+            .expect("cross-session evidence result");
+        assert!(
+            result["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Observations:"))
+        );
+        assert_eq!(result["entries"][0]["tool_name"], "list_directory");
+        assert_eq!(result["source_integrity"], "verified");
+    });
+    let mut altered_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    let mut altered = false;
+    for message in &mut altered_thread.messages {
+        if let Message::Agent(original) = message.as_ref() {
+            let mut updated = original.clone();
+            for result in updated.tool_results.values_mut() {
+                if result.tool_name.as_ref() == "list_directory" {
+                    result.content = vec!["Changed observation".into()];
+                    altered = true;
+                }
+            }
+            *message = Arc::new(Message::Agent(updated));
+        }
+    }
+    assert!(altered);
+    database
+        .save_thread(
+            session_id.clone(),
+            altered_thread,
+            PathList::new(&[root.path()]),
+        )
+        .await
+        .expect("replace source observation");
+    let changed_input = json!({"checkpoint_source": evidence_source.clone(), "checkpoint_scope": "agent.questions"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "changed-evidence".into(),
+            name: InspectToolResultTool::NAME.into(),
+            raw_input: changed_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(changed_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        assert!(thread.entries().iter().any(|entry| {
+            match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .raw_output
+                    .as_ref()
+                    .and_then(|output| output.get("error"))
+                    .and_then(|error| error.as_str())
+                    .is_some_and(|error| error.contains("changed since")),
+                _ => false,
+            }
+        }));
+    });
+    let other_root = tempfile::tempdir().expect("other project");
+    let saved_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    database
+        .save_thread(
+            session_id.clone(),
+            saved_thread,
+            PathList::new(&[other_root.path()]),
+        )
+        .await
+        .expect("move source metadata");
+    let rejected_input =
+        json!({"checkpoint_source": evidence_source, "checkpoint_scope": "agent.questions"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "foreign-evidence".into(),
+            name: InspectToolResultTool::NAME.into(),
+            raw_input: rejected_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(rejected_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        assert!(thread.entries().iter().any(|entry| {
+            match entry {
+                AgentThreadEntry::ToolCall(call) => call
+                    .raw_output
+                    .as_ref()
+                    .and_then(|output| output.get("error"))
+                    .and_then(|error| error.as_str())
+                    .is_some_and(|error| error.contains("does not belong")),
+                _ => false,
+            }
+        }));
+    });
     fake.send_last_text(&model, "Continuing.");
     fake.end_last(&model);
     next_send.await.expect("next turn completed");

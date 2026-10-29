@@ -59,6 +59,18 @@ The `inspect_tool_result` tool lists retained calls and retrieves their input an
 The dependency set is an explicit coverage contract, not an automatically discovered build graph. Agent must include relevant source, manifests, configuration, and fixtures. Freshness describes the last audit, not a continuous watch or an atomic guarantee against later edits. A passing tool and unchanged declared files establish execution and local-input freshness, not semantic correctness, environment equivalence, or external-service state. Agent still has to audit those conditions against the user's requirements.
 
 
+## Project handoffs {#project-handoffs}
+
+Native Agent can save a concise project handoff with `project_checkpoint`. It stores the summary, unresolved work, decisions and next steps in `.lin/checkpoints.sqlite3` under the project root. The default Write and Ask profiles enable the tool. In a multi-root workspace the tool selects an explicitly named root. Agent can list saved work areas with the `list` action and then read a relevant scope; the index is paginated and does not assert that a summary is current.
+
+The editor records available changed buffers, a Git status snapshot and references to recent tool results. It also saves an automatic record when a turn involving edits or terminal activity finishes or is interrupted. An automatic record contains observed facts; it does not replace a model-written handoff. An unsaved buffer or a file that could not be read requires further checking.
+
+When a native session opens, Lin loads the latest handoff and the latest outstanding automatic record. The **Project handoff** card expands to show the available summary and changes. Agent receives a compact version at the start of a turn and after context compaction. The handoff files and up to ten files in an additional automatic record are checked against their saved fingerprints; unsaved or unreadable files have an unknown state. Git status comes from the editor's most recent scan and can lag. Unrecorded files, other branches, external services and test coverage still require appropriate verification.
+
+The database can contain project paths and summaries. It is stored inside the project, so configure Git ignore rules if you do not want to commit it. Project handoffs currently require a local trusted workspace; external agents manage their own session state.
+
+To inspect a saved observation, open it from the **Project handoff** card, or have Agent pass its `checkpoint_source` and `checkpoint_scope` to `inspect_tool_result`. Long results are shown in pages. Lin checks that the checkpoint references the observation and that the saved session belongs to an open project root. New checkpoints also record a digest of the tool input and result; a changed result is rejected, while older records without a digest are marked unverified. The original result is still stored with the native session; if that session is deleted or its retained history changes, the observation may no longer be available.
+
 ## Questions during a run {#questions-during-a-run}
 
 Agent can use `ask_user` to collect a batch of single-choice, multiple-choice, and text answers. A deferred question leaves the form open while Agent continues independent work. The reply is added once to the conversation at the next model boundary; if Agent has become idle, a reply can resume it without another prompt. A reply does not interrupt a running request or take priority over a new user message. Stopping a run cancels its outstanding forms and prevents an automatic restart.

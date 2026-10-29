@@ -641,6 +641,10 @@ pub struct ThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    checkpoint_expanded: bool,
+    checkpoint_evidence_request_id: usize,
+    checkpoint_evidence_text: Option<String>,
+    checkpoint_evidence_next: Option<(String, String, std::path::PathBuf, usize)>,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
@@ -1184,6 +1188,10 @@ impl ThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            checkpoint_expanded: false,
+            checkpoint_evidence_request_id: 0,
+            checkpoint_evidence_text: None,
+            checkpoint_evidence_next: None,
             queue_expanded: true,
             editor_expanded: false,
             should_be_following: false,
@@ -5367,6 +5375,374 @@ impl ThreadView {
                 .debug_selector(move || id.into())
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .tooltip(Tooltip::text(tooltip)),
+        )
+    }
+
+    fn load_checkpoint_evidence(
+        &mut self,
+        source: String,
+        scope: String,
+        root: std::path::PathBuf,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        self.checkpoint_evidence_request_id = self.checkpoint_evidence_request_id.wrapping_add(1);
+        let request_id = self.checkpoint_evidence_request_id;
+        self.checkpoint_evidence_text = Some("Loading evidence…".into());
+        self.checkpoint_evidence_next = None;
+        let input = agent::InspectToolResultInput {
+            tool_call_id: None,
+            checkpoint_source: Some(source.clone()),
+            checkpoint_scope: Some(scope.clone()),
+            checkpoint_root: Some(root.clone()),
+            offset,
+            limit: Some(4000),
+        };
+        let task = agent::inspect_checkpoint_evidence(thread.downgrade(), input, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.checkpoint_evidence_request_id != request_id {
+                    return;
+                }
+                match result {
+                    Ok(output) => {
+                        this.checkpoint_evidence_text = Some(format!(
+                            "{}\n{}",
+                            output.source_integrity.unwrap_or_default(),
+                            output.text.unwrap_or_default()
+                        ));
+                        this.checkpoint_evidence_next =
+                            output.next_offset.map(|next| (source, scope, root, next));
+                    }
+                    Err(error) => {
+                        this.checkpoint_evidence_text =
+                            Some(format!("Evidence unavailable: {error:#}"))
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_project_checkpoint(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let native_thread = self.as_native_thread(cx)?;
+        let context = native_thread.read(cx).project_checkpoint_context()?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(context)
+            .unwrap_or_else(|_| vec![serde_json::json!({"checkpoint_unavailable": true})]);
+        if entries.is_empty() {
+            return None;
+        }
+        let unavailable = entries.iter().any(|entry| {
+            entry
+                .get("checkpoint_unavailable")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        });
+        let mut details = Vec::new();
+        let mut evidence_buttons = Vec::new();
+        for entry in &entries {
+            if entry
+                .get("additional_roots_omitted")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                details.push("Additional project roots have saved handoffs.".into());
+                continue;
+            }
+            let root = entry
+                .get("root")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Project");
+            if entry
+                .get("checkpoint_unavailable")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                details.push(format!("{root}: checkpoint unavailable"));
+                continue;
+            }
+            let scope = entry
+                .get("scope")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Project");
+            let scope = if scope.starts_with(agent::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX) {
+                "Recent activity"
+            } else {
+                scope
+            };
+            details.push(format!("{root} · {scope}"));
+            if let Some(scopes) = entry
+                .get("available_scopes")
+                .and_then(|value| value.as_array())
+            {
+                let other_scopes = scopes
+                    .iter()
+                    .filter_map(|scope| scope.get("scope").and_then(|value| value.as_str()))
+                    .filter(|name| *name != scope)
+                    .collect::<Vec<_>>();
+                if !other_scopes.is_empty() {
+                    details.push(format!("Other handoffs: {}", other_scopes.join(", ")));
+                }
+            }
+            if entry
+                .get("more_scopes_available")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                details.push(
+                    "More handoff scopes are available through the project checkpoint tool.".into(),
+                );
+            }
+            for (key, title) in [
+                ("completed", "Completed"),
+                ("remaining", "Remaining"),
+                ("decisions", "Decisions"),
+                ("next_steps", "Next steps"),
+                ("changed_files", "Changed since checkpoint"),
+                ("files_not_checked", "Files not checked"),
+                ("new_dirty_files", "New Git changes"),
+            ] {
+                if let Some(values) = entry.get(key).and_then(|value| value.as_array()) {
+                    let values = values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .collect::<Vec<_>>();
+                    if !values.is_empty() {
+                        details.push(format!("{title}: {}", values.join(", ")));
+                    }
+                }
+            }
+            if entry.get("interrupted").and_then(|value| value.as_bool()) == Some(true)
+                || entry
+                    .get("recent_automatic_checkpoint")
+                    .and_then(|value| value.get("interrupted"))
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            {
+                details
+                    .push("A previous turn was interrupted; review its recorded activity.".into());
+            }
+            if let Some(automatic) = entry.get("recent_automatic_checkpoint") {
+                if let Some(files) = automatic.get("files").and_then(|value| value.as_array()) {
+                    let paths = files
+                        .iter()
+                        .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+                        .collect::<Vec<_>>();
+                    if !paths.is_empty() {
+                        details.push(format!("Recent recorded files: {}", paths.join(", ")));
+                    }
+                    let changed = files
+                        .iter()
+                        .filter(|file| {
+                            file.get("changed_since_checkpoint")
+                                .and_then(|value| value.as_bool())
+                                == Some(true)
+                        })
+                        .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+                        .collect::<Vec<_>>();
+                    let unknown = files
+                        .iter()
+                        .filter(|file| {
+                            file.get("changed_since_checkpoint")
+                                .and_then(|value| value.as_bool())
+                                .is_none()
+                        })
+                        .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+                        .collect::<Vec<_>>();
+                    if !changed.is_empty() {
+                        details.push(format!(
+                            "Changed since recent activity: {}",
+                            changed.join(", ")
+                        ));
+                    }
+                    if !unknown.is_empty() {
+                        details.push(format!("Recent files not checked: {}", unknown.join(", ")));
+                    }
+                    if files.iter().any(|file| {
+                        file.get("unsaved").and_then(|value| value.as_bool()) == Some(true)
+                            || file
+                                .get("observation_error")
+                                .and_then(|value| value.as_bool())
+                                == Some(true)
+                    }) {
+                        details
+                            .push("Some recent files were unsaved or could not be checked.".into());
+                    }
+                }
+                if let (Some(root), Some(session), Some(evidence)) = (
+                    entry.get("root").and_then(|value| value.as_str()),
+                    automatic.get("session_id").and_then(|value| value.as_str()),
+                    automatic.get("evidence").and_then(|value| value.as_array()),
+                ) {
+                    for item in evidence {
+                        if let (Some(description), Some(source)) = (
+                            item.get("description").and_then(|value| value.as_str()),
+                            item.get("source").and_then(|value| value.as_str()),
+                        ) {
+                            evidence_buttons.push((
+                                description.to_string(),
+                                source.to_string(),
+                                format!("{}{session}", agent::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX),
+                                std::path::PathBuf::from(root),
+                            ));
+                        }
+                    }
+                }
+                if automatic
+                    .get("files_may_be_truncated")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+                {
+                    details.push("More recent files are recorded in the checkpoint.".into());
+                }
+            }
+            if let Some(evidence) = entry.get("evidence").and_then(|value| value.as_array()) {
+                for item in evidence {
+                    if let (Some(description), Some(source)) = (
+                        item.get("description").and_then(|value| value.as_str()),
+                        item.get("source").and_then(|value| value.as_str()),
+                    ) {
+                        if let (Some(root), Some(scope)) = (
+                            entry.get("root").and_then(|value| value.as_str()),
+                            entry.get("scope").and_then(|value| value.as_str()),
+                        ) {
+                            evidence_buttons.push((
+                                description.to_string(),
+                                source.to_string(),
+                                scope.to_string(),
+                                std::path::PathBuf::from(root),
+                            ));
+                        }
+                    }
+                }
+            }
+            if entry
+                .get("current_revision_changed")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+                || entry
+                    .get("current_branch_changed")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            {
+                details.push("Git revision or branch changed since the checkpoint.".into());
+            }
+            if entry
+                .get("summary_may_be_truncated")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+                || entry
+                    .get("file_lists_may_be_truncated")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+                || entry
+                    .get("new_dirty_files_may_be_truncated")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            {
+                details.push(
+                    "Additional checkpoint details are available in the saved record.".into(),
+                );
+            }
+            details.push("Only recorded files were checked; Git status may be delayed.".into());
+        }
+        let details = details.join("\n");
+        let expanded = self.checkpoint_expanded;
+        Some(
+            v_flex()
+                .id("project-checkpoint")
+                .debug_selector(|| "project-checkpoint".to_string())
+                .px_3()
+                .py_1()
+                .gap_1()
+                .child(
+                    Button::new(
+                        "toggle-project-checkpoint",
+                        match (expanded, unavailable) {
+                            (true, true) => "▾ Project handoff · attention needed",
+                            (false, true) => "▸ Project handoff · attention needed",
+                            (true, false) => "▾ Project handoff",
+                            (false, false) => "▸ Project handoff",
+                        },
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.checkpoint_expanded = !this.checkpoint_expanded;
+                        if !this.checkpoint_expanded {
+                            this.checkpoint_evidence_request_id =
+                                this.checkpoint_evidence_request_id.wrapping_add(1);
+                            this.checkpoint_evidence_text = None;
+                            this.checkpoint_evidence_next = None;
+                        }
+                        cx.notify();
+                    })),
+                )
+                .when(expanded, |card| {
+                    card.child(
+                        div()
+                            .id("project-checkpoint-details")
+                            .debug_selector(|| "project-checkpoint-details".to_string())
+                            .child(Label::new(details).size(LabelSize::Small)),
+                    )
+                    .children(evidence_buttons.into_iter().enumerate().map(
+                        |(index, (description, source, scope, root))| {
+                            div()
+                                .id(("checkpoint-evidence-container", index))
+                                .debug_selector(move || format!("checkpoint-evidence-{index}"))
+                                .child(
+                                    Button::new(
+                                        ("checkpoint-evidence", index),
+                                        format!("View observation: {description}"),
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.load_checkpoint_evidence(
+                                                source.clone(),
+                                                scope.clone(),
+                                                root.clone(),
+                                                0,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                )
+                        },
+                    ))
+                    .when_some(self.checkpoint_evidence_text.clone(), |card, text| {
+                        card.child(
+                            div()
+                                .id("checkpoint-evidence-output")
+                                .debug_selector(|| "checkpoint-evidence-output".to_string())
+                                .child(Label::new(text).size(LabelSize::Small)),
+                        )
+                    })
+                    .when_some(
+                        self.checkpoint_evidence_next.clone(),
+                        |card, (source, scope, root, offset)| {
+                            card.child(
+                                Button::new("checkpoint-evidence-next", "Next page")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.load_checkpoint_evidence(
+                                            source.clone(),
+                                            scope.clone(),
+                                            root.clone(),
+                                            offset,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        },
+                    )
+                }),
         )
     }
 
@@ -14006,6 +14382,7 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
+            .children(self.render_project_checkpoint(cx))
             .children(self.render_goal_status(cx))
             .child(self.render_message_editor(window, cx))
     }

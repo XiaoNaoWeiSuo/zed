@@ -123,29 +123,29 @@ impl Render for AgentUsageIndicator {
         let mut children: Vec<AnyElement> = Vec::new();
         if let Some(cache_hit_rate) = cache_hit_rate {
             children.push(
-                Label::new(format!("Cache {:.0}%", cache_hit_rate * 100.0))
-                    .size(LabelSize::Small)
+                Label::new(format!("Cache {:.1}%", cache_hit_rate * 100.0))
+                    .size(LabelSize::XSmall)
                     .into_any_element(),
             );
         }
         if let Some(tokens_per_second) = tokens_per_second {
             children.push(
                 Label::new(format!("{tokens_per_second:.0} tok/s"))
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
                     .into_any_element(),
             );
         }
         if let Some(context) = context {
             children.push(
                 Label::new(context)
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
                     .into_any_element(),
             );
         }
         if let Some(time_to_first_token) = time_to_first_token {
             children.push(
                 Label::new(format!("{:.2}s TTFT", time_to_first_token.as_secs_f32()))
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
                     .into_any_element(),
             );
         }
@@ -154,7 +154,7 @@ impl Render for AgentUsageIndicator {
             if let Some(balance) = &usage.balance {
                 children.push(
                     Label::new(balance.clone())
-                        .size(LabelSize::Small)
+                        .size(LabelSize::XSmall)
                         .into_any_element(),
                 );
             }
@@ -162,7 +162,7 @@ impl Render for AgentUsageIndicator {
                 let remaining = (100.0 - window.used_percent).max(0.0);
                 let reset = Self::reset_label(window.resets_at_unix);
                 let label = Label::new(format!("{} {:.0}%", window.label, remaining))
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
                     .color(if remaining <= 10.0 {
                         Color::Error
                     } else if remaining <= 25.0 {

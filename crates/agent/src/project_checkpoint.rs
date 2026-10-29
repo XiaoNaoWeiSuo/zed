@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::Read as _,
     path::{Path, PathBuf},
 };
@@ -13,8 +14,21 @@ use sqlez::connection::Connection;
 pub struct CheckpointEvidence {
     pub description: String,
     pub source: String,
-    pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
     pub revision: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+pub fn checkpoint_evidence_digest(
+    tool_use: &language_model::LanguageModelToolUse,
+    result: &language_model::LanguageModelToolResult,
+) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(tool_use, result))?)
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +37,8 @@ pub struct CheckpointFile {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub unsaved: bool,
+    #[serde(default)]
+    pub observation_error: Option<String>,
 }
 
 impl CheckpointFile {
@@ -67,11 +83,20 @@ impl CheckpointFile {
             path: path.to_path_buf(),
             fingerprint,
             unsaved: false,
+            observation_error: None,
         })
     }
 
     pub fn has_changed(&self, root: &Path) -> Result<bool> {
-        Ok(self.unsaved || Self::observe(root, &self.path)?.fingerprint != self.fingerprint)
+        ensure!(
+            self.observation_error.is_none(),
+            "The file could not be observed when the checkpoint was saved"
+        );
+        ensure!(
+            !self.unsaved,
+            "The file had unsaved changes when the checkpoint was saved"
+        );
+        Ok(Self::observe(root, &self.path)?.fingerprint != self.fingerprint)
     }
 }
 
@@ -82,6 +107,10 @@ pub struct ProjectCheckpoint {
     pub scope: String,
     pub created_at: DateTime<Utc>,
     pub base_revision: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub git_scan_id: Option<u64>,
     pub completed: Vec<String>,
     pub remaining: Vec<String>,
     pub decisions: Vec<String>,
@@ -91,43 +120,250 @@ pub struct ProjectCheckpoint {
     pub interrupted: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointScopeSummary {
+    pub scope: String,
+    pub created_at: DateTime<Utc>,
+    pub remaining_count: usize,
+    pub next_step: Option<String>,
+}
+
+impl From<ProjectCheckpoint> for CheckpointScopeSummary {
+    fn from(checkpoint: ProjectCheckpoint) -> Self {
+        Self {
+            scope: checkpoint.scope,
+            created_at: checkpoint.created_at,
+            remaining_count: checkpoint.remaining.len(),
+            next_step: checkpoint
+                .next_steps
+                .first()
+                .map(|step| step.chars().take(180).collect()),
+        }
+    }
+}
+
 /// A project's checkpoint history, stored separately for each checkout.
 pub struct ProjectCheckpointStore {
     connection: Connection,
 }
 
-pub fn load_checkpoint_context(roots: &[PathBuf]) -> Result<Option<String>> {
+#[derive(Clone, Debug)]
+pub struct CheckpointRoot {
+    pub path: PathBuf,
+    pub git: Option<CheckpointGitSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckpointGitSnapshot {
+    pub revision: Option<String>,
+    pub branch: Option<String>,
+    pub scan_id: u64,
+    pub dirty_files: Vec<PathBuf>,
+}
+
+pub const AUTOMATIC_CHECKPOINT_SCOPE_PREFIX: &str = "@automatic/";
+
+pub struct AutomaticCheckpoint {
+    pub root: PathBuf,
+    pub session_id: String,
+    pub files: BTreeMap<PathBuf, bool>,
+    pub git: Option<CheckpointGitSnapshot>,
+    pub evidence: Vec<CheckpointEvidence>,
+    pub interrupted: bool,
+}
+
+impl AutomaticCheckpoint {
+    pub fn save(self) -> Result<()> {
+        ensure!(
+            self.root.is_dir(),
+            "Project root {} is unavailable",
+            self.root.display()
+        );
+        let mut changed_files = Vec::new();
+        for (path, unsaved) in self.files {
+            let mut file = match CheckpointFile::observe(&self.root, &path) {
+                Ok(file) => file,
+                Err(error) => CheckpointFile {
+                    path,
+                    fingerprint: None,
+                    unsaved: false,
+                    observation_error: Some(format!("{error:#}")),
+                },
+            };
+            file.unsaved = unsaved;
+            changed_files.push(file);
+        }
+        let checkpoint = ProjectCheckpoint {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: format!("{AUTOMATIC_CHECKPOINT_SCOPE_PREFIX}{}", self.session_id),
+            session_id: self.session_id,
+            created_at: Utc::now(),
+            base_revision: self.git.as_ref().and_then(|git| git.revision.clone()),
+            branch: self.git.as_ref().and_then(|git| git.branch.clone()),
+            git_scan_id: self.git.as_ref().map(|git| git.scan_id),
+            completed: Vec::new(),
+            remaining: Vec::new(),
+            decisions: Vec::new(),
+            next_steps: Vec::new(),
+            changed_files,
+            evidence: self.evidence,
+            interrupted: self.interrupted,
+        };
+        ProjectCheckpointStore::open(&self.root)?.save(&checkpoint)
+    }
+}
+
+pub fn checkpoint_git_snapshot(
+    project: &project::Project,
+    root: &Path,
+    cx: &gpui::App,
+) -> Option<CheckpointGitSnapshot> {
+    let git_store = project.git_store().read(cx);
+    git_store
+        .repositories()
+        .values()
+        .map(|repository| repository.read(cx).snapshot())
+        .filter(|snapshot| root.starts_with(snapshot.work_directory_abs_path.as_ref()))
+        .max_by_key(|snapshot| snapshot.work_directory_abs_path.components().count())
+        .map(|snapshot| {
+            let dirty_files = snapshot
+                .status()
+                .filter_map(|entry| {
+                    if matches!(entry.status, git::status::FileStatus::Ignored) {
+                        return None;
+                    }
+                    let absolute = snapshot.repo_path_to_abs_path(&entry.repo_path);
+                    let relative = absolute.strip_prefix(root).ok()?;
+                    if relative.components().next().is_some_and(|component| {
+                        component.as_os_str() == paths::local_settings_folder_name()
+                    }) {
+                        return None;
+                    }
+                    Some(relative.to_path_buf())
+                })
+                .collect();
+            CheckpointGitSnapshot {
+                revision: snapshot
+                    .head_commit
+                    .as_ref()
+                    .map(|commit| commit.sha.to_string()),
+                branch: snapshot
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.ref_name.to_string()),
+                scan_id: snapshot.scan_id,
+                dirty_files,
+            }
+        })
+}
+
+pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String>> {
     let mut sections = Vec::new();
     for root in roots {
-        let Some(store) = ProjectCheckpointStore::open_existing(root)? else {
+        let checkpoints =
+            ProjectCheckpointStore::open_existing(&root.path).and_then(|store| match store {
+                Some(store) => Ok((
+                    store.latest_any()?,
+                    store.latest_automatic()?,
+                    store.list_scopes(0, 6)?,
+                )),
+                None => Ok((None, None, Vec::new())),
+            });
+        let (checkpoint, interruption, scopes) = match checkpoints {
+            Ok((None, None, _)) => continue,
+            Ok((checkpoint, interruption, scopes)) => (checkpoint, interruption, scopes),
+            Err(error) => {
+                log::error!(
+                    "Failed to load checkpoint for {}: {error:#}",
+                    root.path.display()
+                );
+                sections
+                    .push(serde_json::json!({"root": root.path, "checkpoint_unavailable": true}));
+                continue;
+            }
+        };
+        let Some(checkpoint) = checkpoint.or_else(|| interruption.clone()) else {
             continue;
         };
-        let Some(checkpoint) = store.latest_any()? else {
-            continue;
-        };
+        if sections.len() >= 4 {
+            sections.push(serde_json::json!({"additional_roots_omitted": true}));
+            break;
+        }
         let mut changed = Vec::new();
         let mut unknown = Vec::new();
         for file in &checkpoint.changed_files {
-            match file.has_changed(root) {
+            match file.has_changed(&root.path) {
                 Ok(true) => changed.push(file.path.display().to_string()),
                 Ok(false) => {}
                 Err(_) => unknown.push(file.path.display().to_string()),
             }
         }
+        let new_git_paths = root.git.as_ref().map(|git| {
+            git.dirty_files
+                .iter()
+                .filter(|path| {
+                    !checkpoint
+                        .changed_files
+                        .iter()
+                        .any(|file| &file.path == *path)
+                })
+                .collect::<Vec<_>>()
+        });
+        let git_revision_changed = root.git.as_ref().and_then(|git| {
+            checkpoint
+                .base_revision
+                .as_ref()
+                .zip(git.revision.as_ref())
+                .map(|(previous, current)| previous != current)
+        });
+        let branch_changed = root.git.as_ref().and_then(|git| {
+            checkpoint
+                .branch
+                .as_ref()
+                .zip(git.branch.as_ref())
+                .map(|(previous, current)| previous != current)
+        });
+        let bounded = |entries: &[String]| {
+            entries
+                .iter()
+                .take(5)
+                .map(|entry| entry.chars().take(180).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let bounded_path =
+            |path: &Path| path.to_string_lossy().chars().take(180).collect::<String>();
+        let path_too_long = |path: &Path| path.to_string_lossy().chars().count() > 180;
         let data = serde_json::json!({
-            "root": root, "scope": checkpoint.scope, "created_at": checkpoint.created_at,
-            "completed": checkpoint.completed, "remaining": checkpoint.remaining,
-            "decisions": checkpoint.decisions, "next_steps": checkpoint.next_steps,
-            "interrupted": checkpoint.interrupted, "changed_files": changed,
-            "files_not_checked": unknown, "base_revision": checkpoint.base_revision,
+            "root": root.path, "scope": checkpoint.scope, "created_at": checkpoint.created_at,
+            "available_scopes": scopes.iter().take(5).collect::<Vec<_>>(),
+            "more_scopes_available": scopes.len() > 5,
+            "completed": bounded(&checkpoint.completed), "remaining": bounded(&checkpoint.remaining),
+            "decisions": bounded(&checkpoint.decisions), "next_steps": bounded(&checkpoint.next_steps),
+            "evidence": checkpoint.evidence.iter().take(5).map(|entry| serde_json::json!({"description": entry.description.chars().take(180).collect::<String>(), "source": entry.source.chars().take(240).collect::<String>(), "observed_at": entry.observed_at, "revision": entry.revision})).collect::<Vec<_>>(),
+            "more_evidence_available": checkpoint.evidence.len() > 5,
+            "summary_may_be_truncated": checkpoint.completed.len() > 5 || checkpoint.remaining.len() > 5 || checkpoint.decisions.len() > 5 || checkpoint.next_steps.len() > 5 || checkpoint.completed.iter().chain(&checkpoint.remaining).chain(&checkpoint.decisions).chain(&checkpoint.next_steps).any(|entry| entry.chars().count() > 180),
+            "interrupted": checkpoint.interrupted, "changed_files": changed.iter().take(10).map(|path| bounded_path(Path::new(path))).collect::<Vec<_>>(),
+            "files_not_checked": unknown.iter().take(10).map(|path| bounded_path(Path::new(path))).collect::<Vec<_>>(), "base_revision": checkpoint.base_revision,
+            "file_lists_may_be_truncated": changed.len() > 10 || unknown.len() > 10 || changed.iter().chain(&unknown).any(|path| path_too_long(Path::new(path))),
+            "branch": checkpoint.branch, "git_scan_id": checkpoint.git_scan_id,
+            "current_revision_changed": git_revision_changed, "current_branch_changed": branch_changed,
+            "new_dirty_files": new_git_paths.as_ref().map(|paths| paths.iter().take(10).map(|path| bounded_path(path)).collect::<Vec<_>>()),
+            "new_dirty_files_may_be_truncated": new_git_paths.as_ref().is_some_and(|paths| paths.len() > 10 || paths.iter().any(|path| path_too_long(path))), "current_git_scan_id": root.git.as_ref().map(|git| git.scan_id),
+            "recent_automatic_checkpoint": interruption.as_ref().filter(|interruption| interruption.id != checkpoint.id).map(|interruption| serde_json::json!({
+                "session_id": interruption.session_id,
+                "created_at": interruption.created_at,
+                "interrupted": interruption.interrupted,
+                "files": interruption.changed_files.iter().take(10).map(|file| serde_json::json!({"path": bounded_path(&file.path), "unsaved": file.unsaved, "observation_error": file.observation_error.is_some(), "changed_since_checkpoint": match file.has_changed(&root.path) { Ok(changed) => Some(changed), Err(_) => None }})).collect::<Vec<_>>(),
+                "files_may_be_truncated": interruption.changed_files.len() > 10 || interruption.changed_files.iter().any(|file| path_too_long(&file.path)),
+                "evidence": interruption.evidence.iter().take(5).map(|entry| serde_json::json!({"description": entry.description.chars().take(180).collect::<String>(), "source": entry.source.chars().take(240).collect::<String>()})).collect::<Vec<_>>(),
+            })),
         });
         sections.push(data);
     }
     if sections.is_empty() {
         return Ok(None);
     }
-    let text = serde_json::to_string(&sections)?;
-    Ok(Some(text.chars().take(6000).collect()))
+    Ok(Some(serde_json::to_string(&sections)?))
 }
 
 impl ProjectCheckpointStore {
@@ -144,10 +380,29 @@ impl ProjectCheckpointStore {
         }
     }
     pub fn open(root: &Path) -> Result<Self> {
+        let project_root = std::fs::canonicalize(root)
+            .with_context(|| format!("Could not resolve project root {}", root.display()))?;
         let directory = root.join(paths::local_settings_folder_name());
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("Could not create {}", directory.display()))?;
+        let resolved_directory = std::fs::canonicalize(&directory)
+            .with_context(|| format!("Could not resolve {}", directory.display()))?;
+        ensure!(
+            resolved_directory.starts_with(&project_root),
+            "Checkpoint directory resolves outside the project"
+        );
         let database_path = directory.join("checkpoints.sqlite3");
+        match std::fs::symlink_metadata(&database_path) {
+            Ok(metadata) => ensure!(
+                !metadata.file_type().is_symlink(),
+                "Checkpoint database must not be a symbolic link"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Could not inspect {}", database_path.display()));
+            }
+        }
         let path = database_path
             .to_str()
             .context("Checkpoint database path is not valid UTF-8")?;
@@ -206,7 +461,34 @@ impl ProjectCheckpointStore {
 
     pub fn latest_any(&self) -> Result<Option<ProjectCheckpoint>> {
         let records = self.connection.select_bound::<(), String>(
-            "SELECT data FROM checkpoints ORDER BY sequence DESC LIMIT 1",
+            "SELECT data FROM checkpoints WHERE scope NOT GLOB '@automatic/*' ORDER BY sequence DESC LIMIT 1",
+        )?(())?;
+        records
+            .into_iter()
+            .next()
+            .map(|data| serde_json::from_str(&data).context("Invalid checkpoint data"))
+            .transpose()
+    }
+
+    pub fn list_scopes(&self, offset: usize, limit: usize) -> Result<Vec<CheckpointScopeSummary>> {
+        let offset = i64::try_from(offset).context("Checkpoint scope offset is too large")?;
+        let limit = i64::try_from(limit).context("Checkpoint scope limit is too large")?;
+        let records = self.connection.select_bound::<(i64, i64), String>(
+            "SELECT data FROM checkpoints WHERE sequence IN (SELECT MAX(sequence) FROM checkpoints WHERE scope NOT GLOB '@automatic/*' GROUP BY scope) ORDER BY sequence DESC LIMIT ?1 OFFSET ?2",
+        )?((limit, offset))?;
+        records
+            .into_iter()
+            .map(|data| {
+                let checkpoint: ProjectCheckpoint =
+                    serde_json::from_str(&data).context("Invalid checkpoint data")?;
+                Ok(checkpoint.into())
+            })
+            .collect()
+    }
+
+    pub fn latest_automatic(&self) -> Result<Option<ProjectCheckpoint>> {
+        let records = self.connection.select_bound::<(), String>(
+            "SELECT data FROM checkpoints AS interruption WHERE scope GLOB '@automatic/*' AND sequence > COALESCE((SELECT MAX(sequence) FROM checkpoints AS handoff WHERE handoff.scope NOT GLOB '@automatic/*' AND handoff.session_id = interruption.session_id), 0) ORDER BY sequence DESC LIMIT 1",
         )?(())?;
         records
             .into_iter()
@@ -230,6 +512,8 @@ mod tests {
             scope: "agent".into(),
             created_at: Utc::now(),
             base_revision: Some("revision".into()),
+            branch: Some("main".into()),
+            git_scan_id: Some(1),
             completed: vec!["Implemented".into()],
             remaining: vec!["Verify".into()],
             decisions: vec![],
@@ -238,6 +522,7 @@ mod tests {
                 path: "src/main.rs".into(),
                 fingerprint: None,
                 unsaved: false,
+                observation_error: None,
             }],
             evidence: vec![],
             interrupted: false,
@@ -256,6 +541,56 @@ mod tests {
     }
 
     #[test]
+    fn scope_index_lists_latest_handoffs_in_pages_without_automatic_records() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        let mut checkpoint = ProjectCheckpoint {
+            id: "one".into(),
+            session_id: "session".into(),
+            scope: "agent".into(),
+            created_at: Utc::now(),
+            base_revision: None,
+            branch: None,
+            git_scan_id: None,
+            completed: vec![],
+            remaining: vec!["verify".into()],
+            decisions: vec![],
+            next_steps: vec!["run tests".into()],
+            changed_files: vec![],
+            evidence: vec![],
+            interrupted: false,
+        };
+        store.save(&checkpoint)?;
+        checkpoint.id = "two".into();
+        checkpoint.scope = "editor".into();
+        store.save(&checkpoint)?;
+        checkpoint.id = "three".into();
+        checkpoint.scope = "agent".into();
+        checkpoint.remaining.clear();
+        store.save(&checkpoint)?;
+        checkpoint.id = "four".into();
+        checkpoint.scope = "@automatic/session".into();
+        store.save(&checkpoint)?;
+        let first = store.list_scopes(0, 1)?;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].scope, "agent");
+        assert_eq!(first[0].remaining_count, 0);
+        let second = store.list_scopes(1, 1)?;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].scope, "editor");
+        assert_eq!(second[0].remaining_count, 1);
+        assert!(store.list_scopes(2, 1)?.is_empty());
+        let context = load_checkpoint_context(&[CheckpointRoot {
+            path: root.path().to_path_buf(),
+            git: None,
+        }])?
+        .context("context")?;
+        let context: serde_json::Value = serde_json::from_str(&context)?;
+        assert_eq!(context[0]["available_scopes"][1]["scope"], "editor");
+        Ok(())
+    }
+
+    #[test]
     fn file_fingerprints_detect_changes_and_deletions() -> Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("source"), "before")?;
@@ -266,6 +601,173 @@ mod tests {
         std::fs::remove_file(root.path().join("source"))?;
         assert!(observed.has_changed(root.path())?);
         assert!(CheckpointFile::observe(root.path(), Path::new("../outside")).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_database_rejects_links_outside_project() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".lin"))?;
+        assert!(ProjectCheckpointStore::open(root.path()).is_err());
+        assert!(!outside.path().join("checkpoints.sqlite3").exists());
+        std::fs::remove_file(root.path().join(".lin"))?;
+        std::fs::create_dir(root.path().join(".lin"))?;
+        let outside_database = outside.path().join("database");
+        std::fs::write(&outside_database, b"unchanged")?;
+        std::os::unix::fs::symlink(
+            &outside_database,
+            root.path().join(".lin/checkpoints.sqlite3"),
+        )?;
+        assert!(ProjectCheckpointStore::open(root.path()).is_err());
+        assert_eq!(std::fs::read(outside_database)?, b"unchanged");
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_snapshot_preserves_semantic_handoff() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("file.rs"), "contents")?;
+        std::fs::write(root.path().join("saved.rs"), "before")?;
+        std::fs::write(root.path().join("unchanged.rs"), "unchanged")?;
+        std::fs::create_dir(root.path().join("unreadable"))?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        let handoff = ProjectCheckpoint {
+            id: "handoff".into(),
+            session_id: "first".into(),
+            scope: "agent".into(),
+            created_at: Utc::now(),
+            base_revision: None,
+            branch: None,
+            git_scan_id: None,
+            completed: vec![],
+            remaining: vec!["verify behavior".into()],
+            decisions: vec![],
+            next_steps: vec![],
+            changed_files: vec![],
+            evidence: vec![],
+            interrupted: false,
+        };
+        store.save(&handoff)?;
+        AutomaticCheckpoint {
+            root: root.path().to_path_buf(),
+            session_id: "second".into(),
+            files: BTreeMap::from([
+                (PathBuf::from("file.rs"), true),
+                (PathBuf::from("saved.rs"), false),
+                (PathBuf::from("unchanged.rs"), false),
+                (PathBuf::from("unreadable"), false),
+            ]),
+            git: None,
+            evidence: vec![],
+            interrupted: true,
+        }
+        .save()?;
+        assert_eq!(store.latest_any()?, Some(handoff.clone()));
+        let interruption = store.latest_automatic()?.context("interruption")?;
+        assert!(interruption.interrupted);
+        assert!(interruption.changed_files.first().context("file")?.unsaved);
+        std::fs::write(root.path().join("saved.rs"), "changed later")?;
+        let context = load_checkpoint_context(&[CheckpointRoot {
+            path: root.path().to_path_buf(),
+            git: None,
+        }])?
+        .context("context")?;
+        let context: serde_json::Value = serde_json::from_str(&context)?;
+        assert_eq!(
+            context[0]["remaining"],
+            serde_json::json!(["verify behavior"])
+        );
+        assert_eq!(
+            context[0]["recent_automatic_checkpoint"]["session_id"],
+            "second"
+        );
+        assert_eq!(
+            context[0]["recent_automatic_checkpoint"]["files"][0]["unsaved"],
+            true
+        );
+        assert!(
+            context[0]["recent_automatic_checkpoint"]["files"][0]["changed_since_checkpoint"]
+                .is_null()
+        );
+        assert_eq!(
+            context[0]["recent_automatic_checkpoint"]["files"][1]["changed_since_checkpoint"],
+            true
+        );
+        assert_eq!(
+            context[0]["recent_automatic_checkpoint"]["files"][2]["changed_since_checkpoint"],
+            false
+        );
+        assert!(
+            context[0]["recent_automatic_checkpoint"]["files"][3]["changed_since_checkpoint"]
+                .is_null()
+        );
+        let mut later_handoff = handoff;
+        later_handoff.id = "unrelated".into();
+        later_handoff.session_id = "third".into();
+        store.save(&later_handoff)?;
+        assert!(store.latest_automatic()?.is_some());
+        later_handoff.id = "resumed".into();
+        later_handoff.session_id = "second".into();
+        store.save(&later_handoff)?;
+        assert!(store.latest_automatic()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_reports_new_changes_and_keeps_json_valid_when_summaries_are_long() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("edited.rs"), "before")?;
+        let file = CheckpointFile::observe(root.path(), Path::new("edited.rs"))?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        store.save(&ProjectCheckpoint {
+            id: "handoff".into(),
+            session_id: "session".into(),
+            scope: "agent".into(),
+            created_at: Utc::now(),
+            base_revision: Some("old".into()),
+            branch: Some("main".into()),
+            git_scan_id: Some(5),
+            completed: vec!["x".repeat(7000)],
+            remaining: vec!["unfinished".into()],
+            decisions: vec![],
+            next_steps: vec![],
+            changed_files: vec![file],
+            evidence: vec![],
+            interrupted: false,
+        })?;
+        std::fs::write(root.path().join("edited.rs"), "after")?;
+        let context = load_checkpoint_context(&[CheckpointRoot {
+            path: root.path().to_path_buf(),
+            git: Some(CheckpointGitSnapshot {
+                revision: Some("new".into()),
+                branch: Some("feature".into()),
+                scan_id: 6,
+                dirty_files: std::iter::once(PathBuf::from("edited.rs"))
+                    .chain(std::iter::once(PathBuf::from("new.rs")))
+                    .chain(
+                        (0..12)
+                            .map(|index| PathBuf::from(format!("{}-{index}", "long".repeat(60)))),
+                    )
+                    .collect(),
+            }),
+        }])?
+        .context("checkpoint context")?;
+        let context: serde_json::Value = serde_json::from_str(&context)?;
+        let entry = context.get(0).context("root context")?;
+        assert_eq!(entry["current_revision_changed"], true);
+        assert_eq!(entry["current_branch_changed"], true);
+        assert_eq!(entry["changed_files"], serde_json::json!(["edited.rs"]));
+        assert_eq!(entry["new_dirty_files"][0], "new.rs");
+        assert_eq!(entry["new_dirty_files"].as_array().map(Vec::len), Some(10));
+        assert_eq!(
+            entry["new_dirty_files"][1].as_str().map(str::len),
+            Some(180)
+        );
+        assert_eq!(entry["new_dirty_files_may_be_truncated"], true);
+        assert_eq!(entry["summary_may_be_truncated"], true);
+        assert_eq!(entry["remaining"], serde_json::json!(["unfinished"]));
         Ok(())
     }
 }
