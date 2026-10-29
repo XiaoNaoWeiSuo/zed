@@ -108,9 +108,9 @@ impl AgentTool for MovePathTool {
                 .await
                 .map_err(|e| e.to_string())?;
             let paths = vec![input.source_path.clone(), input.destination_path.clone()];
-            let decision = cx.update(|cx| {
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
                 decide_permission_for_paths(Self::NAME, &paths, AgentSettings::get_global(cx))
-            });
+            }));
             if let ToolPermissionDecision::Deny(reason) = decision {
                 return Err(reason);
             }
@@ -164,6 +164,12 @@ impl AgentTool for MovePathTool {
             )
             .await);
 
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
+                decide_permission_for_paths(Self::NAME, &paths, AgentSettings::get_global(cx))
+            }));
+            if let ToolPermissionDecision::Deny(reason) = decision {
+                return Err(reason);
+            }
             let needs_confirmation = matches!(decision, ToolPermissionDecision::Confirm)
                 || (matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some());
 

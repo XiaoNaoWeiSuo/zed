@@ -1113,6 +1113,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            message_detail: Default::default(),
         };
 
         cx.update(|cx| {

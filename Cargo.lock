@@ -301,6 +301,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sha2",
  "shell_command_parser",
  "smallvec",
  "sqlez",

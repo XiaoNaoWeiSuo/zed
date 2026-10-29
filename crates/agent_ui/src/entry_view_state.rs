@@ -65,6 +65,7 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    expanded_tool_groups: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
 }
@@ -89,12 +90,23 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            expanded_tool_groups: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
         }
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.expanded_tool_calls.contains(tool_call_id)
+    }
+
+    pub(crate) fn is_tool_group_expanded(&self, id: &acp_v2::ToolCallId) -> bool {
+        self.expanded_tool_groups.contains(id)
+    }
+
+    pub(crate) fn toggle_tool_group(&mut self, id: acp_v2::ToolCallId) {
+        if !self.expanded_tool_groups.remove(&id) {
+            self.expanded_tool_groups.insert(id);
+        }
     }
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
@@ -612,6 +624,7 @@ impl EntryViewState {
 
     pub fn remove(&mut self, range: Range<usize>) {
         self.entries.drain(range.clone());
+        self.expanded_tool_groups.clear();
 
         self.expanded_compactions = self
             .expanded_compactions

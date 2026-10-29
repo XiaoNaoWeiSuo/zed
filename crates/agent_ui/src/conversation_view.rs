@@ -13,8 +13,6 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
 use agent_settings::{AgentProfileId, AgentSettings};
-#[cfg(test)]
-use anyhow::Context as _;
 use anyhow::{Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
@@ -1995,6 +1993,11 @@ impl ConversationView {
                                 .and_then(|entry| entry.focus_handle(cx))],
                         );
                     });
+                    if AgentSettings::get_global(cx).message_detail
+                        == settings::AgentMessageDetail::Compact
+                    {
+                        list_state.remeasure_items(0..list_state.item_count());
+                    }
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
@@ -2009,7 +2012,13 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(*index, thread, window, cx);
                     });
-                    list_state.remeasure_items(*index..*index + 1);
+                    if AgentSettings::get_global(cx).message_detail
+                        == settings::AgentMessageDetail::Compact
+                    {
+                        list_state.remeasure_items(0..list_state.item_count());
+                    } else {
+                        list_state.remeasure_items(*index..*index + 1);
+                    }
                     active.update(cx, |active, cx| {
                         if active.editing_message == Some(*index)
                             && !active.can_edit_user_message(*index, cx)
@@ -2029,6 +2038,11 @@ impl ConversationView {
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
+                    if AgentSettings::get_global(cx).message_detail
+                        == settings::AgentMessageDetail::Compact
+                    {
+                        list_state.remeasure_items(0..list_state.item_count());
+                    }
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode(cx);
                     });
@@ -10798,6 +10812,189 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_compact_group_includes_tool_preamble_but_preserves_final_and_failures(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation.clone(), true, cx);
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        for update in [
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Checking the project.".into(),
+            )),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("read", "Read").status(acp_v1::ToolCallStatus::Completed),
+            ),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "The answer is 42.".into(),
+            )),
+            acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk::new(
+                "Another task".into(),
+            )),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Trying a command.".into(),
+            )),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("fail", "Failed command")
+                    .status(acp_v1::ToolCallStatus::Failed),
+            ),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Which option do you prefer?".into(),
+            )),
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("inspect", "Inspect")
+                    .status(acp_v1::ToolCallStatus::Completed),
+            ),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(update, cx)
+                    .expect("session update")
+            });
+            cx.run_until_parked();
+        }
+        thread.read_with(cx, |thread, cx| {
+            let entries = thread.entries();
+            let start = entries
+                .iter()
+                .position(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+                .expect("preamble");
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start, cx),
+                Some(start..start + 2)
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 2, cx),
+                None
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 4, cx),
+                None
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 5, cx),
+                None
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 6, cx),
+                None
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 7, cx),
+                None
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compact_tool_groups_stop_at_incomplete_calls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation.clone(), true, cx);
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        for (id, status) in [
+            ("one", acp_v1::ToolCallStatus::Completed),
+            ("two", acp_v1::ToolCallStatus::Completed),
+            ("pending", acp_v1::ToolCallStatus::InProgress),
+            ("failed", acp_v1::ToolCallStatus::Failed),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp_v1::SessionUpdate::ToolCall(
+                            acp_v1::ToolCall::new(id, id).status(status),
+                        ),
+                        cx,
+                    )
+                    .expect("tool call");
+            });
+            cx.run_until_parked();
+        }
+        thread.read_with(cx, |thread, cx| {
+            let entries = thread.entries();
+            let start = entries
+                .iter()
+                .position(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                .expect("tool call");
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start, cx),
+                Some(start..start + 2)
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 1, cx),
+                Some(start..start + 2)
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 2, cx),
+                None
+            );
+            assert_eq!(
+                ThreadView::completed_tool_group(entries, start + 3, cx),
+                None
+            );
+        });
+        cx.run_until_parked();
+        let (index, id) = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .enumerate()
+                .find_map(|(index, entry)| match entry {
+                    AgentThreadEntry::ToolCall(call) => Some((index, call.id.clone())),
+                    _ => None,
+                })
+                .expect("first tool call")
+        });
+        let selector: &'static str =
+            Box::leak(format!("tool-group-header-{index}").into_boxed_str());
+        let header = cx.debug_bounds(selector).expect("compact tool group");
+        cx.simulate_click(
+            point(header.origin.x + px(30.), header.center().y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.entry_view_state.read(cx).is_tool_group_expanded(&id))
+        });
+        let tool_selector: &'static str =
+            Box::leak(format!("tool-call-{}-standalone", id.0).into_boxed_str());
+        assert!(cx.debug_bounds(tool_selector).is_some());
+        let header = cx.debug_bounds(selector).expect("expanded tool group");
+        cx.simulate_click(
+            point(header.origin.x + px(30.), header.center().y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.entry_view_state.read(cx).is_tool_group_expanded(&id))
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(selector).is_none());
+        assert!(cx.debug_bounds(tool_selector).is_some());
+        view.update_in(cx, |view, window, cx| {
+            view.close_thread_search(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(selector).is_some());
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.message_detail = settings::AgentMessageDetail::Detailed;
+            AgentSettings::override_global(settings, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(selector).is_none());
+        assert!(cx.debug_bounds(tool_selector).is_some());
+    }
+
+    #[gpui::test]
     async fn test_rewind_views(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11322,6 +11519,11 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_scrollbar_drag_cancels_pending_restore(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.message_detail = settings::AgentMessageDetail::Detailed;
+            AgentSettings::override_global(settings, cx);
+        });
         for draw_during_drag in [false, true] {
             let (thread_view, cx) = setup_pending_scroll_restore(40, cx).await;
             let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());

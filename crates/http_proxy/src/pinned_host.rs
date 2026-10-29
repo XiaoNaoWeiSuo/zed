@@ -23,7 +23,7 @@
 
 use crate::allowlist::Allowlist;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _};
 
 /// Why pinning a host failed.
 #[derive(Debug, thiserror::Error)]
@@ -98,14 +98,23 @@ impl PinnedHost {
     }
 
     fn resolve_inner(host: &str, port: u16, vet: bool) -> Result<Self, PinnedHostError> {
-        let resolved =
-            (host, port)
+        let resolved_host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .filter(|host| host.parse::<Ipv6Addr>().is_ok())
+            .unwrap_or(host);
+        let resolved = if let Ok(ip) = resolved_host.parse::<IpAddr>() {
+            vec![SocketAddr::new(ip, port)]
+        } else {
+            (resolved_host, port)
                 .to_socket_addrs()
                 .map_err(|source| PinnedHostError::Resolve {
                     host: host.to_string(),
                     port,
                     source,
-                })?;
+                })?
+                .collect()
+        };
 
         let mut addrs = HashSet::new();
         let mut saw_any = false;
@@ -198,6 +207,19 @@ fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_ipv6_literals_are_resolved_as_addresses() {
+        assert!(matches!(
+            PinnedHost::resolve("[::1]", 80),
+            Err(PinnedHostError::AllAddressesForbidden { .. })
+        ));
+        let pinned = PinnedHost::resolve_allowing_any("[::1]", 80).expect("loopback literal");
+        assert_eq!(
+            pinned.socket_addrs().collect::<Vec<_>>(),
+            vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 80))]
+        );
+    }
 
     #[test]
     fn forbidden_ip_covers_v4_ranges() {

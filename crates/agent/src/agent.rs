@@ -955,6 +955,7 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(&thread_handle, Self::handle_deferred_question_changed),
             cx.subscribe(
                 &thread_handle,
                 |this, thread, _: &crate::thread::CancellationRequested, cx| {
@@ -1026,6 +1027,86 @@ impl NativeAgent {
         self.update_available_commands_for_project(project_id, cx);
 
         acp_thread
+    }
+
+    fn handle_deferred_question_changed(
+        &mut self,
+        thread: Entity<Thread>,
+        event: &crate::thread::DeferredQuestionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(question) = thread.read(cx).deferred_question(&event.0).cloned() else {
+            return;
+        };
+        let session_id = thread.read(cx).id().clone();
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        if question.withdrawn {
+            if let Some(id) = question.active_entry {
+                session
+                    .acp_thread
+                    .update(cx, |thread, cx| thread.cancel_elicitation(&id, cx))
+                    .log_err();
+            }
+            return;
+        }
+        if question.delivered || question.response.is_none() {
+            return;
+        }
+        let completion = session
+            .execution
+            .as_ref()
+            .map(|execution| execution.completion.clone());
+        let mut cancellation = session.pending_cancellation.receiver();
+        let acp_thread = session.acp_thread.clone();
+        cx.spawn(async move |this, cx| {
+            if let Some(completion) = completion {
+                futures::select_biased! {
+                    _ = cancellation.changed().fuse() => return,
+                    _ = completion.fuse() => {},
+                }
+            }
+            if cancellation.changed().now_or_never().is_some() {
+                return;
+            }
+            let result = this.update(cx, |this, cx| {
+                let Some(session) = this.sessions.get(&session_id) else {
+                    return None;
+                };
+                let acp_thread = session.acp_thread.upgrade()?;
+                if !thread.read(cx).has_undelivered_answers()
+                    || acp_thread.read(cx).has_unsettled_submissions()
+                {
+                    return None;
+                }
+                let connection = NativeAgentConnection(cx.entity());
+                Some(
+                    connection
+                        .submit_native_internal(session_id, None, true, cx)
+                        .0,
+                )
+            });
+            match result {
+                Ok(Some(receipt)) => {
+                    if let Err(error) = receipt.await {
+                        if error.is::<acp_thread::SubmissionCancelled>() {
+                            log::debug!("Deferred answer continuation superseded");
+                        } else {
+                            acp_thread
+                                .update(cx, |thread, cx| {
+                                    thread.report_local_execution_error(Arc::new(error), cx)
+                                })
+                                .and_then(|result| result)
+                                .log_err();
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::debug!("Deferred answer owner closed: {error}"),
+            }
+        })
+        .detach();
     }
 
     fn cancel_session(&mut self, session_id: &acp_v2::SessionId) {
@@ -1857,7 +1938,7 @@ impl NativeAgent {
                         NativeAgentConnection::handle_thread_events(
                             events,
                             acp_thread.downgrade(),
-                            None,
+                            Some(this.clone()),
                             cx,
                         )
                     })
@@ -2452,6 +2533,16 @@ impl NativeAgentConnection {
         content: Option<Vec<acp_v2::ContentBlock>>,
         cx: &mut App,
     ) -> (Task<Result<acp_v2::PromptResponse>>, NativeCompletion) {
+        self.submit_native_internal(session_id, content, false, cx)
+    }
+
+    fn submit_native_internal(
+        &self,
+        session_id: acp_v2::SessionId,
+        content: Option<Vec<acp_v2::ContentBlock>>,
+        automatic_resume: bool,
+        cx: &mut App,
+    ) -> (Task<Result<acp_v2::PromptResponse>>, NativeCompletion) {
         let (completion_sender, completion_receiver) = oneshot::channel();
         let completion = completion_receiver.shared();
         if let Some(content) = &content
@@ -2488,6 +2579,9 @@ impl NativeAgentConnection {
                         };
                         if execution.completion.peek().is_some() {
                             return Ok(None);
+                        }
+                        if automatic_resume {
+                            return Err(acp_thread::SubmissionCancelled.into());
                         }
                         if let Some(sender) = execution.cancellation.take()
                             && sender
@@ -2527,6 +2621,12 @@ impl NativeAgentConnection {
                                 }),
                             ))
                         })??;
+                    if automatic_resume
+                        && (acp_thread.read(cx).has_unsettled_submissions()
+                            || !thread.read(cx).has_undelivered_answers())
+                    {
+                        return Err(acp_thread::SubmissionCancelled.into());
+                    }
                     let (message_id, retry_action) = if let Some(content) = content {
                         let message_id = ClientUserMessageId::new();
                         let retry_action = agent.read_with(cx, |agent, cx| {
@@ -2572,8 +2672,11 @@ impl NativeAgentConnection {
                             .map(|(id, _retry_action)| id.clone())
                             .or_else(|| thread.read(cx).last_user_message_id())
                             .context("No user message to retry")?;
-                        let retry_action =
-                            previous_execution.and_then(|(_id, retry_action)| retry_action);
+                        let retry_action = if automatic_resume {
+                            None
+                        } else {
+                            previous_execution.and_then(|(_id, retry_action)| retry_action)
+                        };
                         thread.update(cx, |thread, cx| thread.prepare_local_turn(cx));
                         (message_id, retry_action)
                     };
@@ -2653,6 +2756,13 @@ impl NativeAgentConnection {
                 cancellation = cancellation.fuse() => {
                     let cancellation = cancellation.unwrap_or(NativeCancellation::Cancelled);
                     let model_started = !thread.read_with(cx, |thread, _cx| thread.is_turn_complete());
+                    if matches!(cancellation, NativeCancellation::Cancelled) {
+                        thread.update(cx, |thread, cx| {
+                            if thread.goal().is_some_and(|goal| goal.status == crate::ThreadGoalStatus::Active) {
+                                thread.set_goal_status(crate::ThreadGoalStatus::Paused, Some("Stopped by user".into()), cx).log_err();
+                            }
+                        });
+                    }
                     // Tools may ignore cancellation. Their native cleanup must not
                     // delay the bridge's Stop event or the next accepted prompt.
                     thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
@@ -2678,10 +2788,24 @@ impl NativeAgentConnection {
                 result = execution => result,
             };
             if result.is_err() {
+                thread.update(cx, |thread, cx| {
+                    if thread.goal().is_some_and(|goal| goal.status == crate::ThreadGoalStatus::Active) {
+                        thread.set_goal_status(crate::ThreadGoalStatus::Paused, Some("Execution failed".into()), cx).log_err();
+                    }
+                });
                 acp_thread.update(cx, |thread, cx| {
                     thread.cancel_local_actions(acp_thread::RequestPermissionOutcome::Cancelled, cx);
                 }).log_err();
                 thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+            }
+            if let Ok(reason) = &result
+                && !matches!(reason, acp_v2::StopReason::EndTurn | acp_v2::StopReason::Cancelled)
+            {
+                thread.update(cx, |thread, cx| {
+                    if thread.goal().is_some_and(|goal| goal.status == crate::ThreadGoalStatus::Active) {
+                        thread.set_goal_status(crate::ThreadGoalStatus::Paused, Some(format!("Agent stopped: {reason:?}")), cx).log_err();
+                    }
+                });
             }
             let result = match result {
                 Ok(reason) => acp_thread
@@ -2819,45 +2943,40 @@ impl NativeAgentConnection {
                                 })?;
                             }
                             ThreadEvent::Elicitation(ElicitationRequest {
-                                tool_call_id,
-                                message,
-                                schema,
-                                response,
+                                deferred_request_id, tool_call_id, message, schema, response,
                             }) => {
+                                let native_thread = connection.as_ref().map(|agent| agent.read_with(cx, |agent, cx| {
+                                    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone()).ok()?;
+                                    agent.sessions.get(&session_id).map(|session| session.thread.clone())
+                                })).transpose()?.flatten();
+                                if let (Some(thread), Some(id)) = (&native_thread, &deferred_request_id) {
+                                    thread.update(cx, |thread, cx| thread.register_deferred_question(id.clone(), tool_call_id.clone(), message.clone(), &schema, cx))?;
+                                }
                                 let request_result = acp_thread.update(cx, |thread, cx| {
-                                    let scope = acp_v2::ElicitationSessionScope::new(
-                                        thread.session_id().clone(),
-                                    )
-                                    .tool_call_id(tool_call_id);
-                                    let request = acp_v2::CreateElicitationRequest::new(
-                                        acp_v2::ElicitationFormMode::new(scope, schema),
-                                        message,
-                                    );
-                                    thread.request_elicitation(request, cx)
+                                    let scope = acp_v2::ElicitationSessionScope::new(thread.session_id().clone()).tool_call_id(tool_call_id);
+                                    let request = acp_v2::CreateElicitationRequest::new(acp_v2::ElicitationFormMode::new(scope, schema), message);
+                                    thread.request_elicitation_with_id(request, cx)
                                 })?;
                                 match request_result {
-                                    Ok(response_task) => {
-                                        cx.background_spawn(async move {
+                                    Ok((entry_id, response_task)) => {
+                                        if let (Some(thread), Some(id)) = (&native_thread, &deferred_request_id) {
+                                            thread.update(cx, |thread, _| thread.set_deferred_question_entry(id, entry_id));
+                                        }
+                                        cx.spawn(async move |cx| {
                                             let elicitation_response = response_task.await;
-                                            response
-                                                .send(elicitation_response)
-                                                .map_err(|_| {
-                                                    anyhow!("elicitation receiver was dropped")
-                                                })
-                                                .log_err();
-                                        })
-                                        .detach();
+                                            if let (Some(thread), Some(id)) = (native_thread, deferred_request_id) {
+                                                thread.update(cx, |thread, cx| thread.receive_deferred_response(&id, &elicitation_response, cx)).log_err();
+                                            }
+                                            if response.send(elicitation_response).is_err() { log::debug!("Elicitation tool receiver was dropped"); }
+                                        }).detach();
                                     }
                                     Err(error) => {
                                         log::error!("Failed to request elicitation: {error:?}");
-                                        // Resolve the tool's pending request so it
-                                        // doesn't hang waiting on a form that will
-                                        // never render.
-                                        response
-                                            .send(acp_v2::CreateElicitationResponse::new(
-                                                acp_v2::ElicitationAction::Cancel,
-                                            ))
-                                            .ok();
+                                        let cancelled = acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Cancel);
+                                        if let (Some(thread), Some(id)) = (native_thread, deferred_request_id) {
+                                            thread.update(cx, |thread, cx| thread.receive_deferred_response(&id, &cancelled, cx)).log_err();
+                                        }
+                                        if response.send(cancelled).is_err() { log::debug!("Elicitation tool receiver was dropped"); }
                                     }
                                 }
                             }
@@ -3708,6 +3827,11 @@ impl NativeThreadEnvironment {
         let depth = subagent_thread.read(cx).depth();
 
         if let Some(parent_thread_entity) = self.thread.upgrade() {
+            if parent_thread_entity != subagent_thread {
+                subagent_thread.update(cx, |thread, cx| {
+                    thread.inherit_permission_tier(&parent_thread_entity, cx)
+                })?;
+            }
             telemetry::event!(
                 "Subagent Started",
                 session = parent_thread_entity.read(cx).id().to_string(),

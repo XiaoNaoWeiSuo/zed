@@ -1485,6 +1485,33 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_confirm_actions_prompts_for_project_edits(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let (stream, mut events) = ToolCallEventStream::test();
+        let stream = stream.with_permission_tier(crate::permission_tier::PermissionTier::ReadOnly);
+        let task =
+            cx.update(|cx| edit_tool.authorize(&PathBuf::from("root/src/main.rs"), &stream, cx));
+        let authorization = events.expect_authorization().await;
+        assert_eq!(
+            authorization.tool_call.title,
+            MaybeUndefined::Value("Edit `root/src/main.rs`".into())
+        );
+        authorization
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("deny"),
+                acp::PermissionOptionKind::RejectOnce,
+            ))
+            .expect("authorization is pending");
+        assert!(task.await.is_err());
+    }
+
+    #[gpui::test]
     async fn test_streaming_authorize(cx: &mut TestAppContext) {
         let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
 

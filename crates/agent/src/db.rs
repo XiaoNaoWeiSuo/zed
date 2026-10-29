@@ -86,6 +86,12 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub goal: Option<crate::ThreadGoal>,
+    #[serde(default)]
+    pub deferred_questions: IndexMap<String, crate::DeferredQuestion>,
+    #[serde(default)]
+    pub permission_tier: crate::permission_tier::PermissionTier,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -169,6 +175,9 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            goal: None,
+            deferred_questions: Default::default(),
+            permission_tier: Default::default(),
         }
     }
 
@@ -355,6 +364,9 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            goal: None,
+            deferred_questions: Default::default(),
+            permission_tier: Default::default(),
         })
     }
 }
@@ -971,6 +983,9 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            goal: None,
+            deferred_questions: Default::default(),
+            permission_tier: Default::default(),
         }
     }
 

@@ -903,7 +903,19 @@ impl ThreadView {
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
-        subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&conversation, |this, _, cx| {
+            if AgentSettings::get_global(cx).message_detail == settings::AgentMessageDetail::Compact
+            {
+                this.list_state
+                    .remeasure_items(0..this.list_state.item_count());
+            }
+            cx.notify();
+        }));
+        subscriptions.push(cx.observe_global::<settings::SettingsStore>(|this, cx| {
+            this.list_state
+                .remeasure_items(0..this.list_state.item_count());
+            cx.notify();
+        }));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
                 event,
@@ -1044,6 +1056,10 @@ impl ThreadView {
             .clone()
             .downcast::<agent::NativeAgentConnection>()
         {
+            if let Some(native_thread) = native_connection.thread(thread.read(cx).session_id(), cx)
+            {
+                subscriptions.push(cx.observe(&native_thread, |_, _, cx| cx.notify()));
+            }
             let project_id = thread.read(cx).project().entity_id();
             subscriptions.push(cx.subscribe(
                 &native_connection.0,
@@ -5338,6 +5354,117 @@ impl ThreadView {
         )
     }
 
+    fn render_goal_status(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.as_native_thread(cx)?;
+        let goal = thread.read(cx).goal()?.clone();
+        let status = match goal.status {
+            agent::ThreadGoalStatus::Active => "Active",
+            agent::ThreadGoalStatus::Paused => "Paused",
+            agent::ThreadGoalStatus::Completed => "Completed",
+            agent::ThreadGoalStatus::Blocked => "Blocked",
+        };
+        let resume_thread = thread.clone();
+        let can_resume = matches!(
+            goal.status,
+            agent::ThreadGoalStatus::Paused | agent::ThreadGoalStatus::Blocked
+        ) && self.thread.read(cx).status() == ThreadStatus::Idle;
+        let mut details = format!(
+            "Success criteria:\n{}",
+            goal.success_criteria
+                .iter()
+                .map(|criterion| format!("• {criterion}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        if !goal.verification_surfaces.is_empty() {
+            details.push_str(&format!(
+                "\n\nVerification surfaces:\n{}",
+                goal.verification_surfaces.join("\n")
+            ));
+        }
+        if !goal.constraints.is_empty() {
+            details.push_str(&format!(
+                "\n\nConstraints:\n{}",
+                goal.constraints.join("\n")
+            ));
+        }
+        for (index, evidence) in goal.evidence.iter().enumerate() {
+            details.push_str(&format!(
+                "\n\nCriterion {}: {}",
+                index + 1,
+                evidence.assessment
+            ));
+            for source in &evidence.sources {
+                details.push_str(&format!(
+                    "\n{} · {} · SHA-256 {}",
+                    source.tool_name, source.tool_call_id, source.digest
+                ));
+            }
+        }
+        if let Some(outcome) = &goal.outcome {
+            details.push_str(&format!("\n\n{outcome}"));
+        }
+        Some(
+            h_flex()
+                .id("goal-status")
+                .px_3()
+                .py_1()
+                .gap_2()
+                .child(
+                    Label::new(format!("Goal · {status}: {}", goal.objective))
+                        .size(LabelSize::Small),
+                )
+                .tooltip(Tooltip::text(details))
+                .when(goal.status == agent::ThreadGoalStatus::Active, |row| {
+                    row.child(
+                        Button::new("pause-goal", "Pause")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                thread.update(cx, |thread, cx| {
+                                    thread
+                                        .set_goal_status(
+                                            agent::ThreadGoalStatus::Paused,
+                                            Some("Paused by user".into()),
+                                            cx,
+                                        )
+                                        .log_err();
+                                });
+                                this.cancel_generation(cx);
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(can_resume, |row| {
+                    row.child(
+                        Button::new("resume-goal", "Resume")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let result = resume_thread.update(cx, |thread, cx| {
+                                    thread.set_goal_status(
+                                        agent::ThreadGoalStatus::Active,
+                                        None,
+                                        cx,
+                                    )
+                                });
+                                if result.log_err().is_none() {
+                                    return;
+                                }
+                                this.send_content(
+                                    Task::ready(Ok(Some((
+                                        vec!["Continue working toward the active goal.".into()],
+                                        Vec::new(),
+                                    )))),
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                                cx.notify();
+                            })),
+                    )
+                }),
+        )
+    }
+
     fn render_queue_steer_button(
         &self,
         entry_id: QueueEntryId,
@@ -7002,6 +7129,43 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    pub(super) fn completed_tool_group(
+        entries: &[AgentThreadEntry],
+        index: usize,
+        cx: &App,
+    ) -> Option<std::ops::Range<usize>> {
+        let is_completed_tool = |entry: &AgentThreadEntry| {
+            matches!(entry, AgentThreadEntry::ToolCall(call)
+            if call.status() == ToolCallStatus::Completed && !call.is_subagent()
+                && call.terminals().all(|terminal| terminal.read(cx).output().is_none_or(|output|
+                    output.exit_status.exit_code.is_none_or(|code| code == 0) && output.exit_status.signal.is_none())))
+        };
+        let eligible = |index: usize| {
+            entries.get(index).is_some_and(|entry| {
+                is_completed_tool(entry) || matches!(entry,
+                    AgentThreadEntry::AssistantMessage(message)
+                    if !message.is_subagent_output && !message.indented
+                        && message.chunks.iter().all(|chunk| match chunk {
+                            AssistantMessageChunk::Message { block, .. } | AssistantMessageChunk::Thought { block, .. } =>
+                                block.source_blocks().iter().all(|block| matches!(block, acp_v2::ContentBlock::Text(text) if !text.text.contains(['?', '？']))),
+                        })
+                        && entries.get(index + 1).is_some_and(is_completed_tool))
+            })
+        };
+        if !eligible(index) {
+            return None;
+        }
+        let mut start = index;
+        while start > 0 && eligible(start - 1) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while eligible(end) {
+            end += 1;
+        }
+        (end - start > 1).then_some(start..end)
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -7018,6 +7182,76 @@ impl ThreadView {
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
+                    let grouping = AgentSettings::get_global(cx).message_detail
+                        == settings::AgentMessageDetail::Compact
+                        && !this.thread_search_visible
+                        && this
+                            .conversation
+                            .read(cx)
+                            .permission_requests
+                            .get(&this.session_id)
+                            .is_none_or(|requests| requests.is_empty());
+                    if grouping && let Some(range) = Self::completed_tool_group(entries, index, cx)
+                    {
+                        if index != range.start {
+                            return Empty.into_any_element();
+                        }
+                        let Some(first) = entries
+                            .iter()
+                            .skip(range.start)
+                            .take(range.end - range.start)
+                            .find_map(|entry| match entry {
+                                AgentThreadEntry::ToolCall(call) => Some(call),
+                                _ => None,
+                            })
+                        else {
+                            return Empty.into_any_element();
+                        };
+                        let id = first.id.clone();
+                        let expanded = this.entry_view_state.read(cx).is_tool_group_expanded(&id);
+                        let count = entries
+                            .iter()
+                            .skip(range.start)
+                            .take(range.end - range.start)
+                            .filter(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                            .count();
+                        let group_range = range.clone();
+                        let header = Button::new(
+                            ("tool-group", index),
+                            format!(
+                                "{} {count} tool {}",
+                                if expanded { "▾" } else { "▸" },
+                                if count == 1 { "call" } else { "calls" }
+                            ),
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.entry_view_state
+                                .update(cx, |state, _| state.toggle_tool_group(id.clone()));
+                            this.list_state.remeasure_items(group_range.clone());
+                            cx.notify();
+                        }));
+                        let mut group = v_flex().w_full().px_2().child(
+                            div()
+                                .id(("tool-group-header", index))
+                                .debug_selector(move || format!("tool-group-header-{index}"))
+                                .child(header),
+                        );
+                        if expanded {
+                            for (entry_index, entry) in
+                                entries.iter().enumerate().take(range.end).skip(range.start)
+                            {
+                                group = group.child(this.render_entry(
+                                    entry_index,
+                                    entries.len(),
+                                    entry,
+                                    window,
+                                    cx,
+                                ));
+                            }
+                        }
+                        return centered_container(group.into_any_element()).into_any_element();
+                    }
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
@@ -7949,6 +8183,8 @@ impl ThreadView {
         }
 
         self.thread_search_visible = false;
+        self.list_state
+            .remeasure_items(0..self.list_state.item_count());
         self.message_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
         true
@@ -7994,6 +8230,8 @@ impl ThreadView {
                 |this, _bar, event, window, cx| {
                     if matches!(event, ThreadSearchBarEvent::Dismissed) {
                         this.thread_search_visible = false;
+                        this.list_state
+                            .remeasure_items(0..this.list_state.item_count());
                         this.message_editor.focus_handle(cx).focus(window, cx);
                         cx.notify();
                     }
@@ -8013,10 +8251,14 @@ impl ThreadView {
                 bar.update(cx, |bar, cx| bar.clear_highlights(cx));
             }
             self.thread_search_visible = false;
+            self.list_state
+                .remeasure_items(0..self.list_state.item_count());
             self.message_editor.focus_handle(cx).focus(window, cx);
             cx.notify();
         } else {
             self.thread_search_visible = true;
+            self.list_state
+                .remeasure_items(0..self.list_state.item_count());
             if let Some(bar) = self.thread_search_bar.clone() {
                 bar.update(cx, |bar, cx| bar.focus_and_refresh(window, cx));
             }
@@ -12328,7 +12570,7 @@ impl ThreadView {
 
     fn render_permission_tier_selector(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         use agent::permission_tier::PermissionTier;
@@ -12336,36 +12578,21 @@ impl ThreadView {
         let thread = self.as_native_thread(cx)?;
         let current = thread.read(cx).permission_tier();
         let view = cx.entity().downgrade();
-        let menu = ContextMenu::build(window, cx, |menu, _, _| {
-            let mut menu = menu;
-            for tier in PermissionTier::ALL {
+        let options = PermissionTier::ALL
+            .into_iter()
+            .map(|tier| {
                 let thread = thread.clone();
                 let view = view.clone();
-                menu = menu.toggleable_entry(
-                    tier.label(),
-                    tier == current,
-                    IconPosition::End,
-                    None,
-                    move |_, cx| {
-                        thread.update(cx, |thread, cx| thread.set_permission_tier(tier, cx));
-                        view.update(cx, |_, cx| cx.notify()).ok();
-                    },
-                );
-            }
-            menu
-        });
+                ui::SelectMenuOption::new(tier.label(), tier == current, move |_, cx| {
+                    thread.update(cx, |thread, cx| thread.set_permission_tier(tier, cx));
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                })
+            })
+            .collect();
 
         Some(
-            ui::DropdownMenu::new("permission-tier", current.label(), menu)
-                .style(ui::DropdownStyle::Ghost)
-                .label_size(LabelSize::Small)
-                .label_color(Color::Muted)
-                .anchor(gpui::Anchor::BottomRight)
-                .offset(gpui::Point {
-                    x: gpui::px(0.),
-                    y: gpui::px(-2.),
-                })
-                .trigger_icon(IconName::ChevronDown),
+            ui::SelectMenu::new("permission-tier", current.label(), options)
+                .tooltip("Agent permission tier"),
         )
     }
 
@@ -13619,6 +13846,7 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
+            .children(self.render_goal_status(cx))
             .child(self.render_message_editor(window, cx))
     }
 }

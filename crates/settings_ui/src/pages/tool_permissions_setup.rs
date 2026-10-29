@@ -1415,6 +1415,8 @@ mod tests {
             "grep",
             "list_agents_and_models",
             "list_directory",
+            "manage_goal",
+            "inspect_tool_result",
             "open",
             "read_file",
             "rename_symbol",

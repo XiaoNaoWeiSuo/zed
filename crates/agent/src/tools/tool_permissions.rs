@@ -634,7 +634,8 @@ pub fn authorize_file_edit(
     let path_str = path.to_string_lossy();
 
     let settings = agent_settings::AgentSettings::get_global(cx);
-    let decision = decide_permission_for_path(tool_name, &path_str, settings);
+    let decision = event_stream
+        .apply_permission_tier(decide_permission_for_path(tool_name, &path_str, settings));
 
     if let ToolPermissionDecision::Deny(reason) = decision {
         return Task::ready(Err(anyhow!("{}", reason)));
@@ -666,6 +667,17 @@ pub fn authorize_file_edit(
         })?;
 
         let canonical_roots = canonicalize_worktree_roots(&project_entity, &fs, cx).await;
+
+        let decision = cx.update(|cx| {
+            event_stream.apply_permission_tier(decide_permission_for_path(
+                &tool_name,
+                &path_owned.to_string_lossy(),
+                agent_settings::AgentSettings::get_global(cx),
+            ))
+        });
+        if let ToolPermissionDecision::Deny(reason) = &decision {
+            return Err(anyhow!(reason.clone()));
+        }
 
         let resolved = project_entity.read_with(cx, |project, cx| {
             resolve_project_path(project, &path_owned, &canonical_roots, cx)
@@ -713,8 +725,6 @@ pub fn authorize_file_edit(
             }
         }
 
-        let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
-
         // Check sensitive settings asynchronously. Short-circuit on the
         // raw-path fast paths to skip the canonicalization in
         // `sensitive_settings_kind`; the slow path still runs for paths
@@ -727,6 +737,18 @@ pub fn authorize_file_edit(
         } else {
             sensitive_settings_kind(&path_owned, &canonical_roots, fs.as_ref()).await
         };
+
+        let decision = cx.update(|cx| {
+            event_stream.apply_permission_tier(decide_permission_for_path(
+                &tool_name,
+                &path_owned.to_string_lossy(),
+                agent_settings::AgentSettings::get_global(cx),
+            ))
+        });
+        if let ToolPermissionDecision::Deny(reason) = &decision {
+            return Err(anyhow!(reason.clone()));
+        }
+        let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
 
         let is_sensitive = settings_kind.is_some();
         if explicitly_allowed && !is_sensitive {
@@ -774,6 +796,17 @@ pub fn authorize_file_edit(
                 return authorize.await;
             }
             None => {}
+        }
+
+        if event_stream.requires_confirmation_for_actions() {
+            let authorize = cx.update(|cx| {
+                let context = ToolPermissionContext::new(
+                    &tool_name,
+                    vec![path_owned.to_string_lossy().to_string()],
+                );
+                event_stream.authorize(&title, context, cx)
+            });
+            return authorize.await;
         }
 
         match resolved {

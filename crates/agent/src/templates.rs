@@ -113,8 +113,42 @@ mod tests {
         let rendered = template.render(&templates).unwrap();
         assert!(rendered.contains("You are the Zed coding agent"));
         assert!(rendered.contains("Today's Date: 2026-01-01"));
-        assert!(rendered.contains("## Fixing Diagnostics"));
+        assert!(rendered.contains("## Tools and verification"));
+        assert!(!rendered.contains("ask_user"));
+        assert!(!rendered.contains("manage_goal"));
+        assert!(!rendered.contains("1-2 focused attempts"));
         assert!(rendered.contains("test-model"));
+    }
+
+    #[test]
+    fn prompt_variants_load_only_available_workflows() {
+        let templates = Templates::new();
+        let project = prompt_store::ProjectContext::default();
+        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
+            let mut template = SystemPromptTemplate {
+                project: &project,
+                available_tools: Vec::new(),
+                model_name: None,
+                date: "2026-10-29".into(),
+                user_agents_md: None,
+                sandboxing: false,
+                is_linux: false,
+                is_windows: false,
+            };
+            let rendered = templates.0.render(name, &template).expect("prompt");
+            assert!(rendered.contains("supplied conversation only"));
+            assert!(!rendered.contains("## Tools and verification"));
+            template.available_tools = vec!["ask_user".into(), "manage_goal".into()];
+            let rendered = templates
+                .0
+                .render(name, &template)
+                .expect("prompt with tools");
+            assert!(rendered.contains("Defer a question"));
+            assert!(rendered.contains("audit every criterion"));
+            assert!(!rendered.contains("Delegate only"));
+            assert!(!rendered.contains("1-2 focused attempts"));
+            assert!(!rendered.contains("let the user decide whether to rerun"));
+        }
     }
 
     #[test]

@@ -97,6 +97,30 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// How much tool activity is shown in the conversation by default.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageDetail {
+    /// Group consecutive completed tool calls into expandable summaries.
+    #[default]
+    Compact,
+    /// Show each tool call separately.
+    Detailed,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -355,11 +379,11 @@ pub struct AgentSettingsContent {
     pub enable_feedback: Option<bool>,
     /// Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     ///
-    /// Default: true
+    /// Default: false
     pub expand_edit_card: Option<bool>,
     /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     ///
-    /// Default: true
+    /// Default: false
     pub expand_terminal_card: Option<bool>,
     /// Command to automatically run when Lin creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
@@ -372,6 +396,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// Level of detail for tool activity in the conversation.
+    ///
+    /// Default: compact
+    pub message_detail: Option<AgentMessageDetail>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///

@@ -86,9 +86,9 @@ impl AgentTool for DeletePathTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
             let path = input.path;
 
-            let decision = cx.update(|cx| {
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
                 decide_permission_for_path(Self::NAME, &path, AgentSettings::get_global(cx))
-            });
+            }));
 
             if let ToolPermissionDecision::Deny(reason) = decision {
                 return Err(reason);
@@ -115,6 +115,12 @@ impl AgentTool for DeletePathTool {
             let settings_kind =
                 sensitive_settings_kind(Path::new(&path), &canonical_roots, fs.as_ref()).await;
 
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
+                decide_permission_for_path(Self::NAME, &path, AgentSettings::get_global(cx))
+            }));
+            if let ToolPermissionDecision::Deny(reason) = decision {
+                return Err(reason);
+            }
             let decision =
                 if matches!(decision, ToolPermissionDecision::Allow) && settings_kind.is_some() {
                     ToolPermissionDecision::Confirm

@@ -648,7 +648,7 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
         system_message
     );
     assert!(
-        system_prompt.contains("## Fixing Diagnostics"),
+        system_prompt.contains("Rerun checks when relevant changes"),
         "unexpected system message: {:?}",
         system_message
     );
@@ -5888,6 +5888,11 @@ async fn test_ask_user_elicitation_references_scoped_tool_call_id(cx: &mut TestA
         question: "Which directory should we explore?".to_string(),
         options: Vec::new(),
         allow_free_text: true,
+        questions: Vec::new(),
+        defer: false,
+        request_id: None,
+        wait: false,
+        withdraw: false,
     };
     fake.send_last_event(
         &model,
@@ -5970,6 +5975,500 @@ async fn test_ask_user_elicitation_references_scoped_tool_call_id(cx: &mut TestA
     fake.send_last_text(&model, "Exploring src");
     fake.end_last(&model);
     send.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_deferred_question_allows_model_to_continue(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(&json!({"agent": {"profiles": {"ask-user": {"name": "Ask User", "tools": { AskUserTool::NAME: true }}}}}).to_string(), cx).result().expect("test settings");
+        });
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({"a": {}})).await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("ask-user".into()), cx);
+    });
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
+    cx.run_until_parked();
+    let input = AskUserToolInput {
+        question: "Choose a direction".into(),
+        options: vec!["A".into(), "B".into()],
+        allow_free_text: false,
+        questions: Vec::new(),
+        defer: true,
+        request_id: None,
+        wait: false,
+        withdraw: false,
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "question".into(),
+            name: AskUserTool::NAME.into(),
+            raw_input: serde_json::to_string(&input).expect("input"),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&input).expect("input"),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let (elicitation_id, request_id) = acp_thread.read_with(cx, |thread, _| {
+        let elicitation_id = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                _ => None,
+            })
+            .expect("question visible");
+        let request_id = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => tool_call
+                    .raw_output
+                    .as_ref()?
+                    .get("request_id")?
+                    .as_str()
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .expect("question tool call");
+        (elicitation_id, request_id)
+    });
+    // A second completion is available before the user answers.
+    fake.send_last_text(&model, "Working independently.");
+    fake.end_last(&model);
+    send.await.expect("turn completed");
+    acp_thread.update(cx, |thread, cx| {
+        thread.respond_to_elicitation(
+            &elicitation_id,
+            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                acp_v2::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from([
+                    ("choice".into(), "B".into()),
+                ])),
+            )),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Continue".into()], cx)
+    });
+    cx.run_until_parked();
+    let input = AskUserToolInput {
+        question: String::new(),
+        options: Vec::new(),
+        allow_free_text: false,
+        questions: Vec::new(),
+        defer: false,
+        request_id: Some(request_id),
+        wait: true,
+        withdraw: false,
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "retrieve".into(),
+            name: AskUserTool::NAME.into(),
+            raw_input: serde_json::to_string(&input).expect("input"),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&input).expect("input"),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    acp_thread.read_with(cx, |thread, _| {
+        assert!(thread.entries().iter().any(|entry| matches!(entry, AgentThreadEntry::ToolCall(call)
+            if call.raw_output.as_ref().is_some_and(|output| output.get("selected") == Some(&json!("B"))))));
+    });
+    fake.send_last_text(&model, "Using B.");
+    fake.end_last(&model);
+    send.await.expect("second turn completed");
+}
+
+#[gpui::test]
+async fn test_active_goal_continues_until_completed(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"goal-test": {"name": "Goal", "tools": {"manage_goal": true, "list_directory": true, "inspect_tool_result": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({"a": {}})).await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("goal-test".into()), cx);
+    });
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Start".into()], cx)
+    });
+    cx.run_until_parked();
+    let create = GoalToolInput {
+        action: "create".into(),
+        objective: "Finish the task".into(),
+        success_criteria: vec!["Project files inspected".into()],
+        evidence: String::new(),
+        criterion_evidence: Vec::new(),
+        verification_surfaces: vec!["list_directory output for a".into()],
+        constraints: Vec::new(),
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "create-goal".into(),
+            name: GoalTool::NAME.into(),
+            raw_input: serde_json::to_string(&create).expect("input"),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&create).expect("input"),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.goal().map(|goal| goal.status),
+            Some(ThreadGoalStatus::Active)
+        )
+    });
+    fake.send_last_text(&model, "Still working.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    // A second request exists without a new user prompt.
+    let incomplete = GoalToolInput {
+        action: "complete".into(),
+        objective: String::new(),
+        success_criteria: Vec::new(),
+        evidence: String::new(),
+        criterion_evidence: Vec::new(),
+        verification_surfaces: Vec::new(),
+        constraints: Vec::new(),
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "premature-goal".into(),
+            name: GoalTool::NAME.into(),
+            raw_input: serde_json::to_string(&incomplete).expect("input"),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&incomplete).expect("input"),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.goal().map(|goal| goal.status),
+            Some(ThreadGoalStatus::Active)
+        )
+    });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "observe-project".into(),
+            name: "list_directory".into(),
+            raw_input: "{\"path\":\"a\"}".into(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"path": "a"})),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let evidence_id = thread.read_with(cx, |thread, _| {
+        thread
+            .retained_tool_results()
+            .find(|(_, result, _)| result.tool_name.as_ref() == "list_directory")
+            .map(|(id, _, _)| id)
+            .expect("observation result")
+    });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "retrieve-observation".into(),
+            name: "inspect_tool_result".into(),
+            raw_input: serde_json::json!({"tool_call_id": evidence_id, "limit": 10}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({"tool_call_id": evidence_id, "limit": 10}),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        let (_, result, _) = thread
+            .retained_tool_results()
+            .find(|(_, result, _)| result.tool_name.as_ref() == "inspect_tool_result")
+            .expect("retrieved observations");
+        assert!(!result.is_error);
+        let output: InspectToolResultOutput =
+            serde_json::from_str(&result.text_contents()).expect("structured result");
+        assert_eq!(
+            output.entries.first().expect("source").tool_call_id,
+            evidence_id
+        );
+        assert_eq!(output.text.expect("page").chars().count(), 10);
+        assert_eq!(output.next_offset, Some(10));
+        assert_eq!(
+            thread
+                .retained_tool_results()
+                .filter(|(_, result, _)| result.tool_name.as_ref() == "list_directory")
+                .count(),
+            1
+        );
+    });
+    let input = GoalToolInput {
+        action: "complete".into(),
+        objective: String::new(),
+        success_criteria: Vec::new(),
+        evidence: "Tests passed".into(),
+        criterion_evidence: vec![GoalCriterionEvidenceInput {
+            assessment: "Observed project files".into(),
+            tool_call_ids: vec![evidence_id],
+        }],
+        verification_surfaces: Vec::new(),
+        constraints: Vec::new(),
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "finish-goal".into(),
+            name: GoalTool::NAME.into(),
+            raw_input: serde_json::to_string(&input).expect("input"),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&input).expect("input"),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Finished.");
+    fake.end_last(&model);
+    send.await.expect("completed turn");
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.goal().map(|goal| goal.status),
+            Some(ThreadGoalStatus::Completed)
+        )
+    });
+    let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+    assert_eq!(
+        saved.goal.expect("saved goal").status,
+        ThreadGoalStatus::Completed
+    );
+}
+
+#[gpui::test]
+async fn test_goal_pauses_after_repeated_responses(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"goal-test": {"name": "Goal", "tools": {"manage_goal": true, "list_directory": true, "inspect_tool_result": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({"a": {}})).await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("goal-test".into()), cx);
+        thread
+            .set_goal(
+                ThreadGoal::new("Finish".into(), vec!["Verified".into()]).expect("goal"),
+                cx,
+            )
+            .expect("set goal");
+    });
+    cx.run_until_parked();
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Start".into()], cx)
+    });
+    cx.run_until_parked();
+    for iteration in 0..3 {
+        assert!(
+            !fake.pending_completions_for(&model).is_empty(),
+            "missing request at iteration {iteration}; goal: {:?}",
+            thread.read_with(cx, |thread, _| thread.goal().cloned())
+        );
+        fake.send_last_text(&model, "No progress yet.");
+        fake.end_last(&model);
+        cx.run_until_parked();
+    }
+    send.await.expect("paused turn");
+    thread.read_with(cx, |thread, _| {
+        let goal = thread.goal().expect("goal");
+        assert_eq!(goal.status, ThreadGoalStatus::Paused);
+        assert!(
+            goal.outcome
+                .as_deref()
+                .is_some_and(|outcome| outcome.contains("three identical responses"))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_user_can_stop_and_resume_active_goal(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"goal-test": {"name": "Goal", "tools": {"manage_goal": true, "list_directory": true, "inspect_tool_result": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({"a": {}})).await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("goal-test".into()), cx);
+        thread
+            .set_goal(
+                ThreadGoal::new("Finish".into(), vec!["Verified".into()]).expect("goal"),
+                cx,
+            )
+            .expect("set goal");
+    });
+    cx.run_until_parked();
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Start".into()], cx)
+    });
+    cx.run_until_parked();
+    assert!(!fake.pending_completions_for(&model).is_empty());
+    cx.update(|cx| connection.cancel(&session_id, cx))
+        .expect("cancel");
+    assert!(matches!(
+        send.await.expect("stop"),
+        acp_v2::StopReason::Cancelled
+    ));
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.goal().map(|goal| goal.status),
+            Some(ThreadGoalStatus::Paused)
+        )
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.set_goal_status(ThreadGoalStatus::Active, None, cx)
+        })
+        .expect("resume");
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Continue".into()], cx)
+    });
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Continuing.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    assert!(
+        !fake.pending_completions_for(&model).is_empty(),
+        "active goal should continue after the response"
+    );
+    cx.update(|cx| connection.cancel(&session_id, cx))
+        .expect("cancel");
+    assert!(matches!(
+        send.await.expect("stop"),
+        acp_v2::StopReason::Cancelled
+    ));
 }
 
 #[gpui::test]

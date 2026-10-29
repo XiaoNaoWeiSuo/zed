@@ -1299,7 +1299,7 @@
         "enable_all_context_servers": true,
         "tools": {
           "apply_code_action": true,
-          "ask_user": false,
+          "ask_user": true,
           "copy_path": true,
           "create_directory": true,
           "create_thread": true,
@@ -1311,6 +1311,8 @@
           "find_references": true,
           "get_code_actions": true,
           "go_to_definition": true,
+          "manage_goal": true,
+          "inspect_tool_result": true,
           "grep": true,
           "list_agents_and_models": true,
           "list_directory": true,
@@ -1329,7 +1331,7 @@
         // We don't know which of the context server tools are safe for the "Ask" profile, so we don't enable them by default.
         // "enable_all_context_servers": true,
         "tools": {
-          "ask_user": false,
+          "ask_user": true,
           "create_thread": true,
           "diagnostics": true,
           "fetch": true,
@@ -1337,6 +1339,8 @@
           "find_references": true,
           "get_code_actions": true,
           "go_to_definition": true,
+          "manage_goal": true,
+          "inspect_tool_result": true,
           "grep": true,
           "list_agents_and_models": true,
           "list_directory": true,
@@ -1373,12 +1377,12 @@
     "prevent_idle_sleep": true,
     // Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     //
-    // Default: true
-    "expand_edit_card": true,
+    // Default: false
+    "expand_edit_card": false,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
-    // Default: true
-    "expand_terminal_card": true,
+    // Default: false
+    "expand_terminal_card": false,
     // Command to automatically run when Lin creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).
@@ -1390,6 +1394,8 @@
     //
     // Default: auto
     "thinking_display": "auto",
+    // "compact" groups completed tool activity; "detailed" shows every call separately.
+    "message_detail": "compact",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

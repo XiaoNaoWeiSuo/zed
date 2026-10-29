@@ -8989,6 +8989,25 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Message Detail",
+                description: "Choose Compact to group completed tool activity into expandable summaries, or Detailed to show each tool call separately.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.message_detail"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.message_detail.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .message_detail = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Thinking Display",
                 description: "How thinking blocks should be displayed by default. 'Auto' fully expands during streaming, then auto-collapses when done. 'Preview' auto-expands with a height constraint during streaming. 'Always Expanded' shows full content. 'Always Collapsed' keeps them collapsed.",
                 field: Box::new(SettingField {

@@ -112,6 +112,13 @@ impl AgentTool for CreateDirectoryTool {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
 
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
+                decide_permission_for_path(Self::NAME, &input.path, AgentSettings::get_global(cx))
+            }));
+            if let ToolPermissionDecision::Deny(reason) = decision {
+                return Err(reason);
+            }
+
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
 
             // Resolve where this directory lives. The global agent-skills dir is a
@@ -133,14 +140,6 @@ impl AgentTool for CreateDirectoryTool {
                 return create_out_of_project_directory(&project, &input, &event_stream, cx).await;
             }
 
-            let decision = cx.update(|cx| {
-                decide_permission_for_path(Self::NAME, &input.path, AgentSettings::get_global(cx))
-            });
-
-            if let ToolPermissionDecision::Deny(reason) = decision {
-                return Err(reason);
-            }
-
             let destination_path: Arc<str> = input.path.as_str().into();
 
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
@@ -154,6 +153,12 @@ impl AgentTool for CreateDirectoryTool {
                 sensitive_settings_kind(Path::new(&input.path), &canonical_roots, fs.as_ref())
                     .await;
 
+            let decision = event_stream.apply_permission_tier(cx.update(|cx| {
+                decide_permission_for_path(Self::NAME, &input.path, AgentSettings::get_global(cx))
+            }));
+            if let ToolPermissionDecision::Deny(reason) = decision {
+                return Err(reason);
+            }
             let decision =
                 if matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some() {
                     ToolPermissionDecision::Confirm
@@ -727,6 +732,37 @@ mod tests {
             ),
             "Deny policy should not emit symlink authorization prompt",
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[gpui::test]
+    async fn test_out_of_project_creation_respects_deny(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Deny;
+            AgentSettings::override_global(settings, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "project": {} }))
+            .await;
+        let project = Project::test(fs, [path!("/root/project").as_ref()], cx).await;
+        let scratch = tempfile::tempdir().expect("temporary directory");
+        let target = scratch.path().join("denied");
+        let (stream, mut events) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            Arc::new(CreateDirectoryTool::new(project)).run(
+                ToolInput::resolved(CreateDirectoryToolInput {
+                    path: target.to_string_lossy().into_owned(),
+                    reason: None,
+                }),
+                stream,
+                cx,
+            )
+        });
+        assert!(task.await.is_err());
+        assert!(!target.exists());
+        assert!(events.try_recv().is_err());
     }
 
     /// Out-of-project creation goes through the sandbox write-grant prompt and,

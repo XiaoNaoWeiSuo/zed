@@ -2,8 +2,8 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    GoToDefinitionTool, GoalTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
@@ -205,6 +205,135 @@ pub enum Message {
     Agent(AgentMessage),
     Resume,
     Compaction(CompactionInfo),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadGoal {
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+    #[serde(default)]
+    pub verification_surfaces: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<crate::GoalCriterionEvidence>,
+    pub status: ThreadGoalStatus,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeferredQuestion {
+    pub request_id: String,
+    pub tool_call_id: acp_v2::ToolCallId,
+    pub question: String,
+    pub schema: serde_json::Value,
+    pub response: Option<serde_json::Value>,
+    pub owner: Option<ClientUserMessageId>,
+    pub delivered: bool,
+    pub withdrawn: bool,
+    #[serde(skip)]
+    pub active_entry: Option<acp_thread::ElicitationEntryId>,
+}
+
+pub struct DeferredQuestionChanged(pub String);
+
+impl DeferredQuestion {
+    pub(crate) fn tool_output(&self) -> Result<crate::AskUserToolOutput, crate::AskUserToolOutput> {
+        let error = |error: String| crate::AskUserToolOutput::Error { error };
+        if self.withdrawn {
+            return Err(error(
+                "The question was withdrawn and its answer must not be used.".into(),
+            ));
+        }
+        let Some(response) = &self.response else {
+            return Ok(crate::AskUserToolOutput::Pending {
+                request_id: self.request_id.clone(),
+            });
+        };
+        let response: acp_v2::CreateElicitationResponse = serde_json::from_value(response.clone())
+            .map_err(|failure| error(failure.to_string()))?;
+        match response.action {
+            acp_v2::ElicitationAction::Accept(accept) => {
+                let answers = accept
+                    .content
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let label = self
+                            .schema
+                            .get("properties")
+                            .and_then(|properties| properties.get(&key))
+                            .and_then(|property| property.get("title"))
+                            .and_then(|title| title.as_str())
+                            .unwrap_or(&key)
+                            .to_string();
+                        serde_json::to_value(value).map(|value| (label, value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+                    .map_err(|failure| error(failure.to_string()))?;
+                Ok(crate::AskUserToolOutput::Answers { answers })
+            }
+            acp_v2::ElicitationAction::Decline => Err(error("The user declined to answer.".into())),
+            _ => Err(error(
+                "The question was cancelled without an answer.".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadGoalStatus {
+    Active,
+    Paused,
+    Completed,
+    Blocked,
+}
+
+struct PermissionTierState {
+    sender: RefCell<watch::Sender<crate::permission_tier::PermissionTier>>,
+    receiver: watch::Receiver<crate::permission_tier::PermissionTier>,
+}
+
+impl PermissionTierState {
+    fn new(tier: crate::permission_tier::PermissionTier) -> Self {
+        let (sender, receiver) = watch::channel(tier);
+        Self {
+            sender: RefCell::new(sender),
+            receiver,
+        }
+    }
+
+    fn current(&self) -> crate::permission_tier::PermissionTier {
+        *self.receiver.clone().borrow()
+    }
+
+    fn set(&self, tier: crate::permission_tier::PermissionTier) {
+        self.sender.borrow_mut().send(tier).log_err();
+    }
+}
+
+impl ThreadGoal {
+    pub fn new(objective: String, success_criteria: Vec<String>) -> Result<Self> {
+        anyhow::ensure!(!objective.trim().is_empty(), "A goal requires an objective");
+        anyhow::ensure!(
+            !success_criteria.is_empty()
+                && success_criteria
+                    .iter()
+                    .all(|criterion| !criterion.trim().is_empty()),
+            "A goal requires at least one non-empty success criterion"
+        );
+        Ok(Self {
+            objective,
+            success_criteria,
+            verification_surfaces: Vec::new(),
+            constraints: Vec::new(),
+            evidence: Vec::new(),
+            status: ThreadGoalStatus::Active,
+            outcome: None,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -1201,6 +1330,7 @@ fn ensure_tool_call_authorization_not_interrupted(
 /// message to display.
 #[derive(Debug)]
 pub struct ElicitationRequest {
+    pub deferred_request_id: Option<String>,
     pub tool_call_id: acp_v2::ToolCallId,
     pub message: String,
     pub schema: acp_v2::ElicitationSchema,
@@ -1283,6 +1413,9 @@ pub(crate) struct StreamingSaveKey {
     thinking_effort: Option<String>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
+    goal: Option<ThreadGoal>,
+    deferred_questions: IndexMap<String, DeferredQuestion>,
+    permission_tier: crate::permission_tier::PermissionTier,
 }
 
 pub struct Thread {
@@ -1318,7 +1451,10 @@ pub struct Thread {
     first_token_at: Option<Instant>,
     streamed_output_chars: u64,
     last_metrics_publish: Option<Instant>,
-    permission_tier: crate::permission_tier::PermissionTier,
+    permission_tier: Rc<PermissionTierState>,
+    goal: Option<ThreadGoal>,
+    deferred_questions: IndexMap<String, DeferredQuestion>,
+    deferred_question_updates: watch::Sender<()>,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1389,6 +1525,7 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
+        thread.permission_tier = parent_thread.read(cx).permission_tier.clone();
         let model_selection = model_selection
             .cloned()
             .or_else(|| AgentSettings::get_global(cx).subagent_model.clone());
@@ -1472,7 +1609,10 @@ impl Thread {
             first_token_at: None,
             streamed_output_chars: 0,
             last_metrics_publish: None,
-            permission_tier: Default::default(),
+            permission_tier: Rc::new(PermissionTierState::new(Default::default())),
+            goal: None,
+            deferred_questions: IndexMap::default(),
+            deferred_question_updates: watch::channel(()).0,
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1626,6 +1766,35 @@ impl Thread {
                 }
             }
         }
+        for question in self
+            .deferred_questions
+            .values()
+            .filter(|question| !question.withdrawn && question.response.is_none())
+        {
+            match serde_json::from_value(question.schema.clone()) {
+                Ok(schema) => {
+                    let (response, receiver) = oneshot::channel();
+                    if let Err(error) = stream.sender.unbounded_send(Ok(ThreadEvent::Elicitation(
+                        ElicitationRequest {
+                            deferred_request_id: Some(question.request_id.clone()),
+                            tool_call_id: question.tool_call_id.clone(),
+                            message: question.question.clone(),
+                            schema,
+                            response,
+                        },
+                    ))) {
+                        log::error!("Could not restore deferred question: {error}");
+                    }
+                    cx.spawn(async move |_, _| {
+                        if let Err(error) = receiver.await {
+                            log::debug!("Restored question closed: {error}");
+                        }
+                    })
+                    .detach();
+                }
+                Err(error) => log::error!("Could not restore deferred question schema: {error}"),
+            }
+        }
         rx
     }
 
@@ -1724,7 +1893,7 @@ impl Thread {
                 self.sandbox_grants.clone(),
                 Some(cx.weak_entity()),
             )
-            .with_permission_tier(self.permission_tier);
+            .with_permission_tier_state(self.permission_tier.clone());
             tool.replay(input, output, tool_event_stream, cx).log_err();
         }
 
@@ -1854,7 +2023,16 @@ impl Thread {
             first_token_at: None,
             streamed_output_chars: 0,
             last_metrics_publish: None,
-            permission_tier: Default::default(),
+            permission_tier: Rc::new(PermissionTierState::new(db_thread.permission_tier)),
+            deferred_questions: db_thread.deferred_questions,
+            deferred_question_updates: watch::channel(()).0,
+            goal: db_thread.goal.map(|mut goal| {
+                if goal.status == ThreadGoalStatus::Active {
+                    goal.status = ThreadGoalStatus::Paused;
+                    goal.outcome = Some("Session restored; resume the goal to continue".into());
+                }
+                goal
+            }),
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -1983,6 +2161,9 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            goal: self.goal.clone(),
+            deferred_questions: self.deferred_questions.clone(),
+            permission_tier: self.permission_tier(),
         };
 
         cx.background_spawn(async move {
@@ -2009,6 +2190,9 @@ impl Thread {
             thinking_effort: self.thinking_effort.clone(),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            goal: self.goal.clone(),
+            deferred_questions: self.deferred_questions.clone(),
+            permission_tier: self.permission_tier(),
         }
     }
 
@@ -2086,7 +2270,250 @@ impl Thread {
     }
 
     pub fn permission_tier(&self) -> crate::permission_tier::PermissionTier {
-        self.permission_tier
+        self.permission_tier.current()
+    }
+
+    pub(crate) fn inherit_permission_tier(
+        &mut self,
+        parent: &Entity<Thread>,
+        cx: &App,
+    ) -> Result<()> {
+        let permission_tier = parent.read(cx).permission_tier.clone();
+        anyhow::ensure!(
+            self.is_turn_complete() || Rc::ptr_eq(&self.permission_tier, &permission_tier),
+            "Cannot attach a running subagent with a different permission policy"
+        );
+        self.permission_tier = permission_tier;
+        Ok(())
+    }
+
+    pub(crate) fn has_undelivered_answers(&self) -> bool {
+        self.deferred_questions.values().any(|question| {
+            !question.withdrawn && !question.delivered && question.response.is_some()
+        })
+    }
+
+    pub(crate) fn register_deferred_question(
+        &mut self,
+        id: String,
+        tool_call_id: acp_v2::ToolCallId,
+        question: String,
+        schema: &acp_v2::ElicitationSchema,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if !self.deferred_questions.contains_key(&id) {
+            self.deferred_questions.insert(
+                id.clone(),
+                DeferredQuestion {
+                    request_id: id,
+                    tool_call_id,
+                    question,
+                    schema: serde_json::to_value(schema)?,
+                    response: None,
+                    owner: self.last_user_message_id(),
+                    delivered: false,
+                    withdrawn: false,
+                    active_entry: None,
+                },
+            );
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn deferred_question(&self, id: &str) -> Option<&DeferredQuestion> {
+        self.deferred_questions.get(id)
+    }
+
+    pub(crate) fn set_deferred_question_entry(
+        &mut self,
+        id: &str,
+        entry: acp_thread::ElicitationEntryId,
+    ) {
+        if let Some(question) = self.deferred_questions.get_mut(id) {
+            question.active_entry = Some(entry);
+        }
+    }
+
+    pub(crate) fn receive_deferred_response(
+        &mut self,
+        id: &str,
+        response: &acp_v2::CreateElicitationResponse,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let question = self
+            .deferred_questions
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Unknown deferred question {id}"))?;
+        if question.withdrawn || question.response.is_some() {
+            return Ok(());
+        }
+        question.response = Some(serde_json::to_value(response)?);
+        question.delivered = matches!(response.action, acp_v2::ElicitationAction::Cancel);
+        self.deferred_question_updates.send(()).log_err();
+        cx.emit(DeferredQuestionChanged(id.to_string()));
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn withdraw_deferred_question(
+        &mut self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let question = self
+            .deferred_questions
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Unknown deferred question {id}"))?;
+        question.withdrawn = true;
+        question.delivered = true;
+        self.deferred_question_updates.send(()).log_err();
+        cx.emit(DeferredQuestionChanged(id.to_string()));
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn goal(&self) -> Option<&ThreadGoal> {
+        self.goal.as_ref()
+    }
+
+    pub fn set_goal(&mut self, goal: ThreadGoal, cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.goal
+                .as_ref()
+                .is_none_or(|goal| goal.status == ThreadGoalStatus::Completed),
+            "The current goal is not complete"
+        );
+        self.goal = Some(goal);
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn retained_tool_results(
+        &self,
+    ) -> impl Iterator<Item = (String, &LanguageModelToolResult, &LanguageModelToolUse)> {
+        self.messages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, message)| {
+                message
+                    .as_agent_message()
+                    .into_iter()
+                    .flat_map(move |message| {
+                        message.content.iter().filter_map(move |content| {
+                            let AgentMessageContent::ToolUse(tool_use) = content else {
+                                return None;
+                            };
+                            let result = message.tool_results.get(&tool_use.id)?;
+                            Some((
+                                scoped_tool_call_id(index, &tool_use.id).to_string(),
+                                result,
+                                tool_use,
+                            ))
+                        })
+                    })
+            })
+    }
+
+    pub(crate) fn complete_goal(
+        &mut self,
+        evidence: Vec<crate::GoalCriterionEvidenceInput>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        let goal = self
+            .goal
+            .as_ref()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        anyhow::ensure!(
+            goal.status == ThreadGoalStatus::Active,
+            "Resume the goal before completing it"
+        );
+        anyhow::ensure!(
+            evidence.len() == goal.success_criteria.len(),
+            "Provide evidence for every success criterion in order"
+        );
+        let mut verified = Vec::new();
+        for criterion in evidence {
+            anyhow::ensure!(
+                !criterion.assessment.trim().is_empty() && !criterion.tool_call_ids.is_empty(),
+                "Each criterion needs an assessment and at least one completed tool source; use inspect_tool_result to find sources"
+            );
+            let mut sources = Vec::new();
+            for source_id in criterion.tool_call_ids {
+                let (_, result, tool_use) = self
+                    .retained_tool_results()
+                    .find(|(id, _, _)| id == &source_id)
+                    .ok_or_else(|| {
+                        anyhow!("Evidence source {source_id} is unavailable in retained history")
+                    })?;
+                anyhow::ensure!(
+                    !result.is_error && !result.is_content_empty(),
+                    "Evidence source {source_id} failed or has no observations"
+                );
+                anyhow::ensure!(
+                    !matches!(
+                        result.tool_name.as_ref(),
+                        "manage_goal" | "inspect_tool_result"
+                    ),
+                    "Goal bookkeeping and result retrieval cannot prove completion"
+                );
+                let digest = format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&(tool_use, result))?)
+                );
+                sources.push(crate::GoalEvidenceSource {
+                    tool_call_id: source_id,
+                    tool_name: result.tool_name.to_string(),
+                    digest,
+                });
+            }
+            verified.push(crate::GoalCriterionEvidence {
+                assessment: criterion.assessment,
+                sources,
+            });
+        }
+        let outcome = goal
+            .success_criteria
+            .iter()
+            .zip(&verified)
+            .map(|(criterion, evidence)| format!("{criterion}: {}", evidence.assessment))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let goal = self
+            .goal
+            .as_mut()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        goal.evidence = verified;
+        self.set_goal_status(ThreadGoalStatus::Completed, Some(outcome), cx)
+    }
+
+    pub fn set_goal_status(
+        &mut self,
+        status: ThreadGoalStatus,
+        outcome: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let goal = self
+            .goal
+            .as_mut()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        anyhow::ensure!(
+            goal.status != ThreadGoalStatus::Completed || status == ThreadGoalStatus::Completed,
+            "A completed goal cannot be resumed"
+        );
+        anyhow::ensure!(
+            status != ThreadGoalStatus::Completed
+                || (goal.evidence.len() == goal.success_criteria.len()
+                    && goal.evidence.iter().all(|evidence| {
+                        !evidence.assessment.trim().is_empty() && !evidence.sources.is_empty()
+                    })),
+            "Complete the criterion evidence audit before marking the goal complete"
+        );
+        goal.status = status;
+        goal.outcome = outcome;
+        cx.notify();
+        Ok(())
     }
 
     pub fn set_permission_tier(
@@ -2094,7 +2521,7 @@ impl Thread {
         tier: crate::permission_tier::PermissionTier,
         cx: &mut Context<Self>,
     ) {
-        self.permission_tier = tier;
+        self.permission_tier.set(tier);
         cx.notify();
     }
 
@@ -2285,7 +2712,9 @@ impl Thread {
         ));
         self.add_tool(WebSearchTool);
 
-        self.add_tool(AskUserTool);
+        self.add_tool(AskUserTool::default());
+        self.add_tool(GoalTool::new(cx.weak_entity()));
+        self.add_tool(crate::InspectToolResultTool::new(cx.weak_entity()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -2527,6 +2956,25 @@ impl Thread {
                 Message::Agent(_) | Message::Resume | Message::Compaction(_) => {}
             }
         }
+        let retained_users = self
+            .messages
+            .iter()
+            .filter_map(|message| match message.as_ref() {
+                Message::User(user) => Some(user.id.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for question in self.deferred_questions.values_mut() {
+            if question
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !retained_users.contains(owner))
+            {
+                question.withdrawn = true;
+                question.delivered = true;
+            }
+        }
+        self.deferred_question_updates.send(()).log_err();
         self.clear_summary();
         cx.notify();
         Ok(())
@@ -2958,6 +3406,8 @@ impl Thread {
     ) -> Result<()> {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
+        let mut last_goal_response: Option<String> = None;
+        let mut repeated_goal_responses = 0;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
         loop {
@@ -3062,6 +3512,14 @@ impl Thread {
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
+                for question in this
+                    .deferred_questions
+                    .values_mut()
+                    .filter(|question| question.response.is_some())
+                {
+                    question.delivered = true;
+                }
+                cx.notify();
                 this.current_request_token_usage = TokenUsage::default();
                 this.request_started_at = Some(Instant::now());
                 this.first_token_at = None;
@@ -3336,8 +3794,70 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
-                return Ok(());
+                let response = this.read_with(cx, |this, _| match this.last_message() {
+                    Some(Message::Agent(message)) => message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            AgentMessageContent::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    _ => String::new(),
+                })?;
+                if last_goal_response.as_deref() == Some(response.trim()) {
+                    repeated_goal_responses += 1;
+                } else {
+                    last_goal_response = Some(response.trim().to_string());
+                    repeated_goal_responses = 1;
+                }
+                let mut paused_for_repeat = false;
+                let continued = this.update(cx, |this, cx| {
+                    if this.end_turn_at_next_boundary
+                        || !this
+                            .goal
+                            .as_ref()
+                            .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
+                    {
+                        return false;
+                    }
+                    if repeated_goal_responses >= 3 {
+                        paused_for_repeat = true;
+                        if let Some(goal) = this.goal.as_mut() {
+                            goal.status = ThreadGoalStatus::Paused;
+                            goal.outcome = Some("Paused after three identical responses without tool activity; review and resume if appropriate".into());
+                        }
+                        cx.notify();
+                        return false;
+                    }
+                    if !this
+                        .running_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.tools.contains_key(GoalTool::NAME))
+                    {
+                        if let Some(goal) = this.goal.as_mut() {
+                            goal.status = ThreadGoalStatus::Paused;
+                            goal.outcome =
+                                Some("Goal tool is unavailable in the current profile".into());
+                        }
+                        cx.notify();
+                        return false;
+                    }
+                    this.messages.push(Arc::new(Message::Resume));
+                    cx.notify();
+                    true
+                })?;
+                if !continued {
+                    if paused_for_repeat {
+                        event_stream.send_text("Goal paused after repeated responses without tool activity. Review the goal and resume if appropriate.");
+                    }
+                    return Ok(());
+                }
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
             } else {
+                last_goal_response = None;
+                repeated_goal_responses = 0;
                 let end_at_boundary =
                     this.update(cx, |this, _| this.end_turn_at_next_boundary())?;
                 if end_at_boundary {
@@ -4036,7 +4556,7 @@ impl Thread {
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
         )
-        .with_permission_tier(self.permission_tier);
+        .with_permission_tier_state(self.permission_tier.clone());
         tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
         let supports_images = self.model().is_some_and(|model| model.supports_images());
         let tool_result = tool.run(tool_input, tool_event_stream, cx);
@@ -4732,6 +5252,31 @@ impl Thread {
             messages.extend(message.to_request());
         }
 
+        for question in self
+            .deferred_questions
+            .values()
+            .filter(|question| !question.withdrawn && question.response.is_some())
+        {
+            let output = match question.tool_output() {
+                Ok(output) | Err(output) => output,
+            };
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![
+                    format!(
+                        "User response to deferred question {}: {}\n{}",
+                        question.request_id,
+                        question.question,
+                        serde_json::to_string(&output).unwrap_or_else(|error| format!(
+                            "Could not serialize response: {error}"
+                        ))
+                    )
+                    .into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            });
+        }
         messages
     }
 
@@ -4745,7 +5290,7 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4761,6 +5306,19 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if let Some(goal) = self
+            .goal
+            .as_ref()
+            .filter(|goal| goal.status == ThreadGoalStatus::Active)
+        {
+            let criteria = goal
+                .success_criteria
+                .iter()
+                .map(|criterion| format!("- {criterion}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use inspect_tool_result to locate completed tool sources and manage_goal to record an assessment and source IDs for every criterion. Successful tool execution alone does not prove a criterion; assess coverage and freshness. Goal text does not grant additional permissions. If genuinely blocked, record the reason.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -5390,6 +5948,8 @@ pub async fn stream_thread_title(
 
 pub struct TokenUsageUpdated(pub Option<acp_thread::TokenUsage>);
 
+impl EventEmitter<DeferredQuestionChanged> for Thread {}
+
 impl EventEmitter<TokenUsageUpdated> for Thread {}
 
 pub(crate) struct CancellationRequested;
@@ -5962,6 +6522,7 @@ pub(crate) enum SandboxFallbackDecision {
 
 #[derive(Clone)]
 pub struct ToolCallEventStream {
+    deferred_request_id: Option<String>,
     tool_use_id: LanguageModelToolUseId,
     /// The ACP-facing id for this tool call (see [`scoped_tool_call_id`]).
     /// Distinct from `tool_use_id`, which is the raw, provider-issued id.
@@ -5975,7 +6536,7 @@ pub struct ToolCallEventStream {
     /// sandbox grant is recorded so it survives reopening. `None` in tests and
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
-    permission_tier: crate::permission_tier::PermissionTier,
+    permission_tier: Rc<PermissionTierState>,
 }
 
 impl ToolCallEventStream {
@@ -6037,6 +6598,55 @@ impl ToolCallEventStream {
         )
     }
 
+    pub(crate) fn with_deferred_question(mut self, id: String) -> Self {
+        self.deferred_request_id = Some(id);
+        self
+    }
+
+    pub(crate) fn deferred_answer(
+        &self,
+        id: String,
+        wait: bool,
+        withdraw: bool,
+        cx: &mut App,
+    ) -> Option<Task<Result<crate::AskUserToolOutput, crate::AskUserToolOutput>>> {
+        let thread = self.thread.as_ref()?.clone();
+        let exists = thread
+            .read_with(cx, |thread, _| thread.deferred_question(&id).is_some())
+            .ok()?;
+        if !exists {
+            return None;
+        }
+        Some(cx.spawn(async move |cx| {
+            let error = |error: anyhow::Error| crate::AskUserToolOutput::Error {
+                error: error.to_string(),
+            };
+            if withdraw {
+                thread
+                    .update(cx, |thread, cx| thread.withdraw_deferred_question(&id, cx))
+                    .map_err(error)?
+                    .map_err(error)?;
+                return Ok(crate::AskUserToolOutput::Withdrawn { request_id: id });
+            }
+            let mut updates = thread
+                .read_with(cx, |thread, _| thread.deferred_question_updates.receiver())
+                .map_err(error)?;
+            loop {
+                let question = thread
+                    .read_with(cx, |thread, _| thread.deferred_question(&id).cloned())
+                    .map_err(error)?
+                    .ok_or_else(|| error(anyhow!("Question {id} is no longer available")))?;
+                if !wait || question.response.is_some() || question.withdrawn {
+                    return question.tool_output();
+                }
+                updates
+                    .changed()
+                    .await
+                    .map_err(|failure| error(anyhow!(failure)))?;
+            }
+        }))
+    }
+
     /// Signal cancellation for this event stream. Only available in tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn signal_cancellation_with_sender(cancellation_tx: &mut watch::Sender<bool>) {
@@ -6053,6 +6663,7 @@ impl ToolCallEventStream {
         thread: Option<WeakEntity<Thread>>,
     ) -> Self {
         Self {
+            deferred_request_id: None,
             tool_use_id,
             tool_call_id,
             stream,
@@ -6060,16 +6671,33 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             thread,
-            permission_tier: Default::default(),
+            permission_tier: Rc::new(PermissionTierState::new(Default::default())),
         }
     }
 
-    fn with_permission_tier(
+    #[cfg(test)]
+    pub(crate) fn with_permission_tier(
         mut self,
         permission_tier: crate::permission_tier::PermissionTier,
     ) -> Self {
+        self.permission_tier = Rc::new(PermissionTierState::new(permission_tier));
+        self
+    }
+
+    fn with_permission_tier_state(mut self, permission_tier: Rc<PermissionTierState>) -> Self {
         self.permission_tier = permission_tier;
         self
+    }
+
+    pub(crate) fn apply_permission_tier(
+        &self,
+        decision: ToolPermissionDecision,
+    ) -> ToolPermissionDecision {
+        self.permission_tier.current().apply(decision)
+    }
+
+    pub(crate) fn requires_confirmation_for_actions(&self) -> bool {
+        self.permission_tier.current() == crate::permission_tier::PermissionTier::ReadOnly
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -6198,10 +6826,13 @@ impl ToolCallEventStream {
         // MCP tools are gated only by tool id (no per-input pattern
         // matching), so we pass a single empty input value just to satisfy
         // `decide_permission_from_settings`' signature.
+        let permission_tier = self.permission_tier.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
                 let settings = agent_settings::AgentSettings::get_global(cx);
-                decide_permission_from_settings(&tool_id, &[String::new()], settings)
+                let decision =
+                    decide_permission_from_settings(&tool_id, &[String::new()], settings);
+                permission_tier.current().apply(decision)
             });
 
         self.run_authorization_loop(title, options, None, Some(check_settings), cx)
@@ -6230,33 +6861,20 @@ impl ToolCallEventStream {
         context: ToolPermissionContext,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        use crate::permission_tier::PermissionTier;
-
-        if self.permission_tier == PermissionTier::FullAccess {
-            return Task::ready(Ok(()));
-        }
-        if self.permission_tier == PermissionTier::Assisted
-            && PermissionTier::assisted_auto_approve(&context.tool_name, &context.input_values)
-        {
-            return Task::ready(Ok(()));
-        }
-
         let title = title.into();
         let options = context.build_permission_options();
 
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
-        let read_only = self.permission_tier == PermissionTier::ReadOnly;
+        let permission_tier = self.permission_tier.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                match decide_permission_from_settings(
+                let decision = decide_permission_from_settings(
                     &tool_name,
                     &input_values,
                     agent_settings::AgentSettings::get_global(cx),
-                ) {
-                    ToolPermissionDecision::Allow if read_only => ToolPermissionDecision::Confirm,
-                    decision => decision,
-                }
+                );
+                permission_tier.current().apply(decision)
             });
 
         self.run_authorization_loop(title, options, Some(context), Some(check_settings), cx)
@@ -6273,7 +6891,7 @@ impl ToolCallEventStream {
         context: ToolPermissionContext,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        if self.permission_tier == crate::permission_tier::PermissionTier::FullAccess {
+        if self.permission_tier.current() == crate::permission_tier::PermissionTier::FullAccess {
             return Task::ready(Ok(()));
         }
         let title = title.into();
@@ -6295,10 +6913,12 @@ impl ToolCallEventStream {
         reason: String,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        if self.permission_tier == crate::permission_tier::PermissionTier::FullAccess {
+        if self.permission_tier.current() == crate::permission_tier::PermissionTier::FullAccess {
             return Task::ready(Ok(()));
         }
-        if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
+        if !self.requires_confirmation_for_actions()
+            && Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx)
+        {
             return Task::ready(Ok(()));
         }
 
@@ -6358,6 +6978,7 @@ impl ToolCallEventStream {
         let tool_call_id = self.tool_call_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
+        let permission_tier = self.permission_tier.clone();
         let auto_allow_outcome = match auto_resolve_permission_outcome(&options, true) {
             Ok(outcome) => outcome,
             Err(error) => return Task::ready(Err(error)),
@@ -6386,6 +7007,7 @@ impl ToolCallEventStream {
             }
 
             let (mut settings_tx, mut settings_rx) = watch::channel(());
+            let mut tier_rx = permission_tier.receiver.clone();
             let _settings_subscription = cx.update(|cx| {
                 cx.observe_global::<SettingsStore>(move |_cx| {
                     settings_tx.send(()).ok();
@@ -6394,8 +7016,9 @@ impl ToolCallEventStream {
 
             loop {
                 let settings_changed = async {
-                    if settings_rx.changed().await.is_err() {
-                        std::future::pending::<()>().await;
+                    futures::select! {
+                        _ = settings_rx.changed().fuse() => {},
+                        _ = tier_rx.changed().fuse() => {},
                     }
                 };
                 futures::select_biased! {
@@ -6412,11 +7035,14 @@ impl ToolCallEventStream {
                         );
                     }
                     _ = settings_changed.fuse() => {
-                        if cx.update(|cx| Self::sandbox_request_covered_by_grants(
-                            &request,
-                            &sandbox_grants,
-                            cx,
-                        )) {
+                        let tier = permission_tier.current();
+                        if tier == crate::permission_tier::PermissionTier::FullAccess
+                            || (tier != crate::permission_tier::PermissionTier::ReadOnly
+                                && cx.update(|cx| Self::sandbox_request_covered_by_grants(
+                                    &request,
+                                    &sandbox_grants,
+                                    cx,
+                                ))) {
                             drop(response_rx);
                             stream.resolve_tool_call_authorization(
                                 &tool_call_id,
@@ -6888,24 +7514,21 @@ impl ToolCallEventStream {
         schema: acp_v2::ElicitationSchema,
         cx: &mut App,
     ) -> Task<Result<acp_v2::CreateElicitationResponse>> {
-        let stream = self.stream.clone();
-        let tool_call_id = self.tool_call_id.clone();
+        let (response_tx, response_rx) = oneshot::channel();
+        if let Err(error) = self
+            .stream
+            .sender
+            .unbounded_send(Ok(ThreadEvent::Elicitation(ElicitationRequest {
+                deferred_request_id: self.deferred_request_id.clone(),
+                tool_call_id: self.tool_call_id.clone(),
+                message,
+                schema,
+                response: response_tx,
+            })))
+        {
+            return Task::ready(Err(anyhow!("Failed to send elicitation request: {error}")));
+        }
         cx.spawn(async move |_cx| {
-            let (response_tx, response_rx) = oneshot::channel();
-            if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::Elicitation(ElicitationRequest {
-                        tool_call_id,
-                        message,
-                        schema,
-                        response: response_tx,
-                    })))
-            {
-                log::error!("Failed to send elicitation request: {error}");
-                return Err(anyhow!("Failed to send elicitation request: {error}"));
-            }
-
             response_rx
                 .await
                 .map_err(|_| anyhow!("elicitation channel closed"))
@@ -6946,6 +7569,7 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
+        let mut tier_rx = self.permission_tier.receiver.clone();
         let auto_resolution_outcomes = if check_settings.is_some() {
             match (
                 auto_resolve_permission_outcome(&options, true),
@@ -7003,14 +7627,18 @@ impl ToolCallEventStream {
             // same prompt.
             loop {
                 let settings_changed = async {
-                    if settings_rx.changed().await.is_err() {
-                        std::future::pending::<()>().await;
+                    futures::select! {
+                        _ = settings_rx.changed().fuse() => {},
+                        _ = tier_rx.changed().fuse() => {},
                     }
                 };
                 futures::select_biased! {
                     outcome = (&mut response_rx).fuse() => {
                         let outcome = outcome.map_err(|_| anyhow!("authorization channel closed"))?;
                         ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                        if let ToolPermissionDecision::Deny(reason) = cx.update(|cx| check_settings(cx)) {
+                            return Err(anyhow!(reason));
+                        }
                         return Self::persist_permission_outcome(&outcome, fs.clone(), cx);
                     }
                     _ = settings_changed.fuse() => {
@@ -9015,6 +9643,288 @@ mod tests {
             }
             subagents
         })
+    }
+
+    #[gpui::test]
+    async fn test_permission_tier_changes_apply_to_pending_and_new_authorizations(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
+        let (stream, mut events) = ToolCallEventStream::test();
+        let stream = stream.with_permission_tier_state(
+            thread.read_with(cx, |thread, _| thread.permission_tier.clone()),
+        );
+        let context = ToolPermissionContext::new("terminal", vec!["pwd".into()]);
+        let pending = cx.update(|cx| stream.authorize("Run pwd", context.clone(), cx));
+        let _request = events.expect_authorization().await;
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::FullAccess, cx)
+        });
+        assert!(pending.await.is_ok());
+        events.expect_authorization_resolved().await;
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx)
+        });
+        let pending = cx.update(|cx| stream.authorize("Run pwd", context, cx));
+        let request = events.expect_authorization().await;
+        request
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("deny"),
+                acp_v2::PermissionOptionKind::RejectOnce,
+            ))
+            .expect("request is pending");
+        assert!(pending.await.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_pending_authorization_respects_new_denial(cx: &mut TestAppContext) {
+        let (_thread, _, _) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
+        let (stream, mut events) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            stream.authorize(
+                "Run pwd",
+                ToolPermissionContext::new("terminal", vec!["pwd".into()]),
+                cx,
+            )
+        });
+        let request = events.expect_authorization().await;
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Deny;
+            AgentSettings::override_global(settings, cx);
+        });
+        request
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("request is pending");
+        assert!(task.await.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_subagents_follow_parent_permission_tier(cx: &mut TestAppContext) {
+        let (parent, _, _) = setup_thread_for_test(cx).await;
+        parent.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx)
+        });
+        let children = setup_parent_with_subagents(cx, &parent, 1);
+        let child = children.first().expect("subagent");
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.permission_tier()),
+            crate::permission_tier::PermissionTier::ReadOnly
+        );
+        parent.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::FullAccess, cx)
+        });
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.permission_tier()),
+            crate::permission_tier::PermissionTier::FullAccess
+        );
+    }
+
+    #[gpui::test]
+    async fn test_permission_tier_is_saved_with_thread(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx)
+        });
+        let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let serialized = serde_json::to_vec(&saved).expect("serialize thread");
+        let restored: DbThread = serde_json::from_slice(&serialized).expect("restore thread");
+        assert_eq!(
+            restored.permission_tier,
+            crate::permission_tier::PermissionTier::ReadOnly
+        );
+        let mut legacy = serde_json::to_value(&saved).expect("serialize thread");
+        legacy
+            .as_object_mut()
+            .expect("thread object")
+            .remove("permission_tier");
+        let restored: DbThread = serde_json::from_value(legacy).expect("restore old thread");
+        assert_eq!(
+            restored.permission_tier,
+            crate::permission_tier::PermissionTier::Assisted
+        );
+    }
+
+    #[gpui::test]
+    async fn goal_completion_requires_real_successful_observations(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            let mut goal = ThreadGoal::new(
+                "Inspect the project".into(),
+                vec!["Source inspected".into()],
+            )
+            .expect("goal");
+            goal.verification_surfaces = vec!["read_file result".into()];
+            goal.constraints = vec!["Preserve user edits".into()];
+            thread.set_goal(goal, cx).expect("set goal");
+            for (name, is_error, text) in [
+                ("read_file", true, "failed"),
+                ("manage_goal", false, "active"),
+                ("read_file", false, ""),
+                ("read_file", false, "file contents"),
+            ] {
+                let tool_use = LanguageModelToolUse {
+                    id: "reused-provider-id".into(),
+                    name: name.into(),
+                    raw_input: "{}".into(),
+                    input: language_model::LanguageModelToolUseInput::Json(serde_json::json!({})),
+                    is_input_complete: true,
+                    thought_signature: None,
+                };
+                let result = LanguageModelToolResult {
+                    tool_use_id: tool_use.id.clone(),
+                    tool_name: tool_use.name.clone(),
+                    is_error,
+                    content: vec![text.into()],
+                    output: None,
+                };
+                thread.messages.push(Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::ToolUse(tool_use)],
+                    tool_results: IndexMap::from_iter([(result.tool_use_id.clone(), result)]),
+                    ..Default::default()
+                })));
+            }
+            let sources = thread
+                .retained_tool_results()
+                .map(|(id, _, _)| id)
+                .collect::<Vec<_>>();
+            for id in
+                std::iter::once("missing-source".to_string()).chain(sources.iter().take(3).cloned())
+            {
+                assert!(
+                    thread
+                        .complete_goal(
+                            vec![crate::GoalCriterionEvidenceInput {
+                                assessment: "Claimed complete".into(),
+                                tool_call_ids: vec![id],
+                            }],
+                            cx
+                        )
+                        .is_err()
+                );
+                assert_eq!(
+                    thread.goal().expect("goal").status,
+                    ThreadGoalStatus::Active
+                );
+            }
+            let source = sources.last().expect("successful source").clone();
+            thread
+                .complete_goal(
+                    vec![crate::GoalCriterionEvidenceInput {
+                        assessment: "File contents directly inspected".into(),
+                        tool_call_ids: vec![source.clone()],
+                    }],
+                    cx,
+                )
+                .expect("complete with observations");
+            let goal = thread.goal().expect("goal");
+            assert_eq!(
+                goal.evidence
+                    .first()
+                    .expect("criterion")
+                    .sources
+                    .first()
+                    .expect("source")
+                    .tool_call_id,
+                source
+            );
+            assert_eq!(
+                goal.evidence
+                    .first()
+                    .expect("criterion")
+                    .sources
+                    .first()
+                    .expect("source")
+                    .digest
+                    .len(),
+                64
+            );
+        });
+        let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let restored: DbThread =
+            serde_json::from_slice(&serde_json::to_vec(&saved).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(restored.goal, saved.goal);
+    }
+
+    #[gpui::test]
+    async fn test_restore_active_goal_pauses_and_preserves_permissions(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .set_goal(
+                    ThreadGoal::new("Finish the task".into(), vec!["Tests pass".into()])
+                        .expect("goal"),
+                    cx,
+                )
+                .expect("set goal");
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx);
+        });
+        let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let (id, project, project_context, registry, templates) =
+            thread.read_with(cx, |thread, _| {
+                (
+                    thread.id.clone(),
+                    thread.project.clone(),
+                    thread.project_context.clone(),
+                    thread.context_server_registry.clone(),
+                    thread.templates.clone(),
+                )
+            });
+        let restored = cx.new(|cx| {
+            Thread::from_db(id, saved, project, project_context, registry, templates, cx)
+        });
+        restored.read_with(cx, |thread, _| {
+            let goal = thread.goal().expect("restored goal");
+            assert_eq!(goal.status, ThreadGoalStatus::Paused);
+            assert_eq!(goal.objective, "Finish the task");
+            assert_eq!(goal.success_criteria, ["Tests pass"]);
+            assert_eq!(
+                thread.permission_tier(),
+                crate::permission_tier::PermissionTier::ReadOnly
+            );
+            assert!(thread.is_turn_complete());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_confirm_tier_rechecks_existing_sandbox_grants(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        let (stream, mut events) = ToolCallEventStream::test();
+        let stream = stream.with_permission_tier_state(
+            thread.read_with(cx, |thread, _| thread.permission_tier.clone()),
+        );
+        let request = SandboxRequest {
+            network: crate::sandboxing::NetworkRequest::AnyHost,
+            ..Default::default()
+        };
+        stream.sandbox_grants.borrow_mut().record(&request);
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx)
+        });
+        let pending =
+            cx.update(|cx| stream.authorize_sandbox(request, "Network access".into(), cx));
+        let _request = events.expect_authorization().await;
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::FullAccess, cx)
+        });
+        assert!(pending.await.is_ok());
+        events.expect_authorization_resolved().await;
     }
 
     struct ReplayImageTool;
