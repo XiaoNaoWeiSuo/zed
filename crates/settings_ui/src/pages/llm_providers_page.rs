@@ -622,61 +622,102 @@ async fn fetch_models_from_api(
     if api_key.trim().is_empty() {
         anyhow::bail!("Enter an API key first.");
     }
-    let url = format!("{}/models", api_url.trim_end_matches('/'));
-    let mut request = Request::builder().method(Method::GET).uri(&url);
-    request = match kind {
-        CompatibleProviderKind::OpenAi => {
-            request.header("Authorization", format!("Bearer {api_key}"))
-        }
-        CompatibleProviderKind::Anthropic => request
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01"),
-    };
-    let mut response = http_client
-        .send(request.body(AsyncBody::empty())?)
-        .await
-        .map_err(|error| anyhow::anyhow!("requesting {url}: {error}"))?;
-    if !response.status().is_success() {
-        anyhow::bail!("{url} returned {}", response.status());
-    }
-    let mut body = String::new();
-    response
-        .body_mut()
-        .read_to_string(&mut body)
-        .await
-        .map_err(|error| anyhow::anyhow!("reading {url}: {error}"))?;
-    let value: serde_json::Value = serde_json::from_str(&body)?;
-    let entries = value
-        .get("data")
-        .and_then(|data| data.as_array())
-        .or_else(|| value.get("models").and_then(|models| models.as_array()))
-        .or_else(|| value.as_array())
-        .ok_or_else(|| anyhow::anyhow!("response did not contain a model list"))?;
-    let mut names = Vec::new();
-    for entry in entries {
-        let name = entry
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| {
-                entry
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                entry
-                    .get("name")
-                    .and_then(|name| name.as_str())
-                    .map(str::to_string)
-            });
-        if let Some(name) = name
-            && !names.contains(&name)
-        {
-            names.push(name);
+
+    let base = api_url.trim().trim_end_matches('/');
+    let base = base
+        .strip_suffix("/responses")
+        .or_else(|| base.strip_suffix("/chat/completions"))
+        .unwrap_or(base);
+    let mut candidates = Vec::new();
+    if base.ends_with("/models") {
+        candidates.push(base.to_string());
+    } else {
+        candidates.push(format!("{base}/models"));
+        if !base.ends_with("/v1") {
+            candidates.push(format!("{base}/v1/models"));
         }
     }
-    names.sort();
-    Ok(names)
+    candidates.dedup();
+
+    let mut errors = Vec::new();
+    for url in candidates {
+        let mut request = Request::builder().method(Method::GET).uri(&url);
+        request = match kind {
+            CompatibleProviderKind::OpenAi => {
+                request.header("Authorization", format!("Bearer {api_key}"))
+            }
+            CompatibleProviderKind::Anthropic => request
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01"),
+        };
+        let mut response = match http_client.send(request.body(AsyncBody::empty())?).await {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("requesting {url}: {error}"));
+                continue;
+            }
+        };
+        let status = response.status();
+        let mut body = String::new();
+        response
+            .body_mut()
+            .read_to_string(&mut body)
+            .await
+            .map_err(|error| anyhow::anyhow!("reading {url}: {error}"))?;
+        if !status.is_success() {
+            errors.push(format!(
+                "{url} returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            ));
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("{url} returned invalid JSON: {error}"));
+                continue;
+            }
+        };
+        let entries = value
+            .get("data")
+            .and_then(|data| data.as_array())
+            .or_else(|| value.get("models").and_then(|models| models.as_array()))
+            .or_else(|| value.as_array());
+        let Some(entries) = entries else {
+            errors.push(format!("{url} did not contain a model list"));
+            continue;
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let name = entry
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    entry
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .map(str::to_string)
+                });
+            if let Some(name) = name
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        if !names.is_empty() {
+            return Ok(names);
+        }
+        errors.push(format!("{url} returned an empty model list"));
+    }
+
+    anyhow::bail!("{}", errors.join("\n"))
 }
 
 pub(crate) struct LlmProviderForm {
