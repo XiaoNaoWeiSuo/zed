@@ -149,12 +149,16 @@ impl AgentUsageIndicator {
         let ring = canvas(
             move |bounds, _, cx| {
                 let width = f32::from(bounds.size.width);
-                let stroke_width = if ring_hovered { 2.8 } else { 2.0 };
+                let base_stroke_width = 2.0;
+                let stroke_width = if ring_hovered { 2.8 } else { base_stroke_width };
                 let center = point(
                     bounds.origin.x + px(width / 2.0),
                     bounds.origin.y + px(width / 2.0),
                 );
-                let radius = (width - stroke_width) / 2.0;
+                // Leave room for the hover growth so the ring expands outward,
+                // keeping its inner edge fixed.
+                let base_radius = (width - 4.0) / 2.0;
+                let radius = base_radius + (stroke_width - base_stroke_width) / 2.0;
                 let track = arc_path(center, radius, stroke_width, 0.0, 360.0);
                 let progress = arc_path(
                     center,
@@ -208,15 +212,21 @@ impl AgentUsageIndicator {
                         bounds.origin.y + px(width / 2.0),
                     );
                     let radius = width / 2.0;
+                    let background = pie_path(center, radius, 0.0, 360.0);
                     let path = pie_path(center, radius, -90.0, 360.0 * five_hour_remaining);
                     (
+                        background,
                         path,
+                        cx.theme().colors().border.opacity(0.45),
                         five_hour_color
                             .color(cx)
                             .opacity(if pie_hovered { 1.0 } else { 0.75 }),
                     )
                 },
-                |_bounds, (path, color), window, _| {
+                |_bounds, (background, path, background_color, color), window, _| {
+                    if let Some(background) = background {
+                        window.paint_path(background, background_color);
+                    }
                     if let Some(path) = path {
                         window.paint_path(path, color);
                     }
