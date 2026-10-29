@@ -625,6 +625,11 @@ impl SettingsWindow {
         let kind = form.kind;
         let api_url = form.api_url.read(cx).text(cx);
         let api_key = form.api_key.read(cx).text(cx);
+        if let Some(form) = self.llm_provider_form.as_mut() {
+            form.fetching_models = true;
+            form.error = None;
+        }
+        cx.notify();
         let http_client = cx.http_client();
         cx.spawn_in(window, async move |this, cx| {
             let result = fetch_models_from_api(http_client, kind, api_url, api_key).await;
@@ -632,6 +637,7 @@ impl SettingsWindow {
                 let Some(form) = this.llm_provider_form.as_mut() else {
                     return;
                 };
+                form.fetching_models = false;
                 match result {
                     Ok(names) if !names.is_empty() => {
                         form.models = names
@@ -771,6 +777,7 @@ pub(crate) struct LlmProviderForm {
     api_url: Entity<Editor>,
     api_key: Entity<Editor>,
     models: Vec<ModelInput>,
+    fetching_models: bool,
     error: Option<SharedString>,
 }
 
@@ -792,6 +799,7 @@ impl LlmProviderForm {
                 cx,
             ),
             models: vec![ModelInput::new(0, window, cx)],
+            fetching_models: false,
             error: None,
         }
     }
@@ -1014,6 +1022,7 @@ fn render_models_section(
                         .gap_1()
                         .child(
                             Button::new("fetch-models", "Fetch Models")
+                                .loading(form.fetching_models)
                                 .start_icon(
                                     Icon::new(IconName::ArrowCircle)
                                         .size(IconSize::XSmall)
