@@ -10812,7 +10812,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_compact_group_includes_tool_preamble_but_preserves_final_and_failures(
+    async fn test_compact_group_requires_explicit_activity_and_preserves_visible_messages(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -10821,10 +10821,19 @@ pub(crate) mod tests {
         add_to_workspace_with_size(conversation.clone(), true, cx);
         let view = active_thread(&conversation, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_assistant_message(
+                    acp_v2::AgentMessage::new("activity")
+                        .content(vec!["Checking the project?".into()])
+                        .meta(acp_thread::meta_with_message_purpose(
+                            acp_thread::AssistantMessagePurpose::Activity,
+                        )),
+                    cx,
+                )
+            })
+            .expect("explicit activity");
         for update in [
-            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
-                "Checking the project.".into(),
-            )),
             acp_v1::SessionUpdate::ToolCall(
                 acp_v1::ToolCall::new("read", "Read").status(acp_v1::ToolCallStatus::Completed),
             ),
@@ -10842,7 +10851,7 @@ pub(crate) mod tests {
                     .status(acp_v1::ToolCallStatus::Failed),
             ),
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
-                "Which option do you prefer?".into(),
+                "请告诉我需要哪一个方案".into(),
             )),
             acp_v1::SessionUpdate::ToolCall(
                 acp_v1::ToolCall::new("inspect", "Inspect")
@@ -10887,6 +10896,83 @@ pub(crate) mod tests {
                 None
             );
         });
+    }
+
+    #[gpui::test]
+    async fn explicit_activity_expands_without_hiding_progress(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation.clone(), true, cx);
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_assistant_message(
+                    acp_v2::AgentMessage::new("activity")
+                        .content(vec!["Command details\n\n".repeat(15).into()])
+                        .meta(acp_thread::meta_with_message_purpose(
+                            acp_thread::AssistantMessagePurpose::Activity,
+                        )),
+                    cx,
+                )
+                .expect("activity");
+            thread
+                .upsert_assistant_message(
+                    acp_v2::AgentMessage::new("progress")
+                        .content(vec!["A finding the user needs to see".into()])
+                        .meta(acp_thread::meta_with_message_purpose(
+                            acp_thread::AssistantMessagePurpose::Progress,
+                        )),
+                    cx,
+                )
+                .expect("progress");
+        });
+        cx.run_until_parked();
+        let index = thread.read_with(cx, |thread, cx| {
+            let index = thread
+                .entries()
+                .iter()
+                .position(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+                .expect("message");
+            assert_eq!(
+                ThreadView::completed_tool_group(thread.entries(), index, cx),
+                None
+            );
+            assert_eq!(
+                thread
+                    .entries()
+                    .get(index)
+                    .and_then(AgentThreadEntry::purpose),
+                Some(acp_thread::AssistantMessagePurpose::Progress)
+            );
+            index
+        });
+        let selector: &'static str =
+            Box::leak(format!("activity-block-{index}-0").into_boxed_str());
+        let collapsed = cx.debug_bounds(selector).expect("collapsed activity");
+        cx.simulate_click(
+            point(collapsed.origin.x + px(35.), collapsed.origin.y + px(10.)),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.entry_view_state
+                    .read(cx)
+                    .is_activity_expanded((index, 0))
+            )
+        });
+        let expanded = cx.debug_bounds(selector).expect("expanded activity");
+        assert!(expanded.size.height > collapsed.size.height);
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "search exposes all activity text"
+        );
     }
 
     #[gpui::test]

@@ -115,6 +115,11 @@ pub fn init(_user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
         );
     });
 
+    let initial_disabled = disabled_models_from_settings(cx);
+    registry.update(cx, |registry, cx| {
+        registry.set_disabled_models(initial_disabled, cx);
+    });
+
     let registry = registry.downgrade();
     cx.observe_global::<SettingsStore>(move |cx| {
         let Some(registry) = registry.upgrade() else {
@@ -134,8 +139,32 @@ pub fn init(_user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
             });
             compatible_providers = compatible_providers_new;
         }
+        let disabled_models = disabled_models_from_settings(cx);
+        registry.update(cx, |registry, cx| {
+            registry.set_disabled_models(disabled_models, cx);
+        });
     })
     .detach();
+}
+
+fn disabled_models_from_settings(
+    cx: &App,
+) -> collections::HashSet<(
+    language_model::LanguageModelProviderId,
+    language_model::LanguageModelId,
+)> {
+    AllLanguageModelSettings::get_global(cx)
+        .disabled_models
+        .iter()
+        .flat_map(|(provider, models)| {
+            models.iter().map(move |model| {
+                (
+                    language_model::LanguageModelProviderId::from(provider.clone()),
+                    language_model::LanguageModelId::from(model.clone()),
+                )
+            })
+        })
+        .collect()
 }
 
 fn ai_disabled(cx: &App) -> bool {

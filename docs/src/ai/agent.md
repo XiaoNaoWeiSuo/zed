@@ -49,3 +49,17 @@ Before completing a goal, Agent must assess every criterion and cite completed t
 The `inspect_tool_result` tool lists retained calls and retrieves their input and output in bounded pages, so Agent can reuse observations without rerunning commands. Both tools must be enabled in the selected profile; the default Write and Ask profiles enable them.
 
 Source validation establishes that an observation exists. Agent still has to check whether it covers the criterion and remains relevant to the current project. A successful command or an output fingerprint alone does not prove correctness or detect later workspace changes.
+
+
+## Questions during a run {#questions-during-a-run}
+
+Agent can use `ask_user` to collect a batch of single-choice, multiple-choice, and text answers. A deferred question leaves the form open while Agent continues independent work. The reply is added once to the conversation at the next model boundary; if Agent has become idle, a reply can resume it without another prompt. A reply does not interrupt a running request or take priority over a new user message. Stopping a run cancels its outstanding forms and prevents an automatic restart.
+
+Deferred forms and their replies are saved with native sessions. Pending forms are recreated when a thread is reopened. Answers retain their place before later user instructions and remain available after context summarization. Agent can retrieve or wait for a saved answer using its request ID, or withdraw an obsolete question with `request_id` and `withdraw: true`. Withdrawal wakes waiters and removes the previous answer from future request history. Rewinding past a question's owning prompt invalidates it and ignores late replies.
+
+
+## Conversation detail {#conversation-detail}
+
+The `agent.message_detail` setting and the conversation's Compact/Detailed selector control activity disclosure. Compact groups completed tool calls and explicitly marked activity; failures and pending user decisions stay visible. Individual activity blocks can be expanded, and search exposes their full text. Detailed shows activity directly.
+
+Message purposes are structural metadata rather than guesses from punctuation or wording. ACP messages can set `meta.message_purpose` to `progress`, `response`, `activity`, `decision`, or `error`. Unknown or absent values default to a visible response. Native OpenAI Responses messages preserve `commentary` as progress and `final_answer` as a response, including across saving and replay. Providers without message-stage information retain visible text. Thinking content remains separate from user-facing progress.

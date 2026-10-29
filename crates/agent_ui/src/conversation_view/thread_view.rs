@@ -628,6 +628,7 @@ pub struct ThreadView {
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
+    external_first_chunk_at: Option<Instant>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
@@ -927,6 +928,20 @@ impl ThreadView {
                     .remeasure_items(0..this.list_state.item_count());
                 cx.notify();
             }
+            if matches!(event, AcpThreadEvent::EntryUpdated(_))
+                && this.external_first_chunk_at.is_none()
+            {
+                this.external_first_chunk_at = Some(Instant::now());
+            }
+            if matches!(
+                event,
+                AcpThreadEvent::EntryUpdated(_)
+                    | AcpThreadEvent::TokenUsageUpdated(_)
+                    | AcpThreadEvent::Stopped { .. }
+                    | AcpThreadEvent::StatusChanged
+            ) {
+                this.publish_external_metrics(cx);
+            }
         }));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
@@ -1161,6 +1176,7 @@ impl ThreadView {
             thread_error_markdown: None,
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
+            external_first_chunk_at: None,
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
@@ -7141,16 +7157,9 @@ impl ThreadView {
                     output.exit_status.exit_code.is_none_or(|code| code == 0) && output.exit_status.signal.is_none())))
         };
         let eligible = |index: usize| {
-            entries.get(index).is_some_and(|entry| {
-                is_completed_tool(entry) || matches!(entry,
-                    AgentThreadEntry::AssistantMessage(message)
-                    if !message.is_subagent_output && !message.indented
-                        && message.chunks.iter().all(|chunk| match chunk {
-                            AssistantMessageChunk::Message { block, .. } | AssistantMessageChunk::Thought { block, .. } =>
-                                block.source_blocks().iter().all(|block| matches!(block, acp_v2::ContentBlock::Text(text) if !text.text.contains(['?', '？']))),
-                        })
-                        && entries.get(index + 1).is_some_and(is_completed_tool))
-            })
+            entries.get(index).is_some_and(|entry| is_completed_tool(entry) || matches!(entry,
+                AgentThreadEntry::AssistantMessage(message) if !message.is_subagent_output && !message.indented
+                    && !message.chunks.is_empty() && message.chunks.iter().all(|chunk| chunk.purpose() == acp_thread::AssistantMessagePurpose::Activity)))
         };
         if !eligible(index) {
             return None;
@@ -7163,7 +7172,11 @@ impl ThreadView {
         while eligible(end) {
             end += 1;
         }
-        (end - start > 1).then_some(start..end)
+        (end - start > 1
+            && entries
+                .get(start..end)
+                .is_some_and(|entries| entries.iter().any(is_completed_tool)))
+        .then_some(start..end)
     }
 
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
@@ -7475,6 +7488,49 @@ impl ThreadView {
                     .children(chunks.iter().enumerate().filter_map(
                         |(chunk_ix, chunk)| match chunk {
                             AssistantMessageChunk::Message { block, .. } => {
+                                if chunk.purpose() == acp_thread::AssistantMessagePurpose::Activity
+                                    && AgentSettings::get_global(cx).message_detail
+                                        == settings::AgentMessageDetail::Compact
+                                    && !self.thread_search_visible
+                                {
+                                    is_blank = is_blank && !block.visible_content(cx);
+                                    let key = (entry_ix, chunk_ix);
+                                    let expanded =
+                                        self.entry_view_state.read(cx).is_activity_expanded(key);
+                                    return Some(
+                                        v_flex()
+                                            .id(("activity-block", chunk_ix))
+                                            .debug_selector(move || {
+                                                format!("activity-block-{entry_ix}-{chunk_ix}")
+                                            })
+                                            .w_full()
+                                            .child(
+                                                Button::new(
+                                                    ("activity", chunk_ix),
+                                                    if expanded {
+                                                        "▾ Activity"
+                                                    } else {
+                                                        "▸ Activity"
+                                                    },
+                                                )
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.entry_view_state.update(cx, |state, _| {
+                                                        state.toggle_activity_expansion(key)
+                                                    });
+                                                    this.list_state
+                                                        .remeasure_items(entry_ix..entry_ix + 1);
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .when(expanded, |element| {
+                                                element.child(self.render_message_content(
+                                                    entry_ix, chunk_ix, block, window, cx,
+                                                ))
+                                            })
+                                            .into_any_element(),
+                                    );
+                                }
                                 let this_is_blank = !block.visible_content(cx);
                                 is_blank = is_blank && this_is_blank;
                                 (!this_is_blank).then(|| {
@@ -12566,6 +12622,48 @@ impl ThreadView {
                     cx,
                 );
             }))
+    }
+
+    fn publish_external_metrics(&mut self, cx: &mut Context<Self>) {
+        if self.as_native_thread(cx).is_some() {
+            return;
+        }
+        let thread = self.thread.read(cx);
+        let Some(usage) = thread.token_usage() else {
+            return;
+        };
+        let running = matches!(
+            thread.foreground_activity(),
+            acp_thread::ForegroundActivity::Running
+                | acp_thread::ForegroundActivity::RequiresAction
+        );
+        let output_tokens = thread
+            .reported_activity_output_tokens()
+            .unwrap_or(usage.output_tokens);
+        let duration = thread.activity_duration();
+        let tokens_per_second = duration
+            .filter(|duration| duration.as_secs_f32() > 0.0 && output_tokens > 0)
+            .map(|duration| output_tokens as f32 / duration.as_secs_f32());
+        let time_to_first_token_ms = self
+            .external_first_chunk_at
+            .zip(thread.activity_started_at())
+            .map(|(first_chunk, started)| first_chunk.duration_since(started).as_millis() as u64);
+
+        let snapshot = agent::run_metrics::AgentMetricsSnapshot {
+            running,
+            provider: None,
+            model: Some(self.agent_display_name.to_string()),
+            cache_hit_rate: None,
+            tokens_per_second,
+            time_to_first_token_ms,
+            context_used_tokens: Some(usage.used_tokens),
+            context_max_tokens: Some(usage.max_tokens),
+        };
+        let session_id = self.session_id.to_string();
+        let metrics = agent::run_metrics::AgentRunMetrics::global(cx);
+        metrics.update(cx, |metrics, cx| {
+            metrics.update_session(session_id, snapshot, !running, cx);
+        });
     }
 
     fn render_permission_tier_selector(

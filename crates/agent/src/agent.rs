@@ -4,6 +4,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 pub mod permission_tier;
+mod project_checkpoint;
 pub mod run_metrics;
 mod sandboxing;
 mod templates;
@@ -20,6 +21,7 @@ use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use project_checkpoint::*;
 pub use sandboxing::{
     ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
     settings_thread_sandbox,
@@ -959,7 +961,8 @@ impl NativeAgent {
             cx.subscribe(
                 &thread_handle,
                 |this, thread, _: &crate::thread::CancellationRequested, cx| {
-                    this.cancel_session(thread.read(cx).id());
+                    let session_id = thread.read(cx).id().clone();
+                    this.cancel_session(&session_id, cx);
                 },
             ),
             cx.observe(&thread_handle, move |this, thread, cx| {
@@ -1051,9 +1054,20 @@ impl NativeAgent {
             }
             return;
         }
-        if question.delivered || question.response.is_none() {
+        if !question.allow_automatic_resume || question.delivered || question.response.is_none() {
             return;
         }
+        if question
+            .response
+            .as_ref()
+            .and_then(|response| {
+                serde_json::from_value::<acp_v2::CreateElicitationResponse>(response.clone()).ok()
+            })
+            .is_some_and(|response| matches!(response.action, acp_v2::ElicitationAction::Cancel))
+        {
+            return;
+        }
+
         let completion = session
             .execution
             .as_ref()
@@ -1070,23 +1084,32 @@ impl NativeAgent {
             if cancellation.changed().now_or_never().is_some() {
                 return;
             }
-            let result = this.update(cx, |this, cx| {
-                let Some(session) = this.sessions.get(&session_id) else {
-                    return None;
-                };
-                let acp_thread = session.acp_thread.upgrade()?;
-                if !thread.read(cx).has_undelivered_answers()
-                    || acp_thread.read(cx).has_unsettled_submissions()
-                {
-                    return None;
-                }
-                let connection = NativeAgentConnection(cx.entity());
-                Some(
-                    connection
-                        .submit_native_internal(session_id, None, true, cx)
-                        .0,
-                )
-            });
+            let result = this
+                .read_with(cx, |this, cx| {
+                    let session = this.sessions.get(&session_id)?;
+                    let acp_thread = session.acp_thread.upgrade()?;
+                    if !thread.read(cx).has_automatic_answers()
+                        || acp_thread.read(cx).has_unsettled_submissions()
+                    {
+                        return None;
+                    }
+                    Some(())
+                })
+                .and_then(|ready| {
+                    ready
+                        .map(|()| {
+                            cx.update(|cx| {
+                                let connection = NativeAgentConnection(
+                                    this.upgrade()
+                                        .ok_or_else(|| anyhow!("Native agent was released"))?,
+                                );
+                                Ok(connection
+                                    .submit_native_internal(session_id, None, true, cx)
+                                    .0)
+                            })
+                        })
+                        .transpose()
+                });
             match result {
                 Ok(Some(receipt)) => {
                     if let Err(error) = receipt.await {
@@ -1109,10 +1132,13 @@ impl NativeAgent {
         .detach();
     }
 
-    fn cancel_session(&mut self, session_id: &acp_v2::SessionId) {
+    fn cancel_session(&mut self, session_id: &acp_v2::SessionId, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
+        session
+            .thread
+            .update(cx, |thread, cx| thread.suppress_question_continuations(cx));
         if session.pending_cancellation.send(()).is_err() {
             log::debug!("No pending native submissions to cancel");
         }
@@ -2623,7 +2649,7 @@ impl NativeAgentConnection {
                         })??;
                     if automatic_resume
                         && (acp_thread.read(cx).has_unsettled_submissions()
-                            || !thread.read(cx).has_undelivered_answers())
+                            || !thread.read(cx).has_automatic_answers())
                     {
                         return Err(acp_thread::SubmissionCancelled.into());
                     }
@@ -2892,6 +2918,13 @@ impl NativeAgentConnection {
                                     thread.upsert_local_user_message(message.id, content, cx)
                                 })??;
                             }
+                            ThreadEvent::AgentMessageText { message_id, text, purpose } => {
+                                acp_thread.update(cx, |thread, cx| thread.append_assistant_text_with_purpose(message_id.into(), text, purpose, cx))??;
+                            }
+                            ThreadEvent::AgentMessagePurpose { message_id, purpose } => {
+                                acp_thread.update(cx, |thread, cx| thread.upsert_assistant_message(
+                                    acp_v2::AgentMessage::new(message_id).meta(acp_thread::meta_with_message_purpose(purpose)), cx))??;
+                            }
                             ThreadEvent::AgentText(text) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.push_assistant_content_block(text.into(), false, cx)
@@ -2960,7 +2993,14 @@ impl NativeAgentConnection {
                                 match request_result {
                                     Ok((entry_id, response_task)) => {
                                         if let (Some(thread), Some(id)) = (&native_thread, &deferred_request_id) {
-                                            thread.update(cx, |thread, _| thread.set_deferred_question_entry(id, entry_id));
+                                            let saved_response = thread.update(cx, |thread, _| {
+                                                thread.set_deferred_question_entry(id, entry_id.clone());
+                                                thread.deferred_question(id).and_then(|question| question.response.clone())
+                                            });
+                                            if let Some(saved_response) = saved_response {
+                                                let saved_response = serde_json::from_value(saved_response)?;
+                                                acp_thread.update(cx, |thread, cx| thread.respond_to_elicitation(&entry_id, saved_response, cx))?;
+                                            }
                                         }
                                         cx.spawn(async move |cx| {
                                             let elicitation_response = response_task.await;
@@ -3446,8 +3486,8 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
         log::info!("Cancelling on session: {}", session_id);
-        self.0.update(cx, |agent, _cx| {
-            agent.cancel_session(session_id);
+        self.0.update(cx, |agent, cx| {
+            agent.cancel_session(session_id, cx);
         });
         Ok(())
     }
@@ -9880,6 +9920,165 @@ mod internal_tests {
                 .input_tokens,
             100
         );
+    }
+
+    #[test]
+    fn unknown_message_purposes_default_to_visible_responses() {
+        use acp_thread::{
+            AssistantMessagePurpose, MESSAGE_PURPOSE_META_KEY, message_purpose_from_meta,
+        };
+        assert_eq!(
+            message_purpose_from_meta(&None),
+            AssistantMessagePurpose::Response
+        );
+        for value in [
+            serde_json::json!("debug"),
+            serde_json::json!(null),
+            serde_json::json!({"type": "activity"}),
+        ] {
+            let meta = Some(agent_client_protocol::schema::v2::Meta::from_iter([(
+                MESSAGE_PURPOSE_META_KEY.into(),
+                value,
+            )]));
+            assert_eq!(
+                message_purpose_from_meta(&meta),
+                AssistantMessagePurpose::Response
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn native_message_purposes_survive_streaming_save_and_replay(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let native = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("message-purpose");
+        native.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["Explain the result".into()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::StartMessage {
+                message_id: "progress".into(),
+            },
+        );
+        fake.send_last_text(&model, "I checked the relevant code.");
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::ReasoningDetails(json!({"phase": "commentary"})),
+        );
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::Thinking {
+                text: "Internal work".into(),
+                signature: None,
+            },
+        );
+        fake.send_last_text(&model, "The check is complete.");
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::StartMessage {
+                message_id: "answer".into(),
+            },
+        );
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::ReasoningDetails(json!({"phase": "final_answer"})),
+        );
+        fake.send_last_text(&model, "The answer is 42.");
+        fake.end_last(&model);
+        send.await.expect("completed response");
+        cx.run_until_parked();
+        let messages = |thread: &AcpThread| {
+            thread
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::AssistantMessage(message) => {
+                        Some(message.chunks.iter().filter_map(|chunk| {
+                            match chunk {
+                                acp_thread::AssistantMessageChunk::Message { block, .. } => Some((
+                                    chunk.purpose(),
+                                    block
+                                        .source_blocks()
+                                        .iter()
+                                        .filter_map(|block| match block {
+                                            acp_v2::ContentBlock::Text(text) => {
+                                                Some(text.text.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<String>(),
+                                )),
+                                _ => None,
+                            }
+                        }))
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (
+                acp_thread::AssistantMessagePurpose::Progress,
+                "I checked the relevant code.".to_string(),
+            ),
+            (
+                acp_thread::AssistantMessagePurpose::Progress,
+                "The check is complete.".to_string(),
+            ),
+            (
+                acp_thread::AssistantMessagePurpose::Response,
+                "The answer is 42.".to_string(),
+            ),
+        ];
+        acp_thread.read_with(cx, |thread, _| assert_eq!(messages(thread), expected));
+        let saved = native.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let saved: DbThread =
+            serde_json::from_slice(&serde_json::to_vec(&saved).expect("serialize"))
+                .expect("deserialize");
+        let (context, registry, templates) = native.read_with(cx, |thread, _| {
+            (
+                thread.project_context().clone(),
+                thread.context_server_registry.clone(),
+                thread.templates.clone(),
+            )
+        });
+        let restored = cx.new(|cx| {
+            Thread::from_db(
+                session_id,
+                saved,
+                project.clone(),
+                context,
+                registry,
+                templates,
+                cx,
+            )
+        });
+        let replay_target = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[Path::new("/a")]), cx)
+            })
+            .await
+            .expect("replay view");
+        let events = restored.update(cx, |thread, cx| thread.replay(cx));
+        cx.update(|cx| {
+            NativeAgentConnection::handle_thread_events(events, replay_target.downgrade(), None, cx)
+        })
+        .await
+        .expect("replay");
+        cx.run_until_parked();
+        replay_target.read_with(cx, |thread, _| assert_eq!(messages(thread), expected));
     }
 
     struct StreamingTurn {

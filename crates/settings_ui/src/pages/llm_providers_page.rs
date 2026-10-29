@@ -1,5 +1,8 @@
 use std::{collections::HashSet, sync::Arc};
 
+use futures::AsyncReadExt as _;
+use http_client::{AsyncBody, Method, Request};
+
 use editor::Editor;
 use gpui::{AnyView, Entity, Focusable as _, ScrollHandle, prelude::*};
 use language_model::{
@@ -14,7 +17,8 @@ use settings::{
 };
 use ui::{
     ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Divider, DividerColor, DropdownMenu,
-    DropdownStyle, IconPosition, PopoverMenu, ToggleState, prelude::*,
+    DropdownStyle, IconPosition, PopoverMenu, SelectMenu, SelectMenuOption, ToggleState,
+    prelude::*,
 };
 use util::ResultExt as _;
 
@@ -138,6 +142,52 @@ pub(crate) fn render_add_llm_provider_popover(
         })
 }
 
+fn render_provider_models_menu(
+    provider: &Arc<dyn LanguageModelProvider>,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let provider_id = provider.id();
+    let models = provider.provided_models(cx);
+    if models.is_empty() {
+        return div().into_any_element();
+    }
+
+    let registry = LanguageModelRegistry::read_global(cx);
+    let options = models
+        .into_iter()
+        .map(|model| {
+            let enabled = !registry.is_model_disabled(&model);
+            let provider_key = provider_id.0.to_string();
+            let model_id = model.id.0.to_string();
+            SelectMenuOption::new(model.name.0.clone(), enabled, move |_, cx| {
+                let fs = <dyn fs::Fs>::global(cx);
+                let provider_key = provider_key.clone();
+                let model_id = model_id.clone();
+                settings::update_settings_file(fs, cx, move |settings, _| {
+                    let language_models = settings.language_models.get_or_insert_default();
+                    let disabled = language_models.disabled_models.get_or_insert_default();
+                    let entries = disabled
+                        .entry(Arc::from(provider_key.as_str()))
+                        .or_default();
+                    if let Some(index) = entries.iter().position(|id| id == &model_id) {
+                        entries.remove(index);
+                    } else {
+                        entries.push(model_id);
+                    }
+                });
+            })
+        })
+        .collect();
+
+    SelectMenu::new(
+        format!("provider-models-{}", provider_id.0),
+        "Models",
+        options,
+    )
+    .tooltip("Enable or disable models from the model picker")
+    .into_any_element()
+}
+
 fn render_provider_section(
     settings_window: &SettingsWindow,
     provider: &Arc<dyn LanguageModelProvider>,
@@ -179,6 +229,7 @@ fn render_provider_section(
         .gap_1p5()
         .child(render_provider_header(provider_name, provider.icon(), cx))
         .child(body)
+        .child(render_provider_models_menu(provider, cx))
         .into_any_element()
 }
 
@@ -521,6 +572,113 @@ fn get_or_create_configuration_view(
     view
 }
 
+impl SettingsWindow {
+    fn fetch_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.llm_provider_form.as_ref() else {
+            return;
+        };
+        let kind = form.kind;
+        let api_url = form.api_url.read(cx).text(cx);
+        let api_key = form.api_key.read(cx).text(cx);
+        let http_client = cx.http_client();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = fetch_models_from_api(http_client, kind, api_url, api_key).await;
+            this.update_in(cx, |this, window, cx| {
+                let Some(form) = this.llm_provider_form.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(names) if !names.is_empty() => {
+                        form.models = names
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                let model = ModelInput::new(index, window, cx);
+                                model.name.update(cx, |editor, cx| {
+                                    editor.set_text(name.as_str(), window, cx)
+                                });
+                                model
+                            })
+                            .collect();
+                        form.error = None;
+                    }
+                    Ok(_) => form.error = Some("The provider returned no models.".into()),
+                    Err(error) => form.error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+async fn fetch_models_from_api(
+    http_client: Arc<dyn http_client::HttpClient>,
+    kind: CompatibleProviderKind,
+    api_url: String,
+    api_key: String,
+) -> anyhow::Result<Vec<String>> {
+    if api_key.trim().is_empty() {
+        anyhow::bail!("Enter an API key first.");
+    }
+    let url = format!("{}/models", api_url.trim_end_matches('/'));
+    let mut request = Request::builder().method(Method::GET).uri(&url);
+    request = match kind {
+        CompatibleProviderKind::OpenAi => {
+            request.header("Authorization", format!("Bearer {api_key}"))
+        }
+        CompatibleProviderKind::Anthropic => request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+    };
+    let mut response = http_client
+        .send(request.body(AsyncBody::empty())?)
+        .await
+        .map_err(|error| anyhow::anyhow!("requesting {url}: {error}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("{url} returned {}", response.status());
+    }
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(|error| anyhow::anyhow!("reading {url}: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)?;
+    let entries = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .or_else(|| value.get("models").and_then(|models| models.as_array()))
+        .or_else(|| value.as_array())
+        .ok_or_else(|| anyhow::anyhow!("response did not contain a model list"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                entry
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                entry
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            });
+        if let Some(name) = name
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 pub(crate) struct LlmProviderForm {
     kind: CompatibleProviderKind,
     provider_name: Entity<Editor>,
@@ -766,20 +924,36 @@ fn render_models_section(
                 .justify_between()
                 .child(Label::new("Models"))
                 .child(
-                    Button::new("add-model", "Add Model")
-                        .start_icon(
-                            Icon::new(IconName::Plus)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("fetch-models", "Fetch Models")
+                                .start_icon(
+                                    Icon::new(IconName::ArrowCircle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.fetch_models(window, cx);
+                                })),
                         )
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(form) = this.llm_provider_form.as_mut() {
-                                let index = form.models.len();
-                                form.models.push(ModelInput::new(index, window, cx));
-                            }
-                            cx.notify();
-                        })),
+                        .child(
+                            Button::new("add-model", "Add Model")
+                                .start_icon(
+                                    Icon::new(IconName::Plus)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(form) = this.llm_provider_form.as_mut() {
+                                        let index = form.models.len();
+                                        form.models.push(ModelInput::new(index, window, cx));
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
                 ),
         )
         .children(form.models.iter().enumerate().map(|(index, model)| {

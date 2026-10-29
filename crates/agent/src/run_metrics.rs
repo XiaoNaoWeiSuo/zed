@@ -18,6 +18,8 @@ pub struct AgentMetricsSnapshot {
     pub cache_hit_rate: Option<f32>,
     pub tokens_per_second: Option<f32>,
     pub time_to_first_token_ms: Option<u64>,
+    pub context_used_tokens: Option<u64>,
+    pub context_max_tokens: Option<u64>,
 }
 
 impl AgentMetricsSnapshot {

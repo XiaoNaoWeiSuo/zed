@@ -26,6 +26,8 @@ pub struct AllLanguageModelSettingsContent {
     pub openai_compatible: Option<HashMap<Arc<str>, OpenAiCompatibleSettingsContent>>,
     pub vercel_ai_gateway: Option<VercelAiGatewaySettingsContent>,
     pub x_ai: Option<XAiSettingsContent>,
+    /// Model IDs to hide from the model picker, grouped by provider ID.
+    pub disabled_models: Option<HashMap<Arc<str>, Vec<String>>>,
 }
 
 #[with_fallible_options]

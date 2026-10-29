@@ -21,7 +21,9 @@ const OTHER_FIELD: &str = "other";
 /// single-select, multi-select, and text fields; the legacy fields ask one question.
 /// Group related decisions and avoid asking for information already in context.
 /// Set defer when independent work can continue. Retrieve the returned request_id
-/// later; wait=true waits, while false checks once. Avoid repeated polling.
+/// later; wait=true waits, while false checks once. Native sessions also deliver
+/// replies at the next safe boundary and can resume an idle session. Withdraw
+/// obsolete requests using request_id and withdraw=true. Avoid repeated polling.
 /// Never guess a pending answer or proceed with work that depends on it.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AskUserToolInput {
@@ -102,7 +104,7 @@ impl From<AskUserToolOutput> for LanguageModelToolResultContent {
                 serde_json::Value::from_iter(answers)
             )
             .into(),
-            AskUserToolOutput::Pending { request_id } => format!("Question {request_id} is pending. Continue independent work, then call ask_user with this request_id and wait=true when the answer is needed.").into(),
+            AskUserToolOutput::Pending { request_id } => format!("Question {request_id} is pending. Continue independent work. Native sessions deliver replies automatically; use ask_user with this request_id and wait=true when dependent work needs the answer. Withdraw it if no longer applicable.").into(),
             AskUserToolOutput::Withdrawn { request_id } => format!("Question {request_id} was withdrawn.").into(),
             AskUserToolOutput::Error { error } => error.into(),
         }

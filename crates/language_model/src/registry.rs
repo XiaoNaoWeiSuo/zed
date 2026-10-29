@@ -62,6 +62,7 @@ pub struct LanguageModelRegistry {
     installed_llm_extension_ids: HashSet<Arc<str>>,
     /// Function to check if a built-in provider should be hidden by an extension.
     builtin_provider_hiding_fn: Option<BuiltinProviderHidingFn>,
+    disabled_models: HashSet<(LanguageModelProviderId, LanguageModelId)>,
 }
 
 #[derive(Debug)]
@@ -290,6 +291,28 @@ impl LanguageModelRegistry {
             .values()
             .filter(|provider| provider.is_authenticated(cx))
             .flat_map(|provider| provider.provided_models(cx))
+            .filter(|model| {
+                !self
+                    .disabled_models
+                    .contains(&(model.provider_id(), model.id.clone()))
+            })
+    }
+
+    pub fn set_disabled_models(
+        &mut self,
+        models: HashSet<(LanguageModelProviderId, LanguageModelId)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled_models != models {
+            self.disabled_models = models;
+            cx.emit(Event::ProvidersChanged);
+            cx.notify();
+        }
+    }
+
+    pub fn is_model_disabled(&self, model: &LanguageModel) -> bool {
+        self.disabled_models
+            .contains(&(model.provider_id(), model.id.clone()))
     }
 
     pub fn provider(&self, id: &LanguageModelProviderId) -> Option<Arc<dyn LanguageModelProvider>> {

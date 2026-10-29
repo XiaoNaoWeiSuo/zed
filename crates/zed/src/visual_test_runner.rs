@@ -2745,7 +2745,7 @@ fn run_multi_workspace_sidebar_visual_tests(
                             sandboxed_terminal_temp_dir: None,
                             sandbox_grants: Default::default(),
                             goal: None,
-            deferred_questions: Default::default(),
+                            deferred_questions: Default::default(),
                             permission_tier: Default::default(),
                         },
                         path_list,

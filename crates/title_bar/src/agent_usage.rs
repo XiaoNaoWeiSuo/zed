@@ -115,6 +115,10 @@ impl Render for AgentUsageIndicator {
         let cache_hit_rate = snapshot.cache_hit_rate;
         let tokens_per_second = snapshot.tokens_per_second;
         let time_to_first_token = snapshot.time_to_first_token();
+        let context = snapshot
+            .context_used_tokens
+            .zip(snapshot.context_max_tokens)
+            .map(|(used, max)| format!("{}/{}", short_tokens(used), short_tokens(max)));
 
         let mut children: Vec<AnyElement> = Vec::new();
         if let Some(cache_hit_rate) = cache_hit_rate {
@@ -127,6 +131,13 @@ impl Render for AgentUsageIndicator {
         if let Some(tokens_per_second) = tokens_per_second {
             children.push(
                 Label::new(format!("{tokens_per_second:.0} tok/s"))
+                    .size(LabelSize::Small)
+                    .into_any_element(),
+            );
+        }
+        if let Some(context) = context {
+            children.push(
+                Label::new(context)
                     .size(LabelSize::Small)
                     .into_any_element(),
             );
@@ -172,5 +183,15 @@ impl Render for AgentUsageIndicator {
             .pr_1()
             .children(children)
             .into_any_element()
+    }
+}
+
+fn short_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }

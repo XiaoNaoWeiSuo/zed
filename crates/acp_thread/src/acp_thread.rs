@@ -118,6 +118,37 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp_v2::Meta {
     acp_v2::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
 }
 
+pub const MESSAGE_PURPOSE_META_KEY: &str = "message_purpose";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantMessagePurpose {
+    #[default]
+    Response,
+    Progress,
+    Activity,
+    Decision,
+    Error,
+}
+
+pub fn message_purpose_from_meta(meta: &Option<acp_v2::Meta>) -> AssistantMessagePurpose {
+    meta.as_ref()
+        .and_then(|meta| meta.get(MESSAGE_PURPOSE_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+pub fn meta_with_message_purpose(purpose: AssistantMessagePurpose) -> acp_v2::Meta {
+    let purpose = match purpose {
+        AssistantMessagePurpose::Response => "response",
+        AssistantMessagePurpose::Progress => "progress",
+        AssistantMessagePurpose::Activity => "activity",
+        AssistantMessagePurpose::Decision => "decision",
+        AssistantMessagePurpose::Error => "error",
+    };
+    acp_v2::Meta::from_iter([(MESSAGE_PURPOSE_META_KEY.into(), purpose.into())])
+}
+
 /// Key used in ACP `AvailableCommand` meta to record which source produced a
 /// slash command, so the completion popup can group commands by category.
 pub const COMMAND_CATEGORY_META_KEY: &str = "command_category";
@@ -429,6 +460,13 @@ pub enum AssistantMessageChunk {
 }
 
 impl AssistantMessageChunk {
+    pub fn purpose(&self) -> AssistantMessagePurpose {
+        match self {
+            Self::Thought { .. } => AssistantMessagePurpose::Activity,
+            Self::Message { meta, .. } => message_purpose_from_meta(meta),
+        }
+    }
+
     pub fn from_str(
         chunk: &str,
         language_registry: &Arc<LanguageRegistry>,
@@ -992,6 +1030,34 @@ pub struct ContextCompactionUpdate {
 }
 
 impl AgentThreadEntry {
+    pub fn purpose(&self) -> Option<AssistantMessagePurpose> {
+        match self {
+            Self::UserMessage(_) => None,
+            Self::AssistantMessage(message) => Some(
+                message
+                    .chunks
+                    .iter()
+                    .map(AssistantMessageChunk::purpose)
+                    .max_by_key(|purpose| match purpose {
+                        AssistantMessagePurpose::Error => 4,
+                        AssistantMessagePurpose::Decision => 3,
+                        AssistantMessagePurpose::Response => 2,
+                        AssistantMessagePurpose::Progress => 1,
+                        AssistantMessagePurpose::Activity => 0,
+                    })
+                    .unwrap_or_default(),
+            ),
+            Self::ToolCall(call) if call.status() == ToolCallStatus::Failed => {
+                Some(AssistantMessagePurpose::Error)
+            }
+            Self::ToolCall(_) | Self::ContextCompaction(_) => {
+                Some(AssistantMessagePurpose::Activity)
+            }
+            Self::Elicitation(_) => Some(AssistantMessagePurpose::Decision),
+            Self::SessionMessage(_) => Some(AssistantMessagePurpose::Response),
+        }
+    }
+
     pub fn is_indented(&self) -> bool {
         match self {
             Self::UserMessage(message) => message.indented,
@@ -5043,6 +5109,29 @@ impl AcpThread {
         Ok(())
     }
 
+    pub fn append_assistant_text_with_purpose(
+        &mut self,
+        message_id: acp_v2::MessageId,
+        text: String,
+        purpose: AssistantMessagePurpose,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let previous_entry_count = self.entries.len();
+        let location = self.keyed_message_location(MessageKind::Assistant, message_id, cx)?;
+        let (_, meta) = location
+            .fields_mut(&mut self.entries)
+            .context("assistant message disappeared")?;
+        meta.get_or_insert_default()
+            .extend(meta_with_message_purpose(purpose));
+        self.append_message_content(
+            location,
+            MessageKind::Assistant,
+            text.into(),
+            previous_entry_count,
+            cx,
+        )
+    }
+
     pub fn append_message_chunk(
         &mut self,
         kind: MessageKind,
@@ -8175,6 +8264,7 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use anyhow::anyhow;
     use futures::stream::StreamExt as _;

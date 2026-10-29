@@ -54,6 +54,106 @@ use std::{
 };
 use util::path;
 
+#[gpui::test]
+async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+        store.set_user_settings(&json!({"agent": {"profiles": {"checkpoint-test": {"name": "Checkpoint", "tools": {"project_checkpoint": true}}}}}).to_string(), cx).result().expect("settings");
+    }));
+    let root = tempfile::tempdir().expect("project directory");
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(root.path(), json!({})).await;
+    let project = Project::test(fs.clone(), [root.path()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[root.path()]), cx)
+        })
+        .await
+        .expect("session");
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&session_id)
+            .expect("session")
+            .thread
+            .clone()
+    });
+    let model = fake.model("checkpoint");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("checkpoint-test".into()), cx);
+    });
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(
+            acp_thread.clone(),
+            vec!["Save a handoff".into()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let input = json!({"action": "save", "scope": "agent.questions", "completed": ["Implemented form"], "remaining": ["Verify recovery"]});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "checkpoint".into(),
+            name: ProjectCheckpointTool::NAME.into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Saved.");
+    fake.end_last(&model);
+    send.await.expect("turn completed");
+    let checkpoint = ProjectCheckpointStore::open(root.path())
+        .expect("checkpoint store")
+        .latest("agent.questions")
+        .expect("read checkpoint")
+        .expect("saved checkpoint");
+    assert_eq!(checkpoint.completed, ["Implemented form"]);
+    assert_eq!(checkpoint.remaining, ["Verify recovery"]);
+    let next_session = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[root.path()]), cx)
+        })
+        .await
+        .expect("next session");
+    let next_id = next_session.read_with(cx, |thread, _| thread.session_id().clone());
+    let next_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&next_id)
+            .expect("next session")
+            .thread
+            .clone()
+    });
+    next_thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_profile(AgentProfileId("checkpoint-test".into()), cx);
+    });
+    let next_send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(next_session.clone(), vec!["Continue".into()], cx)
+    });
+    cx.run_until_parked();
+    let requests = fake.pending_completions_for(&model);
+    let request = requests.last().expect("next request");
+    assert!(request.messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content| matches!(content, MessageContent::Text(text) if text.contains("Verify recovery") && text.contains("historical")))));
+    fake.send_last_text(&model, "Continuing.");
+    fake.end_last(&model);
+    next_send.await.expect("next turn completed");
+}
+
 pub(crate) mod test_tools;
 use test_tools::*;
 
@@ -5977,8 +6077,41 @@ async fn test_ask_user_elicitation_references_scoped_tool_call_id(cx: &mut TestA
     send.await.unwrap();
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferredResponseTiming {
+    Idle,
+    WhileRunning,
+    AfterStop,
+    AnswerBeforeStop,
+    BeforeFollowUp,
+}
+
 #[gpui::test]
 async fn test_deferred_question_allows_model_to_continue(cx: &mut TestAppContext) {
+    run_deferred_question_scenario(DeferredResponseTiming::Idle, cx).await;
+}
+
+#[gpui::test]
+async fn test_deferred_question_waits_for_running_model_boundary(cx: &mut TestAppContext) {
+    run_deferred_question_scenario(DeferredResponseTiming::WhileRunning, cx).await;
+}
+
+#[gpui::test]
+async fn test_deferred_question_does_not_restart_after_stop(cx: &mut TestAppContext) {
+    run_deferred_question_scenario(DeferredResponseTiming::AfterStop, cx).await;
+}
+
+#[gpui::test]
+async fn test_deferred_question_reply_queued_before_stop_cannot_restart(cx: &mut TestAppContext) {
+    run_deferred_question_scenario(DeferredResponseTiming::AnswerBeforeStop, cx).await;
+}
+
+#[gpui::test]
+async fn test_deferred_question_never_preempts_user_followup(cx: &mut TestAppContext) {
+    run_deferred_question_scenario(DeferredResponseTiming::BeforeFollowUp, cx).await;
+}
+
+async fn run_deferred_question_scenario(timing: DeferredResponseTiming, cx: &mut TestAppContext) {
     let fake = init_test(cx);
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
@@ -6066,26 +6199,97 @@ async fn test_deferred_question_allows_model_to_continue(cx: &mut TestAppContext
             .expect("question tool call");
         (elicitation_id, request_id)
     });
-    // A second completion is available before the user answers.
+    let respond = |cx: &mut TestAppContext| {
+        acp_thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([("choice".into(), "B".into())]),
+                    ),
+                )),
+                cx,
+            )
+        })
+    };
+    if matches!(
+        timing,
+        DeferredResponseTiming::AfterStop | DeferredResponseTiming::AnswerBeforeStop
+    ) {
+        if timing == DeferredResponseTiming::AnswerBeforeStop {
+            respond(cx);
+        }
+        fake.forbid_requests();
+        cx.update(|cx| connection.cancel(&session_id, cx))
+            .expect("cancel");
+        assert_eq!(
+            send.await.expect("stopped turn"),
+            acp_v2::StopReason::Cancelled
+        );
+        respond(cx);
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+        return;
+    }
+    if timing == DeferredResponseTiming::BeforeFollowUp {
+        let follow_up = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["Follow-up takes priority".into()],
+                cx,
+            )
+        });
+        respond(cx);
+        cx.run_until_parked();
+        let requests = fake.pending_completions_for(&model);
+        assert_eq!(
+            requests.len(),
+            2,
+            "one abandoned fake request and one user follow-up; no automatic interruption"
+        );
+        assert!(requests.last().expect("user request").messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content|
+            matches!(content, MessageContent::Text(text) if text.contains("Follow-up takes priority")))));
+        fake.send_last_text(&model, "Following your new instruction.");
+        fake.end_last(&model);
+        follow_up.await.expect("follow-up completes");
+        send.await.expect("previous turn settled");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+        return;
+    }
+    if timing == DeferredResponseTiming::WhileRunning {
+        respond(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            fake.pending_completions_for(&model).len(),
+            1,
+            "do not interrupt the in-flight request"
+        );
+    }
     fake.send_last_text(&model, "Working independently.");
     fake.end_last(&model);
     send.await.expect("turn completed");
-    acp_thread.update(cx, |thread, cx| {
-        thread.respond_to_elicitation(
-            &elicitation_id,
-            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
-                acp_v2::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from([
-                    ("choice".into(), "B".into()),
-                ])),
-            )),
-            cx,
+    if timing == DeferredResponseTiming::Idle {
+        respond(cx);
+    }
+    cx.run_until_parked();
+    let requests = fake.pending_completions_for(&model);
+    assert_eq!(
+        requests.len(),
+        1,
+        "answer should resume the idle session without another prompt"
+    );
+    assert!(requests.first().expect("resumed request").messages.iter().any(|message|
+        message.role == Role::User && message.content.iter().any(|content| matches!(content,
+            MessageContent::Text(text) if text.contains("User response to deferred question") && text.contains("B")))));
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread
+                .deferred_question(&request_id)
+                .expect("saved question")
+                .delivered
         )
     });
-    cx.run_until_parked();
-    let send = cx.update(|cx| {
-        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Continue".into()], cx)
-    });
-    cx.run_until_parked();
     let input = AskUserToolInput {
         question: String::new(),
         options: Vec::new(),
@@ -6112,12 +6316,20 @@ async fn test_deferred_question_allows_model_to_continue(cx: &mut TestAppContext
     fake.end_last(&model);
     cx.run_until_parked();
     acp_thread.read_with(cx, |thread, _| {
-        assert!(thread.entries().iter().any(|entry| matches!(entry, AgentThreadEntry::ToolCall(call)
-            if call.raw_output.as_ref().is_some_and(|output| output.get("selected") == Some(&json!("B"))))));
+        let answers = thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) => call.raw_output.as_ref()?.get("answers"),
+                _ => None,
+            })
+            .expect("retrieved answers");
+        assert!(answers.to_string().contains("B"));
     });
     fake.send_last_text(&model, "Using B.");
     fake.end_last(&model);
-    send.await.expect("second turn completed");
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
 }
 
 #[gpui::test]

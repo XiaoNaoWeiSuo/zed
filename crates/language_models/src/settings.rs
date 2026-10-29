@@ -29,6 +29,7 @@ pub struct AllLanguageModelSettings {
     pub openai_compatible: HashMap<Arc<str>, OpenAiCompatibleSettings>,
     pub vercel_ai_gateway: VercelAiGatewaySettings,
     pub x_ai: XAiSettings,
+    pub disabled_models: HashMap<Arc<str>, Vec<String>>,
 }
 
 fn custom_headers_from(
@@ -197,6 +198,7 @@ impl settings::Settings for AllLanguageModelSettings {
                     &[],
                 ),
             },
+            disabled_models: language_models.disabled_models.unwrap_or_default(),
             x_ai: XAiSettings {
                 api_url: x_ai.api_url.unwrap(),
                 available_models: x_ai.available_models.unwrap_or_default(),

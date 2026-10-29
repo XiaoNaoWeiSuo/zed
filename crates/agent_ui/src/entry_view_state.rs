@@ -61,6 +61,7 @@ pub struct EntryViewState {
     session_capabilities: SharedSessionCapabilities,
     agent_id: AgentId,
     expanded_thinking_blocks: HashSet<(usize, usize)>,
+    expanded_activity_blocks: HashSet<(usize, usize)>,
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
@@ -86,6 +87,7 @@ impl EntryViewState {
             session_capabilities,
             agent_id,
             expanded_thinking_blocks: HashSet::default(),
+            expanded_activity_blocks: HashSet::default(),
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
@@ -111,6 +113,16 @@ impl EntryViewState {
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
         self.is_tool_call_expanded(&tool_call.id) || tool_call.authorization_id().is_some()
+    }
+
+    pub(crate) fn is_activity_expanded(&self, key: (usize, usize)) -> bool {
+        self.expanded_activity_blocks.contains(&key)
+    }
+
+    pub(crate) fn toggle_activity_expansion(&mut self, key: (usize, usize)) {
+        if !self.expanded_activity_blocks.remove(&key) {
+            self.expanded_activity_blocks.insert(key);
+        }
     }
 
     pub(crate) fn expand_tool_call(&mut self, tool_call_id: acp_v2::ToolCallId) {
@@ -643,6 +655,13 @@ impl EntryViewState {
             .iter()
             .filter_map(|&(entry_ix, chunk_ix)| {
                 reindex_after_removal(entry_ix, &range).map(|entry_ix| (entry_ix, chunk_ix))
+            })
+            .collect();
+        self.expanded_activity_blocks = self
+            .expanded_activity_blocks
+            .iter()
+            .filter_map(|&(entry, chunk)| {
+                reindex_after_removal(entry, &range).map(|entry| (entry, chunk))
             })
             .collect();
         self.auto_expanded_thinking_block =
