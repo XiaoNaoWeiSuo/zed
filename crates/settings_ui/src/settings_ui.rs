@@ -994,6 +994,7 @@ pub struct SettingsWindow {
     pub(crate) configuring_provider: Option<language_model::LanguageModelProviderId>,
     /// Providers whose model enable/disable list is expanded.
     pub(crate) expanded_model_lists: HashSet<language_model::LanguageModelProviderId>,
+    pub(crate) model_edit: Option<crate::pages::llm_providers_page::ModelEditState>,
     /// Directory path of the skill whose share link was most recently copied,
     /// used to show a transient "copied" checkmark on its share button.
     pub(crate) last_copied_skill_directory_path: Option<PathBuf>,
@@ -2033,6 +2034,7 @@ impl SettingsWindow {
             last_copied_skill_directory_path: None,
             llm_provider_form: None,
             expanded_model_lists: HashSet::default(),
+            model_edit: None,
             llm_provider_add_focus_handle: cx.focus_handle(),
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),
@@ -5506,6 +5508,7 @@ pub mod test {
                 last_copied_skill_directory_path: None,
                 llm_provider_form: None,
                 expanded_model_lists: HashSet::default(),
+                model_edit: None,
                 llm_provider_add_focus_handle: cx.focus_handle(),
                 mcp_server_form: None,
                 mcp_add_server_focus_handle: cx.focus_handle(),
@@ -5647,6 +5650,7 @@ pub mod test {
             last_copied_skill_directory_path: None,
             llm_provider_form: None,
             expanded_model_lists: HashSet::default(),
+            model_edit: None,
             llm_provider_add_focus_handle: cx.focus_handle(),
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),

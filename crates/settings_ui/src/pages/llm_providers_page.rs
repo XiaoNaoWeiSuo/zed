@@ -6,18 +6,20 @@ use http_client::{AsyncBody, Method, Request};
 use editor::Editor;
 use gpui::{AnyView, Entity, Focusable as _, ScrollHandle, prelude::*};
 use language_model::{
-    ApiKeyConfiguration, CreateProviderSettingsView, IconOrSvg, InlineDescription,
+    ApiKeyConfiguration, CreateProviderSettingsView, IconOrSvg, InlineDescription, LanguageModel,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, ProviderSettingsView,
 };
+use language_models::AllLanguageModelSettings;
 
 use settings::{
     AnthropicCompatibleAvailableModel, AnthropicCompatibleModelCapabilities,
     AnthropicCompatibleSettingsContent, OpenAiCompatibleAvailableModel,
     OpenAiCompatibleModelCapabilities, OpenAiCompatibleSettingsContent, OpenAiReasoningEffort,
+    Settings as _,
 };
 use ui::{
     ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Disclosure, Divider, DividerColor,
-    DropdownMenu, DropdownStyle, IconPosition, PopoverMenu, ToggleState, prelude::*,
+    DropdownMenu, DropdownStyle, IconPosition, PopoverMenu, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -141,6 +143,290 @@ pub(crate) fn render_add_llm_provider_popover(
         })
 }
 
+fn render_model_edit_button(
+    provider: &Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let provider_id = provider.id();
+    let settings = AllLanguageModelSettings::get_global(cx);
+    if !settings
+        .openai_compatible
+        .contains_key(provider_id.0.as_ref())
+        && !settings
+            .anthropic_compatible
+            .contains_key(provider_id.0.as_ref())
+    {
+        return div().into_any_element();
+    }
+
+    let provider = provider.clone();
+    let model = model.clone();
+    IconButton::new(
+        format!("edit-model-{}-{}", provider_id.0, model.id.0),
+        IconName::Settings,
+    )
+    .icon_size(IconSize::XSmall)
+    .icon_color(Color::Muted)
+    .tooltip(Tooltip::text("Edit model settings"))
+    .on_click(cx.listener(move |this, _, window, cx| {
+        open_model_edit(this, &provider, &model, window, cx);
+    }))
+    .into_any_element()
+}
+
+pub(crate) struct ModelEditState {
+    pub(crate) provider_id: LanguageModelProviderId,
+    pub(crate) kind: CompatibleProviderKind,
+    pub(crate) original_name: String,
+    pub(crate) display_name: Entity<Editor>,
+    pub(crate) max_tokens: Entity<Editor>,
+    pub(crate) supports_tools: ToggleState,
+    pub(crate) supports_images: ToggleState,
+}
+
+fn open_model_edit(
+    settings_window: &mut SettingsWindow,
+    provider: &Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let provider_id = provider.id();
+    let settings = AllLanguageModelSettings::get_global(cx);
+    let kind = if settings
+        .openai_compatible
+        .contains_key(provider_id.0.as_ref())
+    {
+        CompatibleProviderKind::OpenAi
+    } else if settings
+        .anthropic_compatible
+        .contains_key(provider_id.0.as_ref())
+    {
+        CompatibleProviderKind::Anthropic
+    } else {
+        return;
+    };
+    let (display_name, max_tokens, tools, images) = match kind {
+        CompatibleProviderKind::OpenAi => {
+            let configured = settings
+                .openai_compatible
+                .get(provider_id.0.as_ref())
+                .and_then(|config| {
+                    config
+                        .available_models
+                        .iter()
+                        .find(|m| m.name == model.id.0.as_ref())
+                });
+            (
+                configured.and_then(|m| m.display_name.clone()),
+                configured.map_or(model.max_token_count, |m| m.max_tokens),
+                configured.map_or(true, |m| m.capabilities.tools),
+                configured.map_or(false, |m| m.capabilities.images),
+            )
+        }
+        CompatibleProviderKind::Anthropic => {
+            let configured = settings
+                .anthropic_compatible
+                .get(provider_id.0.as_ref())
+                .and_then(|config| {
+                    config
+                        .available_models
+                        .iter()
+                        .find(|m| m.name == model.id.0.as_ref())
+                });
+            (
+                configured.and_then(|m| m.display_name.clone()),
+                configured.map_or(model.max_token_count, |m| m.max_tokens),
+                configured.map_or(true, |m| m.capabilities.tools),
+                configured.map_or(false, |m| m.capabilities.images),
+            )
+        }
+    };
+
+    settings_window.model_edit = Some(ModelEditState {
+        provider_id,
+        kind,
+        original_name: model.id.0.to_string(),
+        display_name: new_input("Display name", display_name.as_deref(), false, window, cx),
+        max_tokens: new_input("200000", Some(&max_tokens.to_string()), false, window, cx),
+        supports_tools: tools.into(),
+        supports_images: images.into(),
+    });
+    settings_window.push_dynamic_sub_page(
+        format!("Edit {}", model.name.0),
+        "Agent Configuration",
+        Some("llm_providers"),
+        true,
+        render_model_edit_page,
+        window,
+        cx,
+    );
+}
+
+fn render_model_edit_page(
+    settings_window: &SettingsWindow,
+    scroll_handle: &ScrollHandle,
+    _window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let Some(state) = settings_window.model_edit.as_ref() else {
+        return div().into_any_element();
+    };
+    v_flex()
+        .size_full()
+        .child(
+            v_flex()
+                .id("model-edit-page")
+                .track_scroll(scroll_handle)
+                .p_8()
+                .gap_4()
+                .overflow_y_scroll()
+                .child(Label::new(format!("Model: {}", state.original_name)).size(LabelSize::Small))
+                .child(render_form_field(
+                    "Display Name",
+                    "Shown in the model selector.",
+                    &state.display_name,
+                    cx,
+                ))
+                .child(render_form_field(
+                    "Context Window",
+                    "Maximum context tokens.",
+                    &state.max_tokens,
+                    cx,
+                ))
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(
+                            Checkbox::new("model-edit-tools", state.supports_tools.into())
+                                .label("Supports tools")
+                                .on_click(cx.listener(|this, checked: &ToggleState, _, cx| {
+                                    if let Some(state) = this.model_edit.as_mut() {
+                                        state.supports_tools = *checked;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Checkbox::new("model-edit-images", state.supports_images.into())
+                                .label("Supports images")
+                                .on_click(cx.listener(|this, checked: &ToggleState, _, cx| {
+                                    if let Some(state) = this.model_edit.as_mut() {
+                                        state.supports_images = *checked;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Button::new("save-model", "Save").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.save_model_edit(cx);
+                                this.pop_sub_page(window, cx);
+                            },
+                        )))
+                        .child(Button::new("cancel-model", "Cancel").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.model_edit = None;
+                                this.pop_sub_page(window, cx);
+                            },
+                        ))),
+                ),
+        )
+        .into_any_element()
+}
+
+impl SettingsWindow {
+    fn save_model_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.model_edit.as_ref() else {
+            return;
+        };
+        let provider_id = state.provider_id.clone();
+        let kind = state.kind;
+        let name = state.original_name.clone();
+        let display_name = state.display_name.read(cx).text(cx).trim().to_string();
+        let Ok(max_tokens) = state.max_tokens.read(cx).text(cx).trim().parse::<u64>() else {
+            return;
+        };
+        let tools = state.supports_tools.selected();
+        let images = state.supports_images.selected();
+        let fs = <dyn fs::Fs>::global(cx);
+        settings::update_settings_file(fs, cx, move |settings, _| {
+            let language_models = settings.language_models.get_or_insert_default();
+            match kind {
+                CompatibleProviderKind::OpenAi => {
+                    let Some(provider) = language_models
+                        .openai_compatible
+                        .get_or_insert_default()
+                        .get_mut(provider_id.0.as_ref())
+                    else {
+                        return;
+                    };
+                    if !provider.available_models.iter().any(|m| m.name == name) {
+                        provider
+                            .available_models
+                            .push(OpenAiCompatibleAvailableModel {
+                                name: name.clone(),
+                                display_name: None,
+                                max_tokens,
+                                max_output_tokens: None,
+                                max_completion_tokens: None,
+                                reasoning_effort: None,
+                                capabilities: Default::default(),
+                            });
+                    }
+                    let model = provider
+                        .available_models
+                        .iter_mut()
+                        .find(|m| m.name == name)
+                        .expect("model exists");
+                    model.display_name = (!display_name.is_empty()).then_some(display_name);
+                    model.max_tokens = max_tokens;
+                    model.capabilities.tools = tools;
+                    model.capabilities.images = images;
+                }
+                CompatibleProviderKind::Anthropic => {
+                    let Some(provider) = language_models
+                        .anthropic_compatible
+                        .get_or_insert_default()
+                        .get_mut(provider_id.0.as_ref())
+                    else {
+                        return;
+                    };
+                    if !provider.available_models.iter().any(|m| m.name == name) {
+                        provider
+                            .available_models
+                            .push(AnthropicCompatibleAvailableModel {
+                                name: name.clone(),
+                                display_name: None,
+                                max_tokens,
+                                tool_override: None,
+                                max_output_tokens: None,
+                                default_temperature: None,
+                                extra_beta_headers: Vec::new(),
+                                mode: None,
+                                capabilities: Default::default(),
+                            });
+                    }
+                    let model = provider
+                        .available_models
+                        .iter_mut()
+                        .find(|m| m.name == name)
+                        .expect("model exists");
+                    model.display_name = (!display_name.is_empty()).then_some(display_name);
+                    model.max_tokens = max_tokens;
+                    model.capabilities.tools = tools;
+                    model.capabilities.images = images;
+                }
+            }
+        });
+        self.model_edit = None;
+    }
+}
+
 fn render_provider_models_list(
     provider: &Arc<dyn LanguageModelProvider>,
     is_open: bool,
@@ -154,10 +440,56 @@ fn render_provider_models_list(
     models.sort_by_key(|model| model.name.0.to_lowercase());
 
     let registry = LanguageModelRegistry::read_global(cx);
-    let enabled_count = models
+    let enabled_flags = models
         .iter()
-        .filter(|model| !registry.is_model_disabled(model))
-        .count();
+        .map(|model| !registry.is_model_disabled(model))
+        .collect::<Vec<_>>();
+    let enabled_count = enabled_flags.iter().filter(|enabled| **enabled).count();
+
+    let rows = models
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let enabled = enabled_flags[index];
+            let provider_key = provider_id.0.to_string();
+            let model_id = model.id.0.to_string();
+            h_flex()
+                .gap_1()
+                .child(
+                    Checkbox::new(
+                        ElementId::Name(format!("provider-model-{}-{index}", provider_id.0).into()),
+                        enabled.into(),
+                    )
+                    .label(model.name.0.clone())
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(
+                        move |_, checked: &ToggleState, _, cx| {
+                            let fs = <dyn fs::Fs>::global(cx);
+                            let provider_key = provider_key.clone();
+                            let model_id = model_id.clone();
+                            let enabled = checked.selected();
+                            settings::update_settings_file(fs, cx, move |settings, _| {
+                                let language_models =
+                                    settings.language_models.get_or_insert_default();
+                                let disabled =
+                                    language_models.disabled_models.get_or_insert_default();
+                                let entries = disabled
+                                    .entry(Arc::from(provider_key.as_str()))
+                                    .or_default();
+                                if enabled {
+                                    entries.retain(|id| id != &model_id);
+                                } else if !entries.contains(&model_id) {
+                                    entries.push(model_id);
+                                }
+                            });
+                        },
+                    )),
+                )
+                .child(render_model_edit_button(provider, &model, cx))
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+
     let disclosure_id = format!("provider-models-disclosure-{}", provider_id.0);
     let disclosure_provider_id = provider_id.clone();
 
@@ -179,52 +511,16 @@ fn render_provider_models_list(
                 )
                 .child(Label::new("Models").size(LabelSize::Small))
                 .child(
-                    Label::new(format!("{enabled_count}/{} enabled", models.len()))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(format!(
+                        "{enabled_count}/{count} enabled",
+                        count = rows.len()
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 ),
         )
         .when(is_open, |this| {
-            this.child(
-                v_flex()
-                    .pl_6()
-                    .gap_1()
-                    .children(models.iter().enumerate().map(|(index, model)| {
-                        let enabled = !registry.is_model_disabled(model);
-                        let provider_key = provider_id.0.to_string();
-                        let model_id = model.id.0.to_string();
-                        Checkbox::new(
-                            ElementId::Name(
-                                format!("provider-model-{}-{index}", provider_id.0).into(),
-                            ),
-                            enabled.into(),
-                        )
-                        .label(model.name.0.clone())
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(
-                            move |_, checked: &ToggleState, _, cx| {
-                                let fs = <dyn fs::Fs>::global(cx);
-                                let provider_key = provider_key.clone();
-                                let model_id = model_id.clone();
-                                let enabled = checked.selected();
-                                settings::update_settings_file(fs, cx, move |settings, _| {
-                                    let language_models =
-                                        settings.language_models.get_or_insert_default();
-                                    let disabled =
-                                        language_models.disabled_models.get_or_insert_default();
-                                    let entries = disabled
-                                        .entry(Arc::from(provider_key.as_str()))
-                                        .or_default();
-                                    if enabled {
-                                        entries.retain(|id| id != &model_id);
-                                    } else if !entries.contains(&model_id) {
-                                        entries.push(model_id);
-                                    }
-                                });
-                            },
-                        ))
-                    })),
-            )
+            this.child(v_flex().pl_6().gap_1().children(rows))
         })
         .into_any_element()
 }

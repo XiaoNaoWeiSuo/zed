@@ -3,7 +3,7 @@ mod audio_test_window;
 mod edit_prediction_provider_setup;
 mod external_agents_page;
 mod feature_flags;
-mod llm_providers_page;
+pub(crate) mod llm_providers_page;
 mod mcp_servers_page;
 mod sandbox_settings;
 mod skill_creator;
