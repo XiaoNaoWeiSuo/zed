@@ -285,6 +285,43 @@ pub fn checkpoint_git_snapshot(
         })
 }
 
+pub fn checkpoint_model_context(context: &str) -> String {
+    fn compact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(evidence) = fields.remove("evidence") {
+                    fields.insert(
+                        "evidence_available_on_demand".into(),
+                        serde_json::json!(
+                            evidence
+                                .as_array()
+                                .is_some_and(|entries| !entries.is_empty())
+                        ),
+                    );
+                }
+                for value in fields.values_mut() {
+                    compact(value);
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for value in entries {
+                    compact(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(context) else {
+        return serde_json::json!({"checkpoint_unavailable": true, "reason": "Invalid checkpoint context; read the saved scope if needed"}).to_string();
+    };
+    compact(&mut value);
+    let context = value.to_string();
+    if context.chars().count() > 16_000 {
+        return serde_json::json!({"handoff_details_omitted": true, "reason": "Checkpoint context exceeds the model budget; use project_checkpoint list/read if relevant"}).to_string();
+    }
+    context
+}
+
 pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String>> {
     let mut sections = Vec::new();
     for root in roots {
@@ -615,6 +652,36 @@ mod tests {
         .context("context")?;
         let context: serde_json::Value = serde_json::from_str(&context)?;
         assert_eq!(context[0]["available_scopes"][1]["scope"], "editor");
+        Ok(())
+    }
+
+    #[test]
+    fn model_context_keeps_handoff_but_expands_evidence_only_on_demand() -> Result<()> {
+        let original = serde_json::json!([{
+            "root": "project", "scope": "agent", "created_at": "historical time",
+            "remaining": ["Verify recovery"],
+            "evidence": [{"source": "session:old/tool:one", "description": "old result"}],
+            "recent_automatic_checkpoint": {"evidence": [{"source": "session:old/tool:two"}]}
+        }]);
+        let projected = checkpoint_model_context(&original.to_string());
+        let projected: serde_json::Value = serde_json::from_str(&projected)?;
+        assert_eq!(projected[0]["scope"], "agent");
+        assert_eq!(projected[0]["remaining"][0], "Verify recovery");
+        assert_eq!(projected[0]["created_at"], "historical time");
+        assert_eq!(projected[0]["evidence_available_on_demand"], true);
+        assert_eq!(
+            projected[0]["recent_automatic_checkpoint"]["evidence_available_on_demand"],
+            true
+        );
+        assert!(!projected.to_string().contains("session:old"));
+        assert!(original[0]["evidence"].is_array());
+        let oversized = serde_json::json!({"remaining": ["x".repeat(20_000)]});
+        let bounded: serde_json::Value =
+            serde_json::from_str(&checkpoint_model_context(&oversized.to_string()))?;
+        assert_eq!(bounded["handoff_details_omitted"], true);
+        let invalid: serde_json::Value =
+            serde_json::from_str(&checkpoint_model_context("invalid"))?;
+        assert_eq!(invalid["checkpoint_unavailable"], true);
         Ok(())
     }
 

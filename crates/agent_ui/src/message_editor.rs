@@ -216,6 +216,7 @@ pub struct MessageEditor {
     thread_store: Option<Entity<ThreadStore>>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
+    large_paste_creases: Vec<CreaseId>,
 }
 
 #[derive(Clone, Debug)]
@@ -624,6 +625,7 @@ impl MessageEditor {
             thread_store,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
+            large_paste_creases: Vec::new(),
         }
     }
 
@@ -944,6 +946,7 @@ impl MessageEditor {
         self.editor.update(cx, |editor, cx| {
             editor.clear(window, cx);
         });
+        self.large_paste_creases.clear();
         self.clear_mentions(cx);
     }
 
@@ -1324,6 +1327,14 @@ impl MessageEditor {
             }
         }
 
+        if let Some(clipboard_text) = clipboard_text.as_deref() {
+            let line_count = clipboard_text.lines().count();
+            if line_count > 15 {
+                self.insert_pasted_text_block(clipboard_text, line_count, window, cx);
+                return;
+            }
+        }
+
         if self.handle_pasted_context(clipboard, window, cx) {
             return;
         }
@@ -1331,6 +1342,50 @@ impl MessageEditor {
         self.editor.update(cx, |editor, cx| {
             editor.paste_item(clipboard, window, cx);
         });
+    }
+
+    fn insert_pasted_text_block(
+        &mut self,
+        text: &str,
+        line_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((anchor, content_len)) = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start_offset = editor.selections.newest_anchor().start.to_offset(&snapshot);
+            let start_anchor = snapshot.anchor_before(start_offset);
+            let anchor = snapshot.anchor_to_buffer_anchor(start_anchor)?.0;
+            let before = editor.text(cx).len();
+            editor.insert(text, window, cx);
+            let after = editor.text(cx).len();
+            Some((anchor, after.checked_sub(before)?))
+        }) else {
+            return;
+        };
+        if content_len == 0 {
+            return;
+        }
+
+        let label: SharedString = format!("Pasted {line_count} lines").into();
+        let icon_path = ui::IconName::FileTextOutlined.path().into();
+        let Some((crease_id, tx, _)) = insert_crease_for_mention(
+            anchor,
+            content_len,
+            label,
+            icon_path,
+            None,
+            None,
+            None,
+            None,
+            self.editor.clone(),
+            window,
+            cx,
+        ) else {
+            return;
+        };
+        drop(tx);
+        self.large_paste_creases.push(crease_id);
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
