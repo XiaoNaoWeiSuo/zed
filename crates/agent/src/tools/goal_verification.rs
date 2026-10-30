@@ -22,6 +22,11 @@ pub struct GoalVerificationInput {
     pub tool_input: serde_json::Value,
     /// Project files or directories on which this check depends, including relevant manifests and configuration.
     pub dependencies: Vec<String>,
+    /// Zero-based indices of the success criteria this check covers. Omit when
+    /// the goal has one criterion; multi-criterion receipts need this to be
+    /// selected automatically at completion.
+    #[serde(default)]
+    pub criterion_indices: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +65,11 @@ pub struct GoalVerificationReceipt {
     pub output_digest: String,
     pub preview: String,
     pub stale_reason: Option<String>,
+    /// Criteria declared when the check was recorded. Older persisted
+    /// receipts have no association; a single-criterion goal treats them as
+    /// covering criterion 0.
+    #[serde(default)]
+    pub criterion_indices: Vec<usize>,
 }
 
 pub(crate) async fn capture_goal_dependencies(

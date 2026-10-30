@@ -21,7 +21,7 @@ pub enum GoalEvidenceScope {
     Historical,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GoalCriterionEvidenceInput {
     /// Explain how the observations prove this criterion and what they actually cover.
     pub assessment: String,
@@ -60,11 +60,14 @@ pub struct GoalEvidenceSource {
 
 /// Manage an explicitly requested sustained goal. Define observable criteria,
 /// verification surfaces and constraints. Use verify to run an enabled tool with
-/// declared source dependencies; inspect rechecks receipts without rerunning tools.
-/// Complete only after auditing every original criterion against current evidence.
-/// A passed tool and unchanged inputs prove execution and freshness, not semantic
-/// coverage. Historical observations must state their limits. Pause on user request;
-/// record blocked only when progress needs user input or an external change.
+/// declared source dependencies and `criterion_indices`; inspect rechecks receipts
+/// without rerunning tools. Complete audits all receipts automatically and can
+/// assemble per-criterion evidence without hand-maintained receipt IDs. A passed
+/// tool and unchanged inputs prove execution and freshness, not semantic coverage.
+/// Historical observations must state their limits. Keep working on all
+/// independent parts of an active goal. Pause only on user request; record blocked
+/// only when further progress requires user input or an external change. Model-requested
+/// pause, blocked, and resume transitions require user confirmation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GoalToolInput {
     /// One of create, inspect, verify, complete, pause, resume, or blocked.
@@ -84,7 +87,10 @@ pub struct GoalToolInput {
     /// The reason progress is blocked.
     #[serde(default)]
     pub evidence: String,
-    /// One assessment per criterion, in order; required for complete.
+    /// Optional assessments, one per criterion in order. Omit this field
+    /// entirely to let the harness assemble evidence from current valid
+    /// receipts. When provided, `verification_ids` may be omitted and are
+    /// filled automatically for the corresponding criterion.
     #[serde(default)]
     pub criterion_evidence: Vec<GoalCriterionEvidenceInput>,
     /// Required for verify. Use the original tool's argument schema and include all relevant source dependencies.
@@ -101,6 +107,45 @@ pub struct GoalVerificationResult {
     pub output: serde_json::Value,
     pub successful: bool,
     pub outcome: GoalVerificationOutcome,
+    #[serde(default)]
+    pub covered_criteria: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_note: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GoalCompletionReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub satisfied_criteria: Vec<GoalSatisfiedCriterion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_evidence: Vec<GoalMissingCriterion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_dependencies: Vec<GoalStaleDependency>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GoalSatisfiedCriterion {
+    pub criterion_index: usize,
+    pub criterion: String,
+    pub verification_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GoalMissingCriterion {
+    pub criterion_index: usize,
+    pub criterion: String,
+    pub reason: String,
+    pub suggested_action: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GoalStaleDependency {
+    pub receipt_id: String,
+    pub criterion_indices: Vec<usize>,
+    pub dependencies: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +154,22 @@ pub struct GoalToolOutput {
     pub goal: Option<ThreadGoal>,
     pub verification_count: usize,
     pub verification: Option<GoalVerificationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<GoalCompletionReport>,
+}
+
+#[derive(Clone, Debug)]
+struct GoalReceiptAudit {
+    id: String,
+    valid: bool,
+    criterion_indices: Vec<usize>,
+}
+
+#[derive(Default)]
+struct GoalAudit {
+    valid: collections::HashSet<String>,
+    receipts: Vec<GoalReceiptAudit>,
+    stale_dependencies: Vec<GoalStaleDependency>,
 }
 
 impl GoalToolOutput {
@@ -118,6 +179,7 @@ impl GoalToolOutput {
             goal: None,
             verification_count: 0,
             verification: None,
+            completion: None,
         }
     }
 
@@ -158,6 +220,7 @@ impl GoalToolOutput {
             goal,
             verification_count,
             verification,
+            completion: None,
         }
     }
 }
@@ -189,6 +252,120 @@ impl From<GoalToolOutput> for LanguageModelToolResultContent {
 }
 
 #[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn receipt(id: &str, criterion_indices: Vec<usize>) -> GoalVerificationReceipt {
+        GoalVerificationReceipt {
+            id: id.into(),
+            tool_call_id: format!("call-{id}"),
+            tool_name: "test".into(),
+            tool_input: serde_json::json!({}),
+            observed_at: chrono::Utc::now(),
+            dependencies: Vec::new(),
+            outcome: GoalVerificationOutcome::Passed,
+            command_status: None,
+            output_digest: "digest".into(),
+            preview: "passed".into(),
+            stale_reason: None,
+            criterion_indices,
+        }
+    }
+
+    fn audit(receipts: &[(&str, Vec<usize>, bool)]) -> GoalAudit {
+        let mut result = GoalAudit::default();
+        for (id, indices, valid) in receipts {
+            if *valid {
+                result.valid.insert((*id).into());
+            }
+            result.receipts.push(GoalReceiptAudit {
+                id: (*id).into(),
+                valid: *valid,
+                criterion_indices: indices.clone(),
+            });
+        }
+        result
+    }
+
+    #[test]
+    fn legacy_receipts_map_to_single_criterion_only() {
+        assert_eq!(
+            effective_criterion_indices(&receipt("legacy", Vec::new()), 1),
+            [0]
+        );
+        assert!(effective_criterion_indices(&receipt("legacy", Vec::new()), 2).is_empty());
+        assert_eq!(
+            effective_criterion_indices(&receipt("mapped", vec![1, 1, 9]), 2),
+            [1]
+        );
+    }
+
+    #[test]
+    fn completion_auto_associates_current_receipts() {
+        let goal = ThreadGoal::new(
+            "Ship it".into(),
+            vec!["Source compiles".into(), "Tests pass".into()],
+        )
+        .expect("goal");
+        let audit = audit(&[("compile", vec![0], true), ("tests", vec![1], true)]);
+        let (evidence, report) = prepare_completion_evidence(&goal, &[], &audit);
+        assert!(report.missing_evidence.is_empty(), "{report:?}");
+        assert_eq!(report.satisfied_criteria.len(), 2);
+        assert_eq!(evidence[0].verification_ids, ["compile"]);
+        assert_eq!(evidence[1].verification_ids, ["tests"]);
+        assert!(!evidence[0].assessment.trim().is_empty());
+    }
+
+    #[test]
+    fn completion_reports_missing_evidence_and_affected_stale_receipt() {
+        let goal = ThreadGoal::new(
+            "Ship it".into(),
+            vec!["Source compiles".into(), "Tests pass".into()],
+        )
+        .expect("goal");
+        let mut audit = audit(&[("compile", vec![0], true), ("tests", vec![1], false)]);
+        audit.stale_dependencies.push(GoalStaleDependency {
+            receipt_id: "tests".into(),
+            criterion_indices: vec![1],
+            dependencies: vec!["src/lib.rs".into()],
+            reason: "Declared dependencies changed since verification".into(),
+        });
+        let (_, report) = prepare_completion_evidence(&goal, &[], &audit);
+        assert_eq!(report.missing_evidence.len(), 1);
+        assert_eq!(
+            report.missing_evidence[0].reason,
+            "No current passing verification receipt covers this criterion"
+        );
+        assert_eq!(report.missing_evidence[0].criterion_index, 1);
+        assert_eq!(report.stale_dependencies.len(), 1);
+        assert_eq!(report.stale_dependencies[0].criterion_indices, [1]);
+        assert!(
+            report
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("lack current evidence"))
+        );
+    }
+
+    #[test]
+    fn completion_fills_ids_for_provided_assessment() {
+        let goal = ThreadGoal::new("Ship it".into(), vec!["Tests pass".into()]).expect("goal");
+        let audit = audit(&[("tests", vec![0], true)]);
+        let provided = vec![GoalCriterionEvidenceInput {
+            assessment: "The suite passed on the current tree".into(),
+            ..Default::default()
+        }];
+        let (evidence, report) = prepare_completion_evidence(&goal, &provided, &audit);
+        assert!(report.missing_evidence.is_empty(), "{report:?}");
+        assert_eq!(evidence[0].verification_ids, ["tests"]);
+        assert_eq!(
+            evidence[0].assessment,
+            "The suite passed on the current tree"
+        );
+    }
+}
+
+#[cfg(test)]
 mod output_tests {
     use super::*;
 
@@ -204,7 +381,10 @@ mod output_tests {
                 output: serde_json::json!(original),
                 successful: true,
                 outcome: GoalVerificationOutcome::Passed,
+                covered_criteria: vec![0],
+                coverage_note: None,
             }),
+            completion: None,
         };
         let retained = serde_json::to_value(&output).expect("serialize retained result");
         assert_eq!(retained["verification"]["output"], original);
@@ -244,7 +424,7 @@ impl GoalTool {
             input.tool_input.is_object(),
             "tool_input must be a JSON object matching the original tool schema"
         );
-        let (goal_id, project) = self.thread.read_with(cx, |thread, _| {
+        let (goal_id, project, criterion_count) = self.thread.read_with(cx, |thread, _| {
             let goal = thread
                 .goal()
                 .ok_or_else(|| anyhow::anyhow!("No goal is set"))?;
@@ -252,8 +432,24 @@ impl GoalTool {
                 goal.status == ThreadGoalStatus::Active,
                 "Resume the goal before verifying"
             );
-            anyhow::Ok((goal.id.clone(), thread.project().clone()))
+            anyhow::Ok((
+                goal.id.clone(),
+                thread.project().clone(),
+                goal.success_criteria.len(),
+            ))
         })??;
+        let mut criterion_indices = input.criterion_indices.clone();
+        criterion_indices.sort_unstable();
+        criterion_indices.dedup();
+        anyhow::ensure!(
+            criterion_indices
+                .iter()
+                .all(|index| *index < criterion_count),
+            "criterion_indices must refer to success criteria of the current goal"
+        );
+        if criterion_indices.is_empty() && criterion_count == 1 {
+            criterion_indices.push(0);
+        }
         let before = capture_goal_dependencies(&project, &input.dependencies, cx).await?;
         let task = self.thread.read_with(cx, |thread, cx| {
             thread.verification_tool(&input.tool_name, cx)
@@ -311,12 +507,22 @@ impl GoalTool {
             output_digest: format!("{:x}", Sha256::digest(&serialized)),
             preview: String::from_utf8(serialized)?.chars().take(1500).collect(),
             stale_reason,
+            criterion_indices: criterion_indices.clone(),
+        };
+        let coverage_note = if criterion_indices.is_empty() && criterion_count > 1 {
+            Some(
+                "This receipt is not associated with a criterion; pass verification.criterion_indices to enable automatic completion".into(),
+            )
+        } else {
+            None
         };
         let result = GoalVerificationResult {
             receipt_id: receipt.id.clone(),
             output: output.raw_output,
             successful,
             outcome,
+            covered_criteria: criterion_indices,
+            coverage_note,
         };
         self.thread.update(cx, |thread, cx| {
             thread.record_goal_verification(&goal_id, receipt, cx)?;
@@ -330,25 +536,48 @@ impl GoalTool {
         })?
     }
 
+    fn completion_failure_output(
+        &self,
+        report: GoalCompletionReport,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<GoalToolOutput> {
+        let message = report
+            .message
+            .clone()
+            .unwrap_or_else(|| "Goal is not complete".into());
+        let mut output = self.thread.read_with(cx, |thread, _| {
+            GoalToolOutput::snapshot(thread, message, None, None, 0)
+        })?;
+        output.completion = Some(report);
+        Ok(output)
+    }
+
     async fn audit_receipts(
         &self,
         selected: Option<&[String]>,
         cx: &mut AsyncApp,
-    ) -> anyhow::Result<collections::HashSet<String>> {
-        let (goal_id, project, receipts) = self.thread.read_with(cx, |thread, _| {
-            let goal = thread
-                .goal()
-                .ok_or_else(|| anyhow::anyhow!("No goal is set"))?;
-            let receipts = goal
-                .verification_receipts
-                .iter()
-                .filter(|receipt| selected.is_none_or(|ids| ids.contains(&receipt.id)))
-                .cloned()
-                .collect::<Vec<_>>();
-            anyhow::Ok((goal.id.clone(), thread.project().clone(), receipts))
-        })??;
-        let mut cached = HashMap::new();
-        let mut audited = collections::HashSet::default();
+    ) -> anyhow::Result<GoalAudit> {
+        let (goal_id, project, criterion_count, receipts) =
+            self.thread.read_with(cx, |thread, _| {
+                let goal = thread
+                    .goal()
+                    .ok_or_else(|| anyhow::anyhow!("No goal is set"))?;
+                let receipts = goal
+                    .verification_receipts
+                    .iter()
+                    .filter(|receipt| selected.is_none_or(|ids| ids.contains(&receipt.id)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                anyhow::Ok((
+                    goal.id.clone(),
+                    thread.project().clone(),
+                    goal.success_criteria.len(),
+                    receipts,
+                ))
+            })??;
+        let mut cached: HashMap<Vec<String>, Result<Vec<crate::GoalDependencySnapshot>, String>> =
+            HashMap::new();
+        let mut audit = GoalAudit::default();
         let mut statuses = Vec::new();
         for receipt in receipts {
             let paths = receipt
@@ -364,28 +593,184 @@ impl GoalTool {
                         .map_err(|error| error.to_string()),
                 );
             }
-            let reason = if receipt.outcome != GoalVerificationOutcome::Passed {
-                Some("Verification execution did not pass".to_string())
+            let criterion_indices = effective_criterion_indices(&receipt, criterion_count);
+            let (reason, changed_dependencies) = if receipt.outcome
+                != GoalVerificationOutcome::Passed
+            {
+                (
+                    Some("Verification execution did not pass".to_string()),
+                    Vec::new(),
+                )
             } else {
                 match cached.get(&paths) {
-                    Some(Ok(snapshot)) if snapshot == &receipt.dependencies => {
-                        audited.insert(receipt.id.clone());
-                        None
+                    Some(Ok(snapshot)) if snapshot == &receipt.dependencies => (None, Vec::new()),
+                    Some(Ok(snapshot)) => {
+                        let changed = receipt
+                            .dependencies
+                            .iter()
+                            .filter(|before| !snapshot.iter().any(|after| after == *before))
+                            .map(|dependency| dependency.path.clone())
+                            .collect::<Vec<_>>();
+                        (
+                            Some(
+                                "Declared dependencies changed since verification; rerun this check"
+                                    .into(),
+                            ),
+                            changed,
+                        )
                     }
-                    Some(Ok(_)) => Some(
-                        "Declared dependencies changed since verification; rerun this check".into(),
+                    Some(Err(error)) => (Some(error.clone()), paths.clone()),
+                    None => (
+                        Some("Dependency audit is unavailable".into()),
+                        paths.clone(),
                     ),
-                    Some(Err(error)) => Some(error.clone()),
-                    None => Some("Dependency audit is unavailable".into()),
                 }
             };
+            let valid = reason.is_none();
+            if valid {
+                audit.valid.insert(receipt.id.clone());
+            } else if receipt.outcome == GoalVerificationOutcome::Passed {
+                audit.stale_dependencies.push(GoalStaleDependency {
+                    receipt_id: receipt.id.clone(),
+                    criterion_indices: criterion_indices.clone(),
+                    dependencies: if changed_dependencies.is_empty() {
+                        paths.clone()
+                    } else {
+                        changed_dependencies.clone()
+                    },
+                    reason: reason.clone().unwrap_or_default(),
+                });
+            }
+            audit.receipts.push(GoalReceiptAudit {
+                id: receipt.id.clone(),
+                valid,
+                criterion_indices,
+            });
             statuses.push((receipt.id, reason));
         }
         self.thread.update(cx, |thread, cx| {
             thread.update_goal_verification_audit(&goal_id, statuses, cx)
         })??;
-        Ok(audited)
+        Ok(audit)
     }
+}
+
+fn effective_criterion_indices(
+    receipt: &GoalVerificationReceipt,
+    criterion_count: usize,
+) -> Vec<usize> {
+    if receipt.criterion_indices.is_empty() {
+        return if criterion_count == 1 {
+            vec![0]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut indices = receipt
+        .criterion_indices
+        .iter()
+        .copied()
+        .filter(|index| *index < criterion_count)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn prepare_completion_evidence(
+    goal: &ThreadGoal,
+    provided: &[GoalCriterionEvidenceInput],
+    audit: &GoalAudit,
+) -> (Vec<GoalCriterionEvidenceInput>, GoalCompletionReport) {
+    let mut report = GoalCompletionReport {
+        stale_dependencies: audit.stale_dependencies.clone(),
+        ..Default::default()
+    };
+    if !provided.is_empty() && provided.len() != goal.success_criteria.len() {
+        report.message = Some(
+            "Provide one evidence entry per criterion, or omit criterion_evidence so the harness can assemble it".into(),
+        );
+    }
+    let mut evidence = Vec::with_capacity(goal.success_criteria.len());
+    for (index, criterion) in goal.success_criteria.iter().enumerate() {
+        let mut entry = provided.get(index).cloned().unwrap_or_default();
+        let scope = goal
+            .criterion_scopes
+            .get(index)
+            .copied()
+            .unwrap_or(GoalEvidenceScope::Workspace);
+        if scope == GoalEvidenceScope::Workspace && entry.verification_ids.is_empty() {
+            let auto_ids = audit
+                .receipts
+                .iter()
+                .rev()
+                .filter(|receipt| receipt.valid && receipt.criterion_indices.contains(&index))
+                .map(|receipt| receipt.id.clone())
+                .collect::<Vec<_>>();
+            if !auto_ids.is_empty() {
+                entry.verification_ids = auto_ids.clone();
+                if entry.assessment.trim().is_empty() {
+                    entry.assessment = format!(
+                        "Automatically associated with current verification receipt(s): {}.",
+                        auto_ids.join(", ")
+                    );
+                }
+            }
+        }
+        let invalid_ids = entry
+            .verification_ids
+            .iter()
+            .filter(|id| !audit.valid.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_reason = if entry.historical != (scope == GoalEvidenceScope::Historical) {
+            Some(
+                "Evidence scope is fixed when the goal is created; do not downgrade workspace requirements to historical observations"
+                    .into(),
+            )
+        } else if entry.historical && entry.limitations.trim().is_empty() {
+            Some("State the limits of historical evidence".into())
+        } else if entry.historical
+            && entry.tool_call_ids.is_empty()
+            && entry.verification_ids.is_empty()
+        {
+            Some("Historical criterion requires original observations".into())
+        } else if !entry.historical && entry.verification_ids.is_empty() {
+            Some("No current passing verification receipt covers this criterion".into())
+        } else if !invalid_ids.is_empty() {
+            Some(format!(
+                "Verification {} is missing, failed, or stale; inspect and rerun it",
+                invalid_ids.join(", ")
+            ))
+        } else if entry.assessment.trim().is_empty() {
+            Some("Each criterion needs a coverage assessment".to_string())
+        } else {
+            None
+        };
+        match missing_reason {
+            Some(reason) => report.missing_evidence.push(GoalMissingCriterion {
+                criterion_index: index,
+                criterion: criterion.clone(),
+                reason,
+                suggested_action: format!(
+                    "Run manage_goal action=verify with verification.criterion_indices=[{index}] for this criterion"
+                ),
+            }),
+            None => report.satisfied_criteria.push(GoalSatisfiedCriterion {
+                criterion_index: index,
+                criterion: criterion.clone(),
+                verification_ids: entry.verification_ids.clone(),
+            }),
+        }
+        evidence.push(entry);
+    }
+    if !report.missing_evidence.is_empty() && report.message.is_none() {
+        report.message = Some(format!(
+            "Goal is not complete: {} criteria lack current evidence",
+            report.missing_evidence.len()
+        ));
+    }
+    (evidence, report)
 }
 
 impl AgentTool for GoalTool {
@@ -431,6 +816,54 @@ impl AgentTool for GoalTool {
                     Err(output)
                 };
             }
+            let confirmed_goal_id = if matches!(input.action.as_str(), "pause" | "blocked" | "resume") {
+                if input.action == "blocked" && input.evidence.trim().is_empty() {
+                    return Err(GoalToolOutput::error("Provide a concrete blocking reason"));
+                }
+                let goal_id = self.thread.read_with(cx, |thread, _| -> anyhow::Result<_> {
+                    let goal = thread.goal().ok_or_else(|| anyhow::anyhow!("No goal is set"))?;
+                    if input.action == "resume" {
+                        anyhow::ensure!(matches!(goal.status, ThreadGoalStatus::Paused | ThreadGoalStatus::Blocked), "The goal is not paused or blocked");
+                    } else {
+                        anyhow::ensure!(goal.status == ThreadGoalStatus::Active, "The goal is not active");
+                    }
+                    Ok(goal.id.clone())
+                }).map_err(GoalToolOutput::error)?.map_err(GoalToolOutput::error)?;
+                let (question, confirm_label, cancel_label) = match input.action.as_str() {
+                    "blocked" => (format!("The agent reports that the goal is blocked: {}. Stop and mark it blocked?", input.evidence), "Stop", "Continue working"),
+                    "resume" => ("Resume the goal?".to_string(), "Resume", "Keep paused"),
+                    _ => ("Pause the active goal?".to_string(), "Stop", "Continue working"),
+                };
+                let schema = acp::ElicitationSchema::new().property(
+                    "choice",
+                    acp::StringPropertySchema::new().title("Choose an option").one_of(vec![
+                        acp::EnumOption::new(confirm_label, confirm_label),
+                        acp::EnumOption::new(cancel_label, cancel_label),
+                    ]),
+                    true,
+                );
+                let response = cx.update(|cx| event_stream.request_elicitation(question, schema, cx))
+                    .await.map_err(GoalToolOutput::error)?;
+                let confirmed = match response.action {
+                    acp::ElicitationAction::Accept(accept) => accept.content
+                        .and_then(|content| content.get("choice").cloned())
+                        .is_some_and(|choice| matches!(choice, acp::ElicitationContentValue::String(value) if value == confirm_label)),
+                    _ => false,
+                };
+                if !confirmed {
+                    let message = if input.action == "resume" {
+                        "The goal remains paused. Do not resume it without the user's approval."
+                    } else {
+                        "The goal remains active. Continue independent work; do not repeat this request without new information."
+                    };
+                    return Err(GoalToolOutput::error(message));
+                }
+                Some(goal_id)
+            } else {
+                None
+            };
+            let mut completion_evidence = input.criterion_evidence.clone();
+            let mut completion_report = None;
             let audited = if input.action == "inspect" {
                 let selected = self
                     .thread
@@ -460,80 +893,109 @@ impl AgentTool for GoalTool {
                     .map_err(GoalToolOutput::error)?;
                 self.audit_receipts(Some(&selected), cx)
                     .await
-                    .map_err(GoalToolOutput::error)?
+                    .map_err(GoalToolOutput::error)?;
+                collections::HashSet::default()
             } else if input.action == "complete" {
-                let selected = input
-                    .criterion_evidence
-                    .iter()
-                    .flat_map(|criterion| criterion.verification_ids.iter().cloned())
-                    .collect::<Vec<_>>();
-                self.audit_receipts(Some(&selected), cx)
+                let audit = self
+                    .audit_receipts(None, cx)
                     .await
+                    .map_err(GoalToolOutput::error)?;
+                let goal = self
+                    .thread
+                    .read_with(cx, |thread, _| thread.goal().cloned())
                     .map_err(GoalToolOutput::error)?
+                    .ok_or_else(|| GoalToolOutput::error("No goal is set"))?;
+                let (evidence, report) =
+                    prepare_completion_evidence(&goal, &completion_evidence, &audit);
+                if report.message.is_some() || !report.missing_evidence.is_empty() {
+                    return Err(self
+                        .completion_failure_output(report, cx)
+                        .map_err(GoalToolOutput::error)?);
+                }
+                completion_evidence = evidence;
+                completion_report = Some(report);
+                audit.valid
             } else {
                 collections::HashSet::default()
             };
-            self.thread
-                .update(cx, |thread, cx| -> anyhow::Result<_> {
-                    match input.action.as_str() {
-                        "inspect" => {}
-                        "create" => {
-                            anyhow::ensure!(
-                                !input.verification_surfaces.is_empty()
-                                    && input
-                                        .verification_surfaces
-                                        .iter()
-                                        .all(|surface| !surface.trim().is_empty()),
-                                "Describe a concrete verification surface"
-                            );
-                            anyhow::ensure!(
-                                input
-                                    .constraints
+            let updated = self.thread.update(cx, |thread, cx| -> anyhow::Result<_> {
+                match input.action.as_str() {
+                    "inspect" => {}
+                    "create" => {
+                        anyhow::ensure!(
+                            !input.verification_surfaces.is_empty()
+                                && input
+                                    .verification_surfaces
                                     .iter()
-                                    .all(|constraint| !constraint.trim().is_empty()),
-                                "Constraints must be non-empty when provided"
-                            );
-                            let mut goal =
-                                ThreadGoal::new(input.objective, input.success_criteria)?;
-                            if !input.criterion_scopes.is_empty() {
-                                anyhow::ensure!(
-                                    input.criterion_scopes.len() == goal.success_criteria.len(),
-                                    "Provide one evidence scope per criterion"
-                                );
-                                goal.criterion_scopes = input.criterion_scopes;
-                            }
-                            goal.verification_surfaces = input.verification_surfaces;
-                            goal.constraints = input.constraints;
-                            thread.set_goal(goal, cx)?;
-                        }
-                        "complete" => {
-                            thread.complete_goal(input.criterion_evidence, &audited, cx)?
-                        }
-                        "blocked" => {
+                                    .all(|surface| !surface.trim().is_empty()),
+                            "Describe a concrete verification surface"
+                        );
+                        anyhow::ensure!(
+                            input
+                                .constraints
+                                .iter()
+                                .all(|constraint| !constraint.trim().is_empty()),
+                            "Constraints must be non-empty when provided"
+                        );
+                        let mut goal = ThreadGoal::new(input.objective, input.success_criteria)?;
+                        if !input.criterion_scopes.is_empty() {
                             anyhow::ensure!(
-                                !input.evidence.trim().is_empty(),
-                                "Provide a blocking reason"
+                                input.criterion_scopes.len() == goal.success_criteria.len(),
+                                "Provide one evidence scope per criterion"
                             );
-                            thread.set_goal_status(
-                                ThreadGoalStatus::Blocked,
-                                Some(input.evidence),
-                                cx,
-                            )?;
+                            goal.criterion_scopes = input.criterion_scopes;
                         }
-                        "pause" => thread.set_goal_status(ThreadGoalStatus::Paused, None, cx)?,
-                        "resume" => thread.set_goal_status(ThreadGoalStatus::Active, None, cx)?,
-                        _ => anyhow::bail!("Unknown goal action"),
+                        goal.verification_surfaces = input.verification_surfaces;
+                        goal.constraints = input.constraints;
+                        thread.set_goal(goal, cx)?;
                     }
-                    Ok(GoalToolOutput::snapshot(
-                        thread,
-                        "Goal state updated".into(),
-                        None,
-                        input.verification_id.as_deref(),
-                        if input.action == "inspect" { 5 } else { 0 },
-                    ))
-                })
-                .map_err(GoalToolOutput::error)?
-                .map_err(GoalToolOutput::error)
+                    "complete" => {
+                        thread.complete_goal(completion_evidence, &audited, cx)?
+                    }
+                    "blocked" => {
+                        anyhow::ensure!(thread.goal().is_some_and(|goal| Some(&goal.id) == confirmed_goal_id.as_ref() && goal.status == ThreadGoalStatus::Active), "The goal changed while awaiting confirmation");
+                        anyhow::ensure!(
+                            !input.evidence.trim().is_empty(),
+                            "Provide a blocking reason"
+                        );
+                        thread.set_goal_status(
+                            ThreadGoalStatus::Blocked,
+                            Some(input.evidence),
+                            cx,
+                        )?;
+                    }
+                    "pause" => {
+                        anyhow::ensure!(thread.goal().is_some_and(|goal| Some(&goal.id) == confirmed_goal_id.as_ref() && goal.status == ThreadGoalStatus::Active), "The goal changed while awaiting confirmation");
+                        thread.set_goal_status(ThreadGoalStatus::Paused, Some("Paused by user".into()), cx)?;
+                    }
+                    "resume" => {
+                        anyhow::ensure!(thread.goal().is_some_and(|goal| Some(&goal.id) == confirmed_goal_id.as_ref() && matches!(goal.status, ThreadGoalStatus::Paused | ThreadGoalStatus::Blocked)), "The goal changed while awaiting confirmation");
+                        thread.set_goal_status(ThreadGoalStatus::Active, None, cx)?;
+                    }
+                    _ => anyhow::bail!("Unknown goal action"),
+                }
+                Ok(GoalToolOutput::snapshot(
+                    thread,
+                    "Goal state updated".into(),
+                    None,
+                    input.verification_id.as_deref(),
+                    if input.action == "inspect" { 5 } else { 0 },
+                ))
+            });
+            let mut output = match updated {
+                Ok(result) => result.map_err(GoalToolOutput::error)?,
+                Err(error) => {
+                    let mut report = completion_report.take().unwrap_or_default();
+                    report.message = Some(error.to_string());
+                    return Err(self
+                        .completion_failure_output(report, cx)
+                        .map_err(GoalToolOutput::error)?);
+                }
+            };
+            if let Some(report) = completion_report {
+                output.completion = Some(report);
+            }
+            Ok(output)
         })
     }
 }
