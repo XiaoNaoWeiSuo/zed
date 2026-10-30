@@ -1,6 +1,5 @@
 mod agent_usage;
 mod application_menu;
-pub mod collab;
 mod title_bar_settings;
 
 use crate::agent_usage::AgentUsageIndicator;

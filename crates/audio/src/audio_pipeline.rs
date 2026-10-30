@@ -7,15 +7,12 @@ use cpal::{
 use futures::channel::oneshot;
 use gpui::{App, AsyncApp, BorrowAppContext, Global, Task};
 
-pub(super) use cpal::Sample;
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, mixer::Mixer, source::Buffered};
 use settings::Settings;
 use std::io::Cursor;
 use util::ResultExt;
 
-mod echo_canceller;
-use echo_canceller::EchoCanceller;
 mod rodio_ext;
 pub use crate::audio_settings::AudioSettings;
 pub use rodio_ext::RodioExt;
@@ -23,8 +20,6 @@ pub use rodio_ext::RodioExt;
 use crate::Sound;
 
 use super::{CHANNEL_COUNT, SAMPLE_RATE};
-pub const BUFFER_SIZE: usize = // echo canceller and livekit want 10ms of audio
-    (SAMPLE_RATE.get() as usize / 100) * CHANNEL_COUNT.get() as usize;
 
 pub fn init(_cx: &mut App) {}
 
@@ -49,7 +44,6 @@ pub fn ensure_devices_initialized(cx: &mut App) {
 pub struct Audio {
     output: Option<(MixerDeviceSink, Mixer)>,
     output_error_task: Option<Task<()>>,
-    pub echo_canceller: EchoCanceller,
     source_cache: HashMap<Sound, Buffered<Decoder<Cursor<Vec<u8>>>>>,
 }
 
@@ -68,11 +62,7 @@ impl Audio {
 
         if self.output.is_none() {
             let (error_callback, error_task) = output_error_handler(cx);
-            let output = open_output_stream(
-                output_audio_device,
-                self.echo_canceller.clone(),
-                error_callback,
-            )?;
+            let output = open_output_stream(output_audio_device, error_callback)?;
             self.output = Some(output);
             self.output_error_task = Some(error_task);
         }
@@ -198,7 +188,6 @@ pub fn open_test_output(device_id: Option<DeviceId>) -> anyhow::Result<MixerDevi
 
 pub fn open_output_stream(
     device_id: Option<DeviceId>,
-    mut echo_canceller: EchoCanceller,
     error_callback: impl FnMut(Error) + Send + 'static,
 ) -> anyhow::Result<(MixerDeviceSink, Mixer)> {
     let device = resolve_device(device_id.as_ref(), false)?;
@@ -213,12 +202,7 @@ pub fn open_output_stream(
     let (output_mixer, source) = rodio::mixer::mixer(CHANNEL_COUNT, SAMPLE_RATE);
     // otherwise the mixer ends as it's empty
     output_mixer.add(rodio::source::Zero::new(CHANNEL_COUNT, SAMPLE_RATE));
-    let echo_cancelling_source = source // apply echo cancellation just before output
-        .inspect_buffer::<BUFFER_SIZE, _>(move |buffer| {
-            let mut buf: [i16; _] = buffer.map(|s| s.to_sample());
-            echo_canceller.process_reverse_stream(&mut buf)
-        });
-    output_handle.mixer().add(echo_cancelling_source);
+    output_handle.mixer().add(source);
 
     Ok((output_handle, output_mixer))
 }
