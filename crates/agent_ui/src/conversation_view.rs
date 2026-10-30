@@ -5117,14 +5117,18 @@ pub(crate) mod tests {
             serde_json::json!([{"root":"project", "scope":"agent", "remaining":["Verify recovery"], "evidence":[{"description":"Previous test", "source":"session:missing/tool:missing"}]}]).to_string(), cx
         ));
         cx.run_until_parked();
-        let card = cx
-            .debug_bounds("project-checkpoint")
-            .expect("checkpoint card");
+        assert!(cx.debug_bounds("project-checkpoint").is_none());
         assert!(cx.debug_bounds("project-checkpoint-details").is_none());
-        cx.simulate_click(
-            point(card.origin.x + px(30.), card.center().y),
-            gpui::Modifiers::default(),
-        );
+        let thread_view = conversation_view
+            .read_with(cx, |view, _| view.root_thread_view())
+            .expect("root thread view");
+        thread_view.update(cx, |view, cx| {
+            let (icon, _) = view
+                .render_project_checkpoint_status(cx)
+                .expect("memory status");
+            assert_eq!(icon, IconName::DatabaseZap);
+            view.toggle_project_checkpoint(cx);
+        });
         cx.run_until_parked();
         assert!(cx.debug_bounds("project-checkpoint-details").is_some());
         let evidence = cx
