@@ -114,6 +114,10 @@ mod tests {
         assert!(rendered.contains("You are the Lin coding agent"));
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Tools and verification"));
+        assert!(rendered.contains("the user's explicit task instructions take precedence"));
+        assert!(rendered.contains("If the user provides an accurate path, read it directly"));
+        assert!(rendered.contains("For implementation requests"));
+        assert!(rendered.contains("the tool schema is authoritative"));
         assert!(!rendered.contains("ask_user"));
         assert!(!rendered.contains("manage_goal"));
         assert!(!rendered.contains("1-2 focused attempts"));
@@ -137,6 +141,8 @@ mod tests {
             };
             let rendered = templates.0.render(name, &template).expect("prompt");
             assert!(rendered.contains("supplied conversation only"));
+            assert!(rendered.contains("the user's explicit task instructions take precedence"));
+            assert!(rendered.contains("For implementation requests"));
             assert!(!rendered.contains("For a greeting alone"));
             assert!(!rendered.contains("Use `project_checkpoint`"));
             assert!(!rendered.contains("## Tools and verification"));
@@ -145,7 +151,8 @@ mod tests {
                 .0
                 .render(name, &template)
                 .expect("prompt with tools");
-            assert!(rendered.contains("Defer a question"));
+            assert!(rendered.contains("If the user provides an accurate path, read it directly"));
+            assert!(rendered.contains("ask with `defer: true`"));
             assert!(!rendered.contains("Use `project_checkpoint`"));
             template.available_tools.push("project_checkpoint".into());
             let rendered = templates
@@ -154,7 +161,6 @@ mod tests {
                 .expect("checkpoint workflow");
             assert!(rendered.contains("when saved task history would resolve a gap"));
             assert!(rendered.contains("recheck changed inputs or missing coverage"));
-            assert!(rendered.contains("audit every criterion"));
             assert!(!rendered.contains("Delegate only"));
             assert!(!rendered.contains("1-2 focused attempts"));
             assert!(!rendered.contains("let the user decide whether to rerun"));
