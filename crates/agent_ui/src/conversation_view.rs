@@ -872,6 +872,31 @@ impl ConversationView {
         })
     }
 
+    pub fn has_pending_question(&self, cx: &App) -> bool {
+        self.as_connected().is_some_and(|connected| {
+            connected
+                .conversation
+                .read(cx)
+                .threads
+                .values()
+                .any(|thread| {
+                    let thread = thread.read(cx);
+                    thread.entries().iter().any(|entry| {
+                        let AgentThreadEntry::Elicitation(id) = entry else {
+                            return false;
+                        };
+                        thread.elicitation(id).is_some_and(|(_, elicitation)| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                                && matches!(
+                                    &elicitation.request.mode,
+                                    acp_v2::ElicitationMode::Form(_)
+                                )
+                        })
+                    })
+                })
+        })
+    }
+
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
@@ -7298,6 +7323,44 @@ pub(crate) mod tests {
                 "pending form elicitations that predate ThreadView construction should be usable"
             );
         });
+        assert!(conversation_view.read_with(cx, |view, cx| view.has_pending_question(cx)));
+        let thread = active_thread.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        [(
+                            "name".into(),
+                            acp_v2::ElicitationContentValue::String("Ada".into()),
+                        )]
+                        .into_iter()
+                        .collect::<collections::BTreeMap<_, _>>(),
+                    ),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(!conversation_view.read_with(cx, |view, cx| view.has_pending_question(cx)));
+        thread.update(cx, |thread, cx| {
+            let session_id = thread.session_id().clone();
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id),
+                            acp_v2::ElicitationSchema::new().string("answer", true),
+                        ),
+                        "Another question",
+                    ),
+                    cx,
+                )
+                .expect("new question should be accepted")
+                .detach();
+        });
+        cx.run_until_parked();
+        assert!(conversation_view.read_with(cx, |view, cx| view.has_pending_question(cx)));
     }
 
     #[gpui::test]

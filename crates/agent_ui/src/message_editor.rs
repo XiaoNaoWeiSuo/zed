@@ -898,6 +898,7 @@ impl MessageEditor {
             .mention_set
             .update(cx, |store, cx| store.contents(full_mention_content, cx));
         let editor = self.editor.clone();
+        let large_paste_creases = self.large_paste_creases.clone();
         let supports_embedded_context =
             self.session_capabilities.read().supports_embedded_context();
 
@@ -912,6 +913,7 @@ impl MessageEditor {
                     &crease_snapshot,
                     &buffer_snapshot,
                     supports_embedded_context,
+                    &large_paste_creases,
                     |crease_id| {
                         contents
                             .remove(crease_id)
@@ -937,6 +939,7 @@ impl MessageEditor {
             &crease_snapshot,
             &buffer_snapshot,
             supports_embedded_context,
+            &self.large_paste_creases,
             |crease_id| mention_set.resolved_mention_for_crease(crease_id),
         );
         chunks
@@ -1367,6 +1370,17 @@ impl MessageEditor {
             return;
         }
 
+        self.fold_pasted_text(anchor, content_len, line_count, window, cx);
+    }
+
+    fn fold_pasted_text(
+        &mut self,
+        anchor: language::Anchor,
+        content_len: usize,
+        line_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let label: SharedString = format!("Pasted {line_count} lines").into();
         let icon_path = ui::IconName::FileTextOutlined.path().into();
         let Some((crease_id, tx, _)) = insert_crease_for_mention(
@@ -1768,6 +1782,7 @@ impl MessageEditor {
         self.editor
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.clear_mentions(cx);
+        self.large_paste_creases.clear();
         self.insert_message_blocks(message, false, window, cx);
     }
 
@@ -1836,6 +1851,7 @@ impl MessageEditor {
         let path_style = workspace.read(cx).project().read(cx).path_style(cx);
         let mut text = String::new();
         let mut mentions = Vec::new();
+        let mut pasted_text_ranges = Vec::new();
         let append_normalized = |text: &mut String, mut segment: String| {
             LineEnding::normalize(&mut segment);
             text.push_str(&segment);
@@ -1844,7 +1860,17 @@ impl MessageEditor {
         for chunk in message {
             match chunk {
                 acp_v2::ContentBlock::Text(text_content) => {
+                    let is_pasted = text_content
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get(PASTED_TEXT_META_KEY))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let start = text.len();
                     append_normalized(&mut text, text_content.text);
+                    if is_pasted && text.len() > start {
+                        pasted_text_ranges.push((start..text.len(), text[start..].lines().count()));
+                    }
                 }
                 acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource {
                     resource: acp_v2::EmbeddedResourceResource::TextResourceContents(resource),
@@ -1933,6 +1959,13 @@ impl MessageEditor {
                 editor.buffer().read(cx).snapshot(cx)
             })
         };
+
+        for (range, line_count) in pasted_text_ranges {
+            let anchor = snapshot.anchor_before(MultiBufferOffset(insertion_start + range.start));
+            if let Some((anchor, _)) = snapshot.anchor_to_buffer_anchor(anchor) {
+                self.fold_pasted_text(anchor, range.len(), line_count, window, cx);
+            }
+        }
 
         for (range, mention_uri, mention) in mentions {
             let adjusted_start = insertion_start + range.start;
@@ -2175,6 +2208,8 @@ impl Addon for MessageEditorAddon {
     }
 }
 
+const PASTED_TEXT_META_KEY: &str = "lin.pasted_text";
+
 /// Walks the editor's creases in order, interleaving plain-text chunks from
 /// `text` with mention blocks produced from `resolve`.
 fn build_chunks_from_creases(
@@ -2182,6 +2217,7 @@ fn build_chunks_from_creases(
     crease_snapshot: &CreaseSnapshot,
     buffer_snapshot: &MultiBufferSnapshot,
     supports_embedded_context: bool,
+    large_paste_creases: &[CreaseId],
     mut resolve: impl FnMut(&CreaseId) -> Option<(MentionUri, Option<Mention>)>,
 ) -> (Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>) {
     let mut ix = text
@@ -2192,10 +2228,26 @@ fn build_chunks_from_creases(
     let mut tracked_buffers = Vec::new();
 
     for (crease_id, crease) in crease_snapshot.creases() {
+        let crease_range = crease.range().to_offset(buffer_snapshot);
+        if large_paste_creases.contains(&crease_id) {
+            let Some(pasted_text) = text.get(crease_range.start.0..crease_range.end.0) else {
+                continue;
+            };
+            if crease_range.start.0 > ix {
+                chunks.push(text[ix..crease_range.start.0].into());
+            }
+            chunks.push(acp_v2::ContentBlock::Text(
+                acp_v2::TextContent::new(pasted_text).meta(serde_json::Map::from_iter([(
+                    PASTED_TEXT_META_KEY.to_owned(),
+                    serde_json::Value::Bool(true),
+                )])),
+            ));
+            ix = crease_range.end.0;
+            continue;
+        }
         let Some((uri, mention)) = resolve(&crease_id) else {
             continue;
         };
-        let crease_range = crease.range().to_offset(buffer_snapshot);
         if crease_range.start.0 > ix {
             chunks.push(text[ix..crease_range.start.0].into());
         }
@@ -5911,6 +5963,59 @@ mod tests {
 
         cx.run_until_parked();
         (message_editor, cx)
+    }
+
+    #[gpui::test]
+    async fn test_pasted_text_label_survives_source_message_round_trip(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let pasted_text = (0..16)
+            .map(|line| format!("粘贴 {line}\n"))
+            .collect::<String>();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.insert_text("Before\n", window, cx);
+            editor.paste_item(&ClipboardItem::new_string(pasted_text.clone()), window, cx);
+            editor.insert_text("After", window, cx);
+        });
+        let blocks = message_editor
+            .update(cx, |editor, cx| editor.contents(false, cx))
+            .await
+            .expect("serialize pasted text")
+            .0;
+        let blocks: Vec<acp_v2::ContentBlock> =
+            serde_json::from_value(serde_json::to_value(blocks).expect("serialize message blocks"))
+                .expect("restore message blocks");
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_read_only(true, cx);
+            editor.set_source_message(blocks, window, cx);
+            assert_eq!(editor.text(cx), format!("Before\n{pasted_text}After"));
+            assert_eq!(editor.large_paste_creases.len(), 1);
+            let snapshot = editor
+                .editor
+                .read(cx)
+                .display_map
+                .read(cx)
+                .crease_snapshot();
+            assert!(
+                snapshot
+                    .creases()
+                    .any(|(crease_id, _)| editor.large_paste_creases.contains(&crease_id))
+            );
+            let blocks = editor.draft_content_blocks_snapshot(cx);
+            assert!(blocks.iter().any(|block| matches!(
+                block,
+                acp_v2::ContentBlock::Text(text) if text.text == pasted_text
+            )));
+            editor.set_source_message(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    pasted_text.clone(),
+                ))],
+                window,
+                cx,
+            );
+            assert!(editor.large_paste_creases.is_empty());
+            assert_eq!(editor.text(cx), pasted_text);
+        });
     }
 
     #[gpui::test]

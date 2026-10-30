@@ -45,6 +45,9 @@ pub struct ThreadItem {
     title_slot: Option<AnyElement>,
     title_label_color: Option<Color>,
     title_generating: bool,
+    question_pending: bool,
+    sidebar_compact: bool,
+    single_line: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
     notified: bool,
@@ -80,6 +83,9 @@ impl ThreadItem {
             title_slot: None,
             title_label_color: None,
             title_generating: false,
+            question_pending: false,
+            sidebar_compact: false,
+            single_line: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
             notified: false,
@@ -147,6 +153,21 @@ impl ThreadItem {
 
     pub fn title_generating(mut self, generating: bool) -> Self {
         self.title_generating = generating;
+        self
+    }
+
+    pub fn question_pending(mut self, pending: bool) -> Self {
+        self.question_pending = pending;
+        self
+    }
+
+    pub fn sidebar_compact(mut self, compact: bool) -> Self {
+        self.sidebar_compact = compact;
+        self
+    }
+
+    pub fn single_line(mut self, single_line: bool) -> Self {
+        self.single_line = single_line;
         self
     }
 
@@ -353,6 +374,29 @@ impl RenderOnce for ThreadItem {
         } else {
             icon_container().child(agent_icon).into_any_element()
         };
+        let (leading_icon, trailing_status) = if self.sidebar_compact && !self.single_line {
+            (
+                None,
+                (self.status != AgentThreadStatus::Completed || self.notified).then_some(icon),
+            )
+        } else {
+            (Some(icon), None)
+        };
+        let action_slot = if self.hovered {
+            self.action_slot
+        } else {
+            let id = self.id.clone();
+            trailing_status.map(|icon| {
+                h_flex()
+                    .debug_selector(move || format!("thread-status-{id}"))
+                    .flex_none()
+                    .w(IconSize::Small.rems() + DynamicSpacing::Base04.rems(cx) * 2.)
+                    .h(ButtonSize::Default.rems())
+                    .justify_center()
+                    .child(icon)
+                    .into_any_element()
+            })
+        };
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
@@ -382,6 +426,21 @@ impl RenderOnce for ThreadItem {
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
+        let title_label = if self.question_pending {
+            div()
+                .min_w_0()
+                .child(title_label)
+                .with_animation(
+                    "pending-question-title",
+                    Animation::new(Duration::from_secs(2))
+                        .repeat()
+                        .with_easing(pulsating_between(0.45, 1.0)),
+                    |element, delta| element.opacity(delta),
+                )
+                .into_any_element()
+        } else {
+            title_label
+        };
 
         let has_diff_stats = self.added.is_some() || self.removed.is_some();
         let diff_stat_id = self.id.clone();
@@ -407,10 +466,11 @@ impl RenderOnce for ThreadItem {
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
 
-        let show_tooltip = matches!(
-            self.status,
-            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
-        );
+        let show_tooltip = self.question_pending
+            || matches!(
+                self.status,
+                AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+            );
 
         let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
@@ -435,7 +495,8 @@ impl RenderOnce for ThreadItem {
             .flex_shrink_0()
             .overflow_hidden()
             .w_full()
-            .py_1()
+            .when(self.sidebar_compact, |this| this.py_0p5())
+            .when(!self.sidebar_compact, |this| this.py_1())
             .px_1p5()
             .when(self.selected, |s| s.bg(color.ghost_element_selected))
             .border_1()
@@ -459,43 +520,41 @@ impl RenderOnce for ThreadItem {
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
-                            .child(icon)
+                            .children(leading_icon)
                             .child(title_label),
                     )
                     .when(self.is_truncated && opaque_window, |this| {
                         this.child(gradient_overlay)
                     })
-                    .when(self.hovered, |this| {
-                        this.when_some(self.action_slot, |this, slot| {
-                            this.child(
-                                h_flex()
-                                    .relative()
-                                    .when(opaque_window, |this| {
-                                        this.child(
-                                            GradientFade::new(base_bg, hover_bg, active_bg)
-                                                .width(px(120.0))
-                                                .right(px(8.))
-                                                .gradient_stop(0.90)
-                                                .group_name("thread-item"),
-                                        )
-                                    })
-                                    .child(
-                                        h_flex()
-                                            .pr_1p5()
-                                            .child(slot)
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                    ),
-                            )
-                        })
+                    .when_some(action_slot, |this, slot| {
+                        this.child(
+                            h_flex()
+                                .relative()
+                                .when(opaque_window, |this| {
+                                    this.child(
+                                        GradientFade::new(base_bg, hover_bg, active_bg)
+                                            .width(px(120.0))
+                                            .right(px(8.))
+                                            .gradient_stop(0.90)
+                                            .group_name("thread-item"),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .pr_1p5()
+                                        .child(slot)
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                ),
+                        )
                     }),
             )
-            .when(has_metadata, |this| {
+            .when(has_metadata && !self.single_line, |this| {
                 this.child(
                     h_flex()
                         .gap_1p5()
-                        .child(icon_container()) // Icon Spacing
+                        .when(!self.sidebar_compact, |this| this.child(icon_container()))
                         .when(self.archived, |this| {
                             this.child(
                                 Icon::new(IconName::Archive).size(IconSize::XSmall).color(
@@ -616,7 +675,11 @@ impl RenderOnce for ThreadItem {
             })
             .when(show_tooltip, |this| {
                 let status = self.status;
+                let question_pending = self.question_pending;
                 this.tooltip(Tooltip::element(move |_, _| match status {
+                    _ if question_pending => {
+                        Label::new("Waiting for your answer").into_any_element()
+                    }
                     AgentThreadStatus::Error => h_flex()
                         .gap_1()
                         .child(
@@ -996,6 +1059,7 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TintColor;
     use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
 
     #[gpui::test]
@@ -1022,6 +1086,59 @@ mod tests {
         assert_eq!(painted_backgrounds(cx).first(), Some(&active));
         cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
         assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
+    }
+
+    #[gpui::test]
+    fn test_running_thread_status_uses_hover_action_position(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| RunningThreadTestView { hovered: false });
+        let status_bounds = cx
+            .debug_bounds("thread-status-running-thread")
+            .expect("running status is visible before hovering");
+        assert!(cx.debug_bounds("ICON-Stop").is_none());
+
+        cx.simulate_mouse_move(status_bounds.center(), None, Modifiers::default());
+        let stop_bounds = cx.debug_bounds("ICON-Stop").expect("hover stop button");
+        assert!(cx.debug_bounds("thread-status-running-thread").is_none());
+        assert!((status_bounds.center().x - stop_bounds.center().x).abs() <= px(0.1));
+        assert!((status_bounds.center().y - stop_bounds.center().y).abs() <= px(0.1));
+
+        cx.simulate_mouse_move(point(px(5.), px(5.)), None, Modifiers::default());
+        assert_eq!(
+            cx.debug_bounds("thread-status-running-thread"),
+            Some(status_bounds),
+        );
+        assert!(cx.debug_bounds("ICON-Stop").is_none());
+    }
+
+    struct RunningThreadTestView {
+        hovered: bool,
+    }
+
+    impl Render for RunningThreadTestView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().p(px(20.)).child(
+                div().w(px(260.)).child(
+                    ThreadItem::new("running-thread", "A long running thread title ".repeat(10))
+                        .sidebar_compact(true)
+                        .status(AgentThreadStatus::Running)
+                        .hovered(self.hovered)
+                        .on_hover(cx.listener(|view, hovered, _, cx| {
+                            view.hovered = *hovered;
+                            cx.notify();
+                        }))
+                        .action_slot(
+                            IconButton::new("stop-thread", IconName::Stop)
+                                .icon_size(IconSize::Small)
+                                .style(ButtonStyle::Tinted(TintColor::Error)),
+                        ),
+                ),
+            )
+        }
     }
 
     struct ThreadItemTestView {

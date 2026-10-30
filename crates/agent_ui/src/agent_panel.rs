@@ -4249,7 +4249,10 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() || view.has_saved_input() {
+                if view.has_pending_selections()
+                    || view.has_saved_input()
+                    || view.has_pending_question(cx)
+                {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {
@@ -5516,6 +5519,29 @@ impl AgentPanel {
         let opaque_window =
             cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
 
+        let project_memory_button = match self.visible_surface() {
+            VisibleSurface::AgentThread(conversation_view) => conversation_view
+                .read(cx)
+                .root_thread_view()
+                .and_then(|thread_view| {
+                    thread_view
+                        .read(cx)
+                        .render_project_checkpoint_status(cx)
+                        .map(|(icon, tooltip)| {
+                            IconButton::new("project-memory-status", icon)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(tooltip))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    thread_view.update(cx, |thread_view, cx| {
+                                        thread_view.toggle_project_checkpoint(cx);
+                                    });
+                                }))
+                        })
+                }),
+            _ => None,
+        };
+
         h_flex()
             .key_context("TitleEditor")
             .group("title_editor")
@@ -5525,6 +5551,7 @@ impl AgentPanel {
             .max_w_full()
             .overflow_x_hidden()
             .child(content)
+            .children(project_memory_button)
             .when(self.should_show_title_edit(window, cx), |this| {
                 this.when(opaque_window, |this| this.child(gradient_overlay))
                     .child(
@@ -6159,6 +6186,15 @@ impl AgentPanel {
                     thread_view.update(cx, |thread_view, cx| thread_view.render_sandbox_status(cx))
                 });
 
+            let running_tasks = self
+                .active_conversation_view()
+                .and_then(|conversation_view| conversation_view.read(cx).root_thread_view())
+                .map(|thread_view| {
+                    thread_view.update(cx, |thread_view, cx| {
+                        thread_view.render_running_tasks(window, cx)
+                    })
+                });
+
             base_container
                 .child(
                     h_flex()
@@ -6181,6 +6217,7 @@ impl AgentPanel {
                         .h_full()
                         .flex_none()
                         .gap_1()
+                        .children(running_tasks)
                         .children(sandbox_status)
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)

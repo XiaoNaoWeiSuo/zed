@@ -49,6 +49,7 @@ use command_palette_hooks::CommandPaletteFilter;
 use editor::{Editor, scroll::Autoscroll};
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
+use futures::FutureExt as _;
 use gpui::{
     Action, App, Context, Entity, ImageSource, ReadGlobal as _, Resource, SharedString, SharedUri,
     TaskExt, Window, actions,
@@ -602,6 +603,14 @@ pub enum AgentInitialContent {
         blocks: Vec<acp_v2::ContentBlock>,
         auto_submit: bool,
     },
+    Worktree {
+        blocks: Vec<acp_v2::ContentBlock>,
+        profile: AgentProfileId,
+        model: Option<String>,
+    },
+    WorktreeReview {
+        blocks: Vec<acp_v2::ContentBlock>,
+    },
     FromExternalSource(ExternalSourcePrompt),
 }
 
@@ -713,6 +722,46 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    settings_ui::storage::register_worktree_reference_provider(
+        |path, cx| {
+            let threads = thread_metadata_store::ThreadMetadataStore::try_global(cx)?;
+            let terminals =
+                terminal_thread_metadata_store::TerminalThreadMetadataStore::try_global(cx)?;
+            if threads.read(cx).reload_task().now_or_never().is_none()
+                || terminals.read(cx).reload_task().now_or_never().is_none()
+            {
+                return None;
+            }
+            let conversations = threads
+                .read(cx)
+                .entries()
+                .filter(|thread| {
+                    !thread.archived
+                        && thread.matches_remote_connection(None)
+                        && thread.references_folder_path(path)
+                })
+                .map(|thread| thread.display_title())
+                .collect();
+            let terminals = terminals
+                .read(cx)
+                .entries()
+                .filter(|terminal| {
+                    terminal.remote_connection.is_none()
+                        && terminal
+                            .folder_paths()
+                            .paths()
+                            .iter()
+                            .any(|folder| folder.as_path() == path)
+                })
+                .map(|terminal| terminal.display_title())
+                .collect();
+            Some(settings_ui::storage::WorktreeReferences {
+                conversations,
+                terminals,
+            })
+        },
+        cx,
+    );
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
@@ -1066,6 +1115,8 @@ mod tests {
         });
 
         let agent_settings = AgentSettings {
+            new_thread_in_worktree: false,
+            remember_worktree_choice: false,
             enabled: true,
             button: true,
             dock: DockPosition::Right,

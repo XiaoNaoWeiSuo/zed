@@ -31,15 +31,16 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
-use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{DismissEvent, List};
 use heapless::Vec as ArrayVec;
 use itertools::Itertools;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
+use picker::{Picker, PickerDelegate, popover_menu::PickerPopoverMenu};
 use project::ResolvedPath;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
@@ -100,6 +101,30 @@ pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
 }
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+fn worktree_choice_key(project: &Project, cx: &App) -> Option<String> {
+    if !project.is_local() {
+        return None;
+    }
+    let mut roots: Vec<_> = project
+        .repositories(cx)
+        .values()
+        .filter_map(|repository| {
+            repository
+                .read(cx)
+                .main_worktree_abs_path()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    if roots.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&roots)
+        .log_err()
+        .map(|roots| format!("agent_worktree_choice:{roots}"))
+}
 
 pub(super) struct ThreadRecovery {
     pub session_id: acp_v2::SessionId,
@@ -603,6 +628,272 @@ impl PermissionSelection {
     }
 }
 
+#[derive(Clone)]
+enum RunningTaskTarget {
+    Terminal(Entity<acp_thread::Terminal>),
+    Subagent(acp_v2::SessionId),
+}
+
+#[derive(Clone)]
+struct RunningTaskRow {
+    id: String,
+    label: SharedString,
+    owner: SharedString,
+    target: RunningTaskTarget,
+}
+
+struct RunningTasksDelegate {
+    rows: Vec<RunningTaskRow>,
+    matches: Vec<RunningTaskRow>,
+    selected_index: usize,
+    query: String,
+    server_view: WeakEntity<ConversationView>,
+    workspace: WeakEntity<Workspace>,
+    project: WeakEntity<Project>,
+    focus_handle: FocusHandle,
+}
+
+fn filter_running_tasks(rows: &[RunningTaskRow], query: &str) -> Vec<RunningTaskRow> {
+    let query = query.to_lowercase();
+    rows.iter()
+        .filter(|row| {
+            row.label.to_lowercase().contains(&query) || row.owner.to_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod running_tasks_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn running_picker_refresh_preserves_selection_and_removes_finished_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+        let cx = cx.add_empty_window();
+        let rows = vec!["first", "second"]
+            .into_iter()
+            .map(|id| RunningTaskRow {
+                id: id.into(),
+                label: id.into(),
+                owner: "Agent".into(),
+                target: RunningTaskTarget::Subagent(acp_v2::SessionId::new(id)),
+            })
+            .collect::<Vec<_>>();
+        let picker = cx.update(|window, cx| {
+            cx.new(|cx| {
+                Picker::list(
+                    RunningTasksDelegate {
+                        rows: rows.clone(),
+                        matches: rows,
+                        selected_index: 1,
+                        query: String::new(),
+                        server_view: WeakEntity::new_invalid(),
+                        workspace: WeakEntity::new_invalid(),
+                        project: WeakEntity::new_invalid(),
+                        focus_handle: cx.focus_handle(),
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.rows.reverse();
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.match_count(), 2);
+            assert_eq!(picker.delegate.selected_index(), 0);
+            assert!(matches!(picker.delegate.matches.first().map(|row| &row.target),
+                Some(RunningTaskTarget::Subagent(session_id)) if session_id == &acp_v2::SessionId::new("second")));
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.rows.retain(|row| row.id != "second");
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.match_count(), 1);
+            assert_eq!(picker.delegate.selected_index(), 0);
+            assert_eq!(
+                picker.delegate.matches.first().map(|row| row.id.as_str()),
+                Some("first")
+            );
+        });
+    }
+
+    #[test]
+    fn filters_running_tasks_by_label_and_owner() {
+        let rows = vec![
+            RunningTaskRow {
+                id: "first".into(),
+                label: "Compile project".into(),
+                owner: "Research agent".into(),
+                target: RunningTaskTarget::Subagent(acp_v2::SessionId::new("first")),
+            },
+            RunningTaskRow {
+                id: "second".into(),
+                label: "Run tests".into(),
+                owner: "Main agent".into(),
+                target: RunningTaskTarget::Subagent(acp_v2::SessionId::new("second")),
+            },
+        ];
+        assert_eq!(
+            filter_running_tasks(&rows, "COMPILE")
+                .first()
+                .map(|row| row.id.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            filter_running_tasks(&rows, "main")
+                .first()
+                .map(|row| row.id.as_str()),
+            Some("second")
+        );
+        assert_eq!(filter_running_tasks(&rows, "").len(), 2);
+        assert!(filter_running_tasks(&rows, "missing").is_empty());
+    }
+}
+
+impl RunningTasksDelegate {
+    fn filter(&mut self) {
+        let selected_id = self
+            .matches
+            .get(self.selected_index)
+            .map(|row| row.id.clone());
+        self.matches = filter_running_tasks(&self.rows, &self.query);
+        self.selected_index = selected_id
+            .and_then(|id| self.matches.iter().position(|row| row.id == id))
+            .unwrap_or(0);
+    }
+}
+
+impl PickerDelegate for RunningTasksDelegate {
+    type ListItem = AnyElement;
+
+    fn name() -> &'static str {
+        "running tasks"
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(&mut self, index: usize, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.selected_index = index.min(self.matches.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    fn placeholder_text(&self, _: &mut Window, _: &mut App) -> Arc<str> {
+        "Find a running terminal or subagent…".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        self.query = query;
+        self.filter();
+        cx.notify();
+        Task::ready(())
+    }
+
+    fn render_match(
+        &self,
+        index: usize,
+        selected: bool,
+        _: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        let row = self.matches.get(index)?;
+        let icon = match &row.target {
+            RunningTaskTarget::Terminal(_) => IconName::Terminal,
+            RunningTaskTarget::Subagent(_) => IconName::ZedAssistant,
+        };
+        Some(
+            ui::ListItem::new(index)
+                .toggle_state(selected)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                        .child(
+                            v_flex()
+                                .overflow_hidden()
+                                .child(
+                                    Label::new(row.label.clone())
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                )
+                                .child(
+                                    Label::new(row.owner.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(row) = self.matches.get(self.selected_index).cloned() else {
+            return;
+        };
+        cx.emit(DismissEvent);
+        match row.target {
+            RunningTaskTarget::Subagent(session_id) => {
+                self.server_view
+                    .update(cx, |server_view, cx| {
+                        server_view.navigate_to_thread(session_id, window, cx);
+                    })
+                    .log_err();
+            }
+            RunningTaskTarget::Terminal(terminal) => {
+                let inner = terminal.read(cx).inner().clone();
+                let read_only = !terminal.read(cx).is_process_backed();
+                let workspace = self.workspace.clone();
+                let project = self.project.clone();
+                self.workspace
+                    .update(cx, |workspace_state, cx| {
+                        let view = cx.new(|cx| {
+                            terminal_view::TerminalView::new(
+                                inner, workspace, None, project, window, cx,
+                            )
+                            .with_read_only(read_only)
+                        });
+                        workspace_state.add_item_to_active_pane(
+                            Box::new(view),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                    })
+                    .log_err();
+            }
+        }
+    }
+
+    fn dismissed(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.focus_handle.focus(window, cx);
+        cx.defer_in(window, |picker, window, cx| {
+            picker.set_query("", window, cx)
+        });
+    }
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
@@ -647,6 +938,9 @@ pub struct ThreadView {
     checkpoint_evidence_request_id: usize,
     checkpoint_evidence_text: Option<String>,
     checkpoint_evidence_next: Option<(String, String, std::path::PathBuf, usize)>,
+    goal_editor: Entity<Editor>,
+    goal_editing_id: Option<String>,
+    goal_delete_id: Option<String>,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
@@ -655,6 +949,8 @@ pub struct ThreadView {
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
+    use_worktree_for_first_message: bool,
+    _worktree_creation_task: Option<Task<()>>,
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
@@ -669,6 +965,9 @@ pub struct ThreadView {
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
+    running_tasks_picker: Option<Entity<Picker<RunningTasksDelegate>>>,
+    running_tasks_menu_handle: PopoverMenuHandle<Picker<RunningTasksDelegate>>,
+    running_tasks_refresh_task: Option<Task<()>>,
     pub project: WeakEntity<Project>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Cloned from the parent `ConversationView` so the cache is shared and the
@@ -954,7 +1253,9 @@ impl ThreadView {
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
 
         let mut should_auto_submit = false;
+        let mut is_worktree_draft = false;
         let mut show_external_source_prompt_warning = false;
+        let mut worktree_settings = None;
 
         let input_thread_store = thread_store.clone();
         let message_editor = cx.new(|cx| {
@@ -985,6 +1286,20 @@ impl ThreadView {
                         should_auto_submit = auto_submit;
                         Some(blocks)
                     }
+                    AgentInitialContent::Worktree {
+                        blocks,
+                        profile,
+                        model,
+                    } => {
+                        is_worktree_draft = true;
+                        should_auto_submit = true;
+                        worktree_settings = Some((profile, model));
+                        Some(blocks)
+                    }
+                    AgentInitialContent::WorktreeReview { blocks } => {
+                        is_worktree_draft = true;
+                        Some(blocks)
+                    }
                     AgentInitialContent::FromExternalSource(prompt) => {
                         show_external_source_prompt_warning = true;
                         // SECURITY: Be explicit about not auto submitting prompt from external source.
@@ -1011,6 +1326,25 @@ impl ThreadView {
             }
             editor
         });
+
+        let use_worktree_for_first_message = if should_auto_submit || is_worktree_draft {
+            false
+        } else {
+            let settings = AgentSettings::get_global(cx);
+            let remembered = settings
+                .remember_worktree_choice
+                .then(|| {
+                    let project = project.upgrade()?;
+                    let key = worktree_choice_key(project.read(cx), cx)?;
+                    KeyValueStore::global(cx).read_kvp(&key).log_err().flatten()
+                })
+                .flatten();
+            match remembered.as_deref() {
+                Some("worktree") => true,
+                Some("current") => false,
+                _ => settings.new_thread_in_worktree,
+            }
+        };
 
         let show_codex_windows_warning = cfg!(windows)
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
@@ -1196,6 +1530,9 @@ impl ThreadView {
             checkpoint_evidence_request_id: 0,
             checkpoint_evidence_text: None,
             checkpoint_evidence_next: None,
+            goal_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            goal_editing_id: None,
+            goal_delete_id: None,
             queue_expanded: true,
             editor_expanded: false,
             should_be_following: false,
@@ -1204,6 +1541,8 @@ impl ThreadView {
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
+            use_worktree_for_first_message,
+            _worktree_creation_task: None,
             new_server_version_available: None,
             elicitation_form_states: HashMap::default(),
             _cancel_task: None,
@@ -1216,6 +1555,9 @@ impl ThreadView {
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             fast_mode_menu_handle: PopoverMenuHandle::default(),
+            running_tasks_picker: None,
+            running_tasks_menu_handle: PopoverMenuHandle::default(),
+            running_tasks_refresh_task: None,
             project,
             code_span_resolver,
             show_external_source_prompt_warning,
@@ -1258,6 +1600,31 @@ impl ThreadView {
                 });
             });
 
+        if is_worktree_draft && worktree_settings.is_none() {
+            this.handle_thread_error(anyhow!("The worktree is ready. Review the external agent's model and mode, then send the draft."), cx);
+        }
+        if let Some((profile, model)) = worktree_settings {
+            if let Some(native_thread) = this.as_native_thread(cx) {
+                let restricted = native_thread.read(cx).profile_was_downgraded();
+                if restricted && native_thread.read(cx).profile() != &profile {
+                    should_auto_submit = false;
+                    this.handle_thread_error(anyhow!("The new worktree is restricted. Review its profile before sending the draft."), cx);
+                } else {
+                    native_thread.update(cx, |thread, cx| thread.set_profile(profile, cx));
+                    if let Some(model) = model {
+                        crate::agent_panel::apply_native_model_override(&native_thread, &model, cx);
+                    }
+                }
+            } else {
+                should_auto_submit = false;
+                this.handle_thread_error(
+                    anyhow!(
+                        "The new worktree's agent is unavailable. Review the draft before sending."
+                    ),
+                    cx,
+                );
+            }
+        }
         if should_auto_submit {
             this.send(window, cx);
         }
@@ -1339,6 +1706,214 @@ impl ThreadView {
         let acp_thread = self.thread.read(cx);
         self.as_native_connection(cx)?
             .thread(acp_thread.session_id(), cx)
+    }
+
+    fn running_task_rows(&self, cx: &Context<Self>) -> Vec<RunningTaskRow> {
+        let mut rows = Vec::new();
+        let mut terminal_ids = HashSet::default();
+        let mut subagent_ids = HashSet::default();
+        let connection = self.as_native_connection(cx);
+        let retained_subagents: HashMap<_, _> = self
+            .conversation
+            .read(cx)
+            .threads
+            .keys()
+            .filter_map(|session_id| connection.as_ref()?.thread(session_id, cx))
+            .flat_map(|thread| thread.read(cx).subagent_task_snapshots())
+            .map(|snapshot| (snapshot.session_id.clone(), snapshot))
+            .collect();
+        for (session_id, thread) in &self.conversation.read(cx).threads {
+            let thread = thread.read(cx);
+            let owner = thread.title().unwrap_or_else(|| "Agent".into());
+            if let Some(native_thread) = connection
+                .as_ref()
+                .and_then(|connection| connection.thread(session_id, cx))
+            {
+                let native_thread = native_thread.read(cx);
+                for metadata in native_thread
+                    .terminal_session_metadata()
+                    .into_iter()
+                    .filter(|metadata| {
+                        matches!(metadata.state, agent::TerminalSessionState::Running)
+                    })
+                {
+                    match thread.terminal(acp_v2::TerminalId::new(metadata.terminal_id.clone())) {
+                        Ok(terminal) => {
+                            if terminal_ids.insert(terminal.entity_id()) {
+                                rows.push(RunningTaskRow {
+                                    id: format!("terminal:{session_id}:{}", metadata.terminal_id),
+                                    label: metadata.command.into(),
+                                    owner: owner.clone(),
+                                    target: RunningTaskTarget::Terminal(terminal),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Cannot resolve running terminal: {error:#}")
+                        }
+                    }
+                }
+                for snapshot in native_thread.subagent_task_snapshots() {
+                    if snapshot.state.is_active()
+                        && subagent_ids.insert(snapshot.session_id.clone())
+                    {
+                        rows.push(RunningTaskRow {
+                            id: format!("subagent:{}", snapshot.session_id),
+                            label: if snapshot.label.is_empty() {
+                                "Subagent".into()
+                            } else {
+                                snapshot.label.into()
+                            },
+                            owner: owner.clone(),
+                            target: RunningTaskTarget::Subagent(snapshot.session_id),
+                        });
+                    }
+                }
+            }
+            for terminal in thread
+                .entries()
+                .iter()
+                .flat_map(AgentThreadEntry::terminals)
+            {
+                let terminal_state = terminal.read(cx);
+                if terminal_state.output().is_some() || !terminal_ids.insert(terminal.entity_id()) {
+                    continue;
+                }
+                rows.push(RunningTaskRow {
+                    id: format!("terminal:{session_id}:{}", terminal_state.id()),
+                    label: terminal_state
+                        .command()
+                        .read(cx)
+                        .source()
+                        .to_string()
+                        .into(),
+                    owner: owner.clone(),
+                    target: RunningTaskTarget::Terminal(terminal.clone()),
+                });
+            }
+            if !retained_subagents.contains_key(session_id)
+                && thread.parent_session_id().is_some()
+                && thread.status() != ThreadStatus::Idle
+                && subagent_ids.insert(session_id.clone())
+            {
+                rows.push(RunningTaskRow {
+                    id: format!("subagent:{session_id}"),
+                    label: owner,
+                    owner: "Subagent".into(),
+                    target: RunningTaskTarget::Subagent(session_id.clone()),
+                });
+            }
+        }
+        rows.sort_by(|left, right| left.id.cmp(&right.id));
+        rows
+    }
+
+    pub(crate) fn render_running_tasks(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.running_tasks_refresh_task.is_none() {
+            self.running_tasks_refresh_task = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            let rows = this.running_task_rows(cx);
+                            let mut changed = false;
+                            if let Some(picker) = &this.running_tasks_picker {
+                                picker.update(cx, |picker, cx| {
+                                    if !picker
+                                        .delegate
+                                        .rows
+                                        .iter()
+                                        .map(|row| (&row.id, &row.label, &row.owner))
+                                        .eq(rows
+                                            .iter()
+                                            .map(|row| (&row.id, &row.label, &row.owner)))
+                                    {
+                                        changed = true;
+                                        picker.delegate.rows = rows;
+                                        picker.refresh(window, cx);
+                                    }
+                                });
+                            }
+                            if changed {
+                                cx.notify();
+                                if let Some(workspace) = this.workspace.upgrade()
+                                    && let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+                                {
+                                    panel.update(cx, |_, cx| cx.notify());
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        let rows = self.running_task_rows(cx);
+        let terminals = rows
+            .iter()
+            .filter(|row| matches!(row.target, RunningTaskTarget::Terminal(_)))
+            .count();
+        let subagents = rows.len().saturating_sub(terminals);
+        let picker = self
+            .running_tasks_picker
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    Picker::list(
+                        RunningTasksDelegate {
+                            matches: rows.clone(),
+                            rows,
+                            selected_index: 0,
+                            query: String::new(),
+                            server_view: self.server_view.clone(),
+                            workspace: self.workspace.clone(),
+                            project: self.project.clone(),
+                            focus_handle: self.focus_handle.clone(),
+                        },
+                        window,
+                        cx,
+                    )
+                    .show_scrollbar(true)
+                    .initial_width(rems(24.))
+                })
+            })
+            .clone();
+        let deployed = self.running_tasks_menu_handle.is_deployed();
+        PickerPopoverMenu::new(
+            picker,
+            Button::new(
+                "running-tasks",
+                format!("{terminals} terminals · {subagents} subagents"),
+            )
+            .label_size(LabelSize::Small)
+            .color(if deployed {
+                Color::Accent
+            } else {
+                Color::Muted
+            })
+            .end_icon(
+                Icon::new(if deployed {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            ),
+            Tooltip::text("Running Terminals and Subagents"),
+            gpui::Anchor::TopRight,
+            cx,
+        )
+        .with_handle(self.running_tasks_menu_handle.clone())
+        .render(window, cx)
+        .into_any_element()
     }
 
     /// Resolves the message editor's contents into content blocks. For profiles
@@ -2052,8 +2627,129 @@ impl ThreadView {
             return;
         }
 
+        if self.use_worktree_for_first_message
+            && self.thread.read(cx).is_draft_thread()
+            && !self.is_subagent()
+            && self.project.upgrade().is_some_and(|project| {
+                let project = project.read(cx);
+                !project.is_via_collab() && !project.repositories(cx).is_empty()
+            })
+        {
+            self.send_in_new_worktree(message_editor, window, cx);
+            return;
+        }
+
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    fn send_in_new_worktree(
+        &mut self,
+        message_editor: Entity<MessageEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.handle_thread_error(anyhow!("The workspace is no longer available"), cx);
+            return;
+        };
+        let Some(agent) = self
+            .server_view
+            .read_with(cx, |view, _| view.agent_key().clone())
+            .ok()
+        else {
+            self.handle_thread_error(anyhow!("The agent is no longer available"), cx);
+            return;
+        };
+        let native_settings = self.as_native_thread(cx).map(|thread| {
+            let thread = thread.read(cx);
+            let profile = thread.profile().clone();
+            let model = thread
+                .model()
+                .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
+            (profile, model)
+        });
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.is_loading_contents = true;
+        self.thread_error = None;
+        cx.notify();
+
+        self._worktree_creation_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                let (blocks, _tracked_buffers) = contents.await?;
+                if blocks.is_empty() {
+                    return Ok(());
+                }
+                let action = zed_actions::CreateWorktree {
+                    worktree_name: None,
+                    branch_target: zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+                };
+                let creation = cx.update(|window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        git_ui_core::worktree_service::create_worktree_workspace(
+                            workspace, &action, window, None, cx,
+                        )
+                    })
+                })?;
+                let created = creation.await?;
+                cx.update(|window, cx| -> anyhow::Result<()> {
+                    let target_workspace = created.workspace;
+                    let panel = target_workspace
+                        .read(cx)
+                        .panel::<AgentPanel>(cx)
+                        .ok_or_else(|| {
+                            anyhow!("The new worktree did not initialize its agent panel")
+                        })?;
+                    let thread_id = panel.update(cx, |panel, cx| {
+                        panel.create_thread_with_options(
+                            crate::agent_panel::CreateThreadOptions {
+                                initial_content: Some(match native_settings {
+                                    Some((profile, model)) => AgentInitialContent::Worktree {
+                                        blocks,
+                                        profile,
+                                        model,
+                                    },
+                                    None => AgentInitialContent::WorktreeReview { blocks },
+                                }),
+                                agent: Some(agent),
+                                ..Default::default()
+                            },
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        )
+                    });
+                    if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
+                        multi_workspace.update(cx, |multi_workspace, cx| {
+                            multi_workspace.activate(
+                                target_workspace.clone(),
+                                Some(workspace.downgrade()),
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                    panel.update(cx, |panel, cx| {
+                        panel.activate_retained_thread(thread_id, true, window, cx)
+                    });
+                    target_workspace.update(cx, |workspace, cx| {
+                        workspace.focus_panel::<AgentPanel>(window, cx)
+                    });
+                    Ok(())
+                })??;
+                Ok(())
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.is_loading_contents = false;
+                if let Err(error) = result {
+                    this.handle_thread_error(error, cx);
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after
@@ -5334,6 +6030,62 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .when(
+                                        !has_messages
+                                            && self.project.upgrade().is_some_and(|project| {
+                                                let project = project.read(cx);
+                                                !project.is_via_collab()
+                                                    && !project.repositories(cx).is_empty()
+                                            }),
+                                        |this| {
+                                            this.child(
+                                                Checkbox::new(
+                                                    "new-thread-worktree",
+                                                    if self.use_worktree_for_first_message {
+                                                        ToggleState::Selected
+                                                    } else {
+                                                        ToggleState::Unselected
+                                                    },
+                                                )
+                                                .label("New worktree")
+                                                .label_size(LabelSize::Small)
+                                                .tooltip(Tooltip::text("Create a clean checkout from the current commit. Uncommitted changes are not copied. External agents require review before sending."))
+                                                .on_click(cx.listener(
+                                                    |this, state: &ToggleState, _, cx| {
+                                                        this.use_worktree_for_first_message =
+                                                            *state == ToggleState::Selected;
+                                                        if AgentSettings::get_global(cx)
+                                                            .remember_worktree_choice
+                                                            && let Some(project) =
+                                                                this.project.upgrade()
+                                                            && let Some(key) = worktree_choice_key(
+                                                                project.read(cx),
+                                                                cx,
+                                                            )
+                                                        {
+                                                            let value = if this
+                                                                .use_worktree_for_first_message
+                                                            {
+                                                                "worktree"
+                                                            } else {
+                                                                "current"
+                                                            }
+                                                            .to_string();
+                                                            let store = KeyValueStore::global(cx);
+                                                            cx.spawn(async move |this, cx| {
+                                                                if let Err(error) = store.write_kvp(key, value).await {
+                                                                    this.update(cx, |this, cx| {
+                                                                        this.handle_thread_error(anyhow!("Could not remember the worktree choice: {error:#}"), cx);
+                                                                    }).log_err();
+                                                                }
+                                                            }).detach();
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                            )
+                                        },
+                                    )
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5438,7 +6190,63 @@ impl ThreadView {
         cx.notify();
     }
 
+    pub(crate) fn toggle_project_checkpoint(&mut self, cx: &mut Context<Self>) {
+        self.checkpoint_expanded = !self.checkpoint_expanded;
+        if !self.checkpoint_expanded {
+            self.checkpoint_evidence_request_id =
+                self.checkpoint_evidence_request_id.wrapping_add(1);
+            self.checkpoint_evidence_text = None;
+            self.checkpoint_evidence_next = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn render_project_checkpoint_status(
+        &self,
+        cx: &App,
+    ) -> Option<(IconName, SharedString)> {
+        let native_thread = self.as_native_thread(cx)?;
+        let context = native_thread.read(cx).project_checkpoint_context()?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(context).ok()?;
+        if entries.is_empty() {
+            return None;
+        }
+        let unavailable = entries.iter().any(|entry| {
+            entry
+                .get("checkpoint_unavailable")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
+        let scope_count = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("available_scopes")
+                    .and_then(serde_json::Value::as_array)
+            })
+            .map(Vec::len)
+            .sum::<usize>();
+        let detail = if unavailable {
+            "Project memory needs review".into()
+        } else if scope_count > 0 {
+            format!("Project memory enabled · {scope_count} saved scopes").into()
+        } else {
+            "Project memory enabled · saved session state available".into()
+        };
+        Some((
+            if unavailable {
+                IconName::Warning
+            } else {
+                IconName::DatabaseZap
+            },
+            detail,
+        ))
+    }
+
     fn render_project_checkpoint(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.checkpoint_expanded {
+            return None;
+        }
         let native_thread = self.as_native_thread(cx)?;
         let context = native_thread.read(cx).project_checkpoint_context()?;
         let entries: Vec<serde_json::Value> = serde_json::from_str(context)
@@ -5452,7 +6260,8 @@ impl ThreadView {
                 .and_then(|value| value.as_bool())
                 == Some(true)
         });
-        let mut details = Vec::new();
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        let mut notes = Vec::new();
         let mut evidence_buttons = Vec::new();
         for entry in &entries {
             if entry
@@ -5460,7 +6269,10 @@ impl ThreadView {
                 .and_then(|value| value.as_bool())
                 == Some(true)
             {
-                details.push("Additional project roots have saved handoffs.".into());
+                sections.push((
+                    "Additional project roots".into(),
+                    vec!["Saved handoffs are available for additional project roots.".into()],
+                ));
                 continue;
             }
             let root = entry
@@ -5472,7 +6284,7 @@ impl ThreadView {
                 .and_then(|value| value.as_bool())
                 == Some(true)
             {
-                details.push(format!("{root}: checkpoint unavailable"));
+                sections.push((root.into(), vec!["Checkpoint unavailable".into()]));
                 continue;
             }
             let scope = entry
@@ -5484,7 +6296,7 @@ impl ThreadView {
             } else {
                 scope
             };
-            details.push(format!("{root} · {scope}"));
+            sections.push((format!("{root} · {scope}"), Vec::new()));
             if let Some(scopes) = entry
                 .get("available_scopes")
                 .and_then(|value| value.as_array())
@@ -5495,7 +6307,10 @@ impl ThreadView {
                     .filter(|name| *name != scope)
                     .collect::<Vec<_>>();
                 if !other_scopes.is_empty() {
-                    details.push(format!("Other handoffs: {}", other_scopes.join(", ")));
+                    sections.push((
+                        "Other handoffs".into(),
+                        other_scopes.into_iter().map(str::to_string).collect(),
+                    ));
                 }
             }
             if entry
@@ -5503,15 +6318,15 @@ impl ThreadView {
                 .and_then(|value| value.as_bool())
                 == Some(true)
             {
-                details.push(
+                notes.push(
                     "More handoff scopes are available through the project checkpoint tool.".into(),
                 );
             }
             for (key, title) in [
-                ("completed", "Completed"),
                 ("remaining", "Remaining"),
-                ("decisions", "Decisions"),
                 ("next_steps", "Next steps"),
+                ("decisions", "Decisions"),
+                ("completed", "Completed"),
                 ("changed_files", "Changed since checkpoint"),
                 ("files_not_checked", "Files not checked"),
                 ("new_dirty_files", "New Git changes"),
@@ -5520,9 +6335,10 @@ impl ThreadView {
                     let values = values
                         .iter()
                         .filter_map(|value| value.as_str())
+                        .map(str::to_string)
                         .collect::<Vec<_>>();
                     if !values.is_empty() {
-                        details.push(format!("{title}: {}", values.join(", ")));
+                        sections.push((title.into(), values));
                     }
                 }
             }
@@ -5533,8 +6349,7 @@ impl ThreadView {
                     .and_then(|value| value.as_bool())
                     == Some(true)
             {
-                details
-                    .push("A previous turn was interrupted; review its recorded activity.".into());
+                notes.push("A previous turn was interrupted; review its recorded activity.".into());
             }
             if let Some(automatic) = entry.get("recent_automatic_checkpoint") {
                 if let Some(files) = automatic.get("files").and_then(|value| value.as_array()) {
@@ -5543,7 +6358,10 @@ impl ThreadView {
                         .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
                         .collect::<Vec<_>>();
                     if !paths.is_empty() {
-                        details.push(format!("Recent recorded files: {}", paths.join(", ")));
+                        sections.push((
+                            "Recent recorded files".into(),
+                            paths.into_iter().map(str::to_string).collect(),
+                        ));
                     }
                     let changed = files
                         .iter()
@@ -5564,13 +6382,16 @@ impl ThreadView {
                         .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
                         .collect::<Vec<_>>();
                     if !changed.is_empty() {
-                        details.push(format!(
-                            "Changed since recent activity: {}",
-                            changed.join(", ")
+                        sections.push((
+                            "Changed since recent activity".into(),
+                            changed.into_iter().map(str::to_string).collect(),
                         ));
                     }
                     if !unknown.is_empty() {
-                        details.push(format!("Recent files not checked: {}", unknown.join(", ")));
+                        sections.push((
+                            "Recent files not checked".into(),
+                            unknown.into_iter().map(str::to_string).collect(),
+                        ));
                     }
                     if files.iter().any(|file| {
                         file.get("unsaved").and_then(|value| value.as_bool()) == Some(true)
@@ -5579,7 +6400,7 @@ impl ThreadView {
                                 .and_then(|value| value.as_bool())
                                 == Some(true)
                     }) {
-                        details
+                        notes
                             .push("Some recent files were unsaved or could not be checked.".into());
                     }
                 }
@@ -5607,7 +6428,7 @@ impl ThreadView {
                     .and_then(|value| value.as_bool())
                     == Some(true)
                 {
-                    details.push("More recent files are recorded in the checkpoint.".into());
+                    notes.push("More recent files are recorded in the checkpoint.".into());
                 }
             }
             if let Some(evidence) = entry.get("evidence").and_then(|value| value.as_array()) {
@@ -5639,7 +6460,7 @@ impl ThreadView {
                     .and_then(|value| value.as_bool())
                     == Some(true)
             {
-                details.push("Git revision or branch changed since the checkpoint.".into());
+                notes.push("Git revision or branch changed since the checkpoint.".into());
             }
             if entry
                 .get("summary_may_be_truncated")
@@ -5654,100 +6475,196 @@ impl ThreadView {
                     .and_then(|value| value.as_bool())
                     == Some(true)
             {
-                details.push(
+                notes.push(
                     "Additional checkpoint details are available in the saved record.".into(),
                 );
             }
-            details.push("Only recorded files were checked; Git status may be delayed.".into());
+            notes.push("Only recorded files were checked; Git status may be delayed.".into());
         }
-        let details = details.join("\n");
+        if !notes.is_empty() {
+            sections.push((
+                "Status".into(),
+                notes.into_iter().unique().collect::<Vec<_>>(),
+            ));
+        }
+        let section_item_count = |title: &str| {
+            sections
+                .iter()
+                .filter(|(section_title, _)| section_title == title)
+                .map(|(_, items)| items.len())
+                .sum::<usize>()
+        };
+        let remaining_count = section_item_count("Remaining");
+        let next_step_count = section_item_count("Next steps");
+        let completed_count = section_item_count("Completed");
+        let mut summary = Vec::new();
+        if remaining_count > 0 {
+            summary.push(format!("{remaining_count} remaining"));
+        }
+        if next_step_count > 0 {
+            summary.push(format!(
+                "{next_step_count} {}",
+                pluralize("next step", next_step_count)
+            ));
+        }
+        if summary.is_empty() && completed_count > 0 {
+            summary.push(format!("{completed_count} completed"));
+        }
+        let summary = if summary.is_empty() {
+            "Saved session state".into()
+        } else {
+            summary.join(" · ")
+        };
         let expanded = self.checkpoint_expanded;
         Some(
             v_flex()
                 .id("project-checkpoint")
                 .debug_selector(|| "project-checkpoint".to_string())
-                .px_3()
-                .py_1()
-                .gap_1()
+                .w_full()
                 .child(
-                    Button::new(
-                        "toggle-project-checkpoint",
-                        match (expanded, unavailable) {
-                            (true, true) => "▾ Project handoff · attention needed",
-                            (false, true) => "▸ Project handoff · attention needed",
-                            (true, false) => "▾ Project handoff",
-                            (false, false) => "▸ Project handoff",
-                        },
-                    )
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.checkpoint_expanded = !this.checkpoint_expanded;
-                        if !this.checkpoint_expanded {
-                            this.checkpoint_evidence_request_id =
-                                this.checkpoint_evidence_request_id.wrapping_add(1);
-                            this.checkpoint_evidence_text = None;
-                            this.checkpoint_evidence_next = None;
-                        }
-                        cx.notify();
-                    })),
+                    h_flex()
+                        .id("toggle-project-checkpoint")
+                        .w_full()
+                        .px_3()
+                        .py_1()
+                        .gap_1()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(Disclosure::new("project-checkpoint-disclosure", expanded))
+                        .child(
+                            Label::new("Project memory")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(summary)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                        )
+                        .when(unavailable, |header| {
+                            header.child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(IconName::Warning)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                    .child(
+                                        Label::new("Needs review")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Warning),
+                                    ),
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_project_checkpoint(cx);
+                        })),
                 )
                 .when(expanded, |card| {
                     card.child(
-                        div()
+                        v_flex()
                             .id("project-checkpoint-details")
                             .debug_selector(|| "project-checkpoint-details".to_string())
-                            .child(Label::new(details).size(LabelSize::Small)),
-                    )
-                    .children(evidence_buttons.into_iter().enumerate().map(
-                        |(index, (description, source, scope, root))| {
-                            div()
-                                .id(("checkpoint-evidence-container", index))
-                                .debug_selector(move || format!("checkpoint-evidence-{index}"))
-                                .child(
-                                    Button::new(
-                                        ("checkpoint-evidence", index),
-                                        format!("View observation: {description}"),
-                                    )
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.load_checkpoint_evidence(
-                                                source.clone(),
-                                                scope.clone(),
-                                                root.clone(),
-                                                0,
-                                                cx,
-                                            );
-                                        },
-                                    )),
+                            .max_h_80()
+                            .overflow_y_scroll()
+                            .gap_3()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                            .bg(cx.theme().colors().editor_background)
+                            .px_3()
+                            .py_2()
+                            .children(sections.into_iter().map(|(title, items)| {
+                                v_flex()
+                                    .gap_1()
+                                    .child(Label::new(title).size(LabelSize::Small))
+                                    .children(items.into_iter().map(|item| {
+                                        h_flex()
+                                            .items_start()
+                                            .gap_2()
+                                            .pl_1()
+                                            .child(
+                                                Label::new("•")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().colors().text)
+                                                    .child(item),
+                                            )
+                                    }))
+                            }))
+                            .when(!evidence_buttons.is_empty(), |body| {
+                                body.child(
+                                    Label::new("Recorded observations").size(LabelSize::Small),
                                 )
-                        },
-                    ))
-                    .when_some(self.checkpoint_evidence_text.clone(), |card, text| {
-                        card.child(
-                            div()
-                                .id("checkpoint-evidence-output")
-                                .debug_selector(|| "checkpoint-evidence-output".to_string())
-                                .child(Label::new(text).size(LabelSize::Small)),
-                        )
-                    })
-                    .when_some(
-                        self.checkpoint_evidence_next.clone(),
-                        |card, (source, scope, root, offset)| {
-                            card.child(
-                                Button::new("checkpoint-evidence-next", "Next page")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.load_checkpoint_evidence(
-                                            source.clone(),
-                                            scope.clone(),
-                                            root.clone(),
-                                            offset,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                        },
+                            })
+                            .children(evidence_buttons.into_iter().enumerate().map(
+                                |(index, (description, source, scope, root))| {
+                                    div()
+                                        .id(("checkpoint-evidence-container", index))
+                                        .debug_selector(move || {
+                                            format!("checkpoint-evidence-{index}")
+                                        })
+                                        .child(
+                                            Button::new(
+                                                ("checkpoint-evidence", index),
+                                                description,
+                                            )
+                                            .style(ButtonStyle::Subtle)
+                                            .label_size(LabelSize::Small)
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.load_checkpoint_evidence(
+                                                        source.clone(),
+                                                        scope.clone(),
+                                                        root.clone(),
+                                                        0,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                        )
+                                },
+                            ))
+                            .when_some(self.checkpoint_evidence_text.clone(), |body, text| {
+                                body.child(
+                                    v_flex()
+                                        .id("checkpoint-evidence-output")
+                                        .debug_selector(|| "checkpoint-evidence-output".to_string())
+                                        .max_h_40()
+                                        .overflow_y_scroll()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .p_2()
+                                        .child(Label::new(text).size(LabelSize::Small)),
+                                )
+                            })
+                            .when_some(
+                                self.checkpoint_evidence_next.clone(),
+                                |body, (source, scope, root, offset)| {
+                                    body.child(
+                                        Button::new("checkpoint-evidence-next", "Load more")
+                                            .style(ButtonStyle::Subtle)
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.load_checkpoint_evidence(
+                                                    source.clone(),
+                                                    scope.clone(),
+                                                    root.clone(),
+                                                    offset,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                },
+                            ),
                     )
                 }),
         )
@@ -5763,10 +6680,22 @@ impl ThreadView {
             agent::ThreadGoalStatus::Blocked => "Blocked",
         };
         let resume_thread = thread.clone();
-        let can_resume = matches!(
-            goal.status,
-            agent::ThreadGoalStatus::Paused | agent::ThreadGoalStatus::Blocked
-        ) && self.thread.read(cx).status() == ThreadStatus::Idle;
+        let edit_thread = thread.clone();
+        let delete_thread = thread.clone();
+        let can_manage = self.thread.read(cx).status() == ThreadStatus::Idle
+            && thread.read(cx).is_turn_complete();
+        let can_resume = goal.status != agent::ThreadGoalStatus::Completed && can_manage;
+        let resume_label = if goal.status == agent::ThreadGoalStatus::Active {
+            "Start"
+        } else {
+            "Resume"
+        };
+        let editing = self.goal_editing_id.as_deref() == Some(goal.id.as_str());
+        let confirming_delete = self.goal_delete_id.as_deref() == Some(goal.id.as_str());
+        let goal_id = goal.id.clone();
+        let delete_goal_id = goal.id.clone();
+        let confirmed_delete_goal_id = goal.id.clone();
+        let objective = goal.objective.clone();
         let mut details = format!(
             "Success criteria:\n{}",
             goal.success_criteria
@@ -5868,36 +6797,80 @@ impl ThreadView {
         Some(
             h_flex()
                 .id("goal-status")
+                .w_full()
                 .px_3()
                 .py_1()
                 .gap_2()
-                .child(
-                    Label::new(format!("Goal · {status}: {}", goal.objective))
-                        .size(LabelSize::Small),
-                )
-                .tooltip(Tooltip::text(details))
-                .when(goal.status == agent::ThreadGoalStatus::Active, |row| {
+                .when(!editing, |row| {
                     row.child(
-                        Button::new("pause-goal", "Pause")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                thread.update(cx, |thread, cx| {
-                                    thread
-                                        .set_goal_status(
+                        div().flex_1().min_w_0().child(
+                            Label::new(format!("Goal · {status}: {}", goal.objective))
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
+                    )
+                })
+                .when(editing, |row| {
+                    row.child(div().flex_1().min_w_0().child(self.goal_editor.clone()))
+                        .child(
+                            Button::new("save-goal", "Save")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let objective =
+                                        this.goal_editor.read(cx).text(cx).trim().to_string();
+                                    let result = edit_thread.update(cx, |thread, cx| {
+                                        anyhow::ensure!(
+                                            thread.goal().is_some_and(|goal| goal.id == goal_id),
+                                            "The goal changed while editing"
+                                        );
+                                        thread.edit_goal_objective(objective, cx)
+                                    });
+                                    match result {
+                                        Ok(()) => this.goal_editing_id = None,
+                                        Err(error) => this.handle_thread_error(error, cx),
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-edit-goal", "Cancel")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.goal_editing_id = None;
+                                    cx.notify();
+                                })),
+                        )
+                })
+                .tooltip(Tooltip::text(details))
+                .when(
+                    !editing && goal.status == agent::ThreadGoalStatus::Active,
+                    |row| {
+                        row.child(
+                            Button::new("pause-goal", "Pause")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = thread.update(cx, |thread, cx| {
+                                        thread.set_goal_status(
                                             agent::ThreadGoalStatus::Paused,
                                             Some("Paused by user".into()),
                                             cx,
                                         )
-                                        .log_err();
-                                });
-                                this.cancel_generation(cx);
-                                cx.notify();
-                            })),
-                    )
-                })
-                .when(can_resume, |row| {
+                                    });
+                                    if let Err(error) = result {
+                                        this.handle_thread_error(error, cx);
+                                        return;
+                                    }
+                                    if !can_manage {
+                                        this.cancel_generation(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    },
+                )
+                .when(!editing && can_resume, |row| {
                     row.child(
-                        Button::new("resume-goal", "Resume")
+                        Button::new("resume-goal", resume_label)
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let result = resume_thread.update(cx, |thread, cx| {
@@ -5907,7 +6880,8 @@ impl ThreadView {
                                         cx,
                                     )
                                 });
-                                if result.log_err().is_none() {
+                                if let Err(error) = result {
+                                    this.handle_thread_error(error, cx);
                                     return;
                                 }
                                 this.send_content(
@@ -5919,6 +6893,59 @@ impl ThreadView {
                                     window,
                                     cx,
                                 );
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(can_manage && !editing && !confirming_delete, |row| {
+                    row.child(
+                        Button::new("edit-goal", "Edit objective")
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("Existing criteria and constraints are preserved; verification evidence is cleared."))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.goal_editor.update(cx, |editor, cx| {
+                                    editor.set_text(objective.clone(), window, cx);
+                                });
+                                this.goal_editing_id = Some(delete_goal_id.clone());
+                                this.goal_editor.focus_handle(cx).focus(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("delete-goal", "Delete")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.goal_delete_id = Some(goal.id.clone());
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(can_manage && !editing && confirming_delete, |row| {
+                    row.child(
+                        Button::new("confirm-delete-goal", "Confirm delete")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let result = delete_thread.update(cx, |thread, cx| {
+                                    anyhow::ensure!(
+                                            thread.goal().is_some_and(
+                                                |goal| goal.id == confirmed_delete_goal_id
+                                            ),
+                                            "The goal changed while awaiting confirmation"
+                                        );
+                                    thread.delete_goal(cx)
+                                });
+                                match result {
+                                    Ok(()) => this.goal_delete_id = None,
+                                    Err(error) => this.handle_thread_error(error, cx),
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-delete-goal", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.goal_delete_id = None;
                                 cx.notify();
                             })),
                     )
@@ -8383,6 +9410,79 @@ impl ThreadView {
         None
     }
 
+    fn branch_message_id(&self, entry_index: usize, cx: &App) -> Option<acp_v2::MessageId> {
+        self.as_native_thread(cx)?;
+        let AgentThreadEntry::AssistantMessage(message) =
+            self.thread.read(cx).entries().get(entry_index)?
+        else {
+            return None;
+        };
+        if message.is_subagent_output {
+            return None;
+        }
+        message.chunks.iter().rev().find_map(|chunk| match chunk {
+            AssistantMessageChunk::Message {
+                identity: acp_thread::MessageIdentity::Keyed(id),
+                ..
+            } if id.0.starts_with("native-message-") => Some(id.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn branch_at_message(
+        &mut self,
+        entry_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(message_id) = self.branch_message_id(entry_index, cx) else {
+            return;
+        };
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let Some(store) = self.input_thread_store.clone() else {
+            return;
+        };
+        let snapshot = thread.read(cx).to_db(cx);
+        let folder_paths = self
+            .thread
+            .read(cx)
+            .project()
+            .read(cx)
+            .default_path_list(cx);
+        let branch = store.update(cx, |store, cx| {
+            store.branch_thread(snapshot, message_id, folder_paths.clone(), cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match branch.await {
+                Ok(session_id) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.workspace.update(cx, |workspace, cx| {
+                            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_thread(
+                                        session_id,
+                                        Some(folder_paths),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })?;
+                        anyhow::Ok(())
+                    })??;
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| this.handle_thread_error(error, cx))?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_thread_controls(
         &self,
         thread: &Entity<AcpThread>,
@@ -8413,6 +9513,22 @@ impl ThreadView {
                     }
                 }))
         });
+
+        let branch_button = copy_response_index
+            .filter(|&response_index| {
+                response_index == entry_ix
+                    && self.input_thread_store.is_some()
+                    && self.branch_message_id(response_index, cx).is_some()
+            })
+            .map(|response_index| {
+                IconButton::new(("branch_agent_response", entry_ix), IconName::GitBranch)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Branch Conversation from Here"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.branch_at_message(response_index, window, cx);
+                    }))
+            });
 
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
@@ -8475,7 +9591,7 @@ impl ThreadView {
             .w_full()
             .py_1p5()
             .px_4()
-            .justify_end()
+            .justify_start()
             .opacity(0.4)
             .hover(|s| s.opacity(1.))
             .when(
@@ -8495,6 +9611,7 @@ impl ThreadView {
                 },
             )
             .when_some(copy_response_button, |this, button| this.child(button))
+            .when_some(branch_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
@@ -14740,6 +15857,9 @@ fn leading_native_command(
     let rest = text.trim_start().strip_prefix('/')?;
     let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let name = &rest[..name_end];
+    if name == agent::GOAL_COMMAND_NAME {
+        return None;
+    }
     let is_native = available_commands.iter().any(|command| {
         command.name == name
             && acp_thread::command_category_from_meta(&command.meta)
@@ -14837,7 +15957,15 @@ mod tests {
 
     #[test]
     fn test_leading_native_command_matches_bare_and_with_remainder() {
-        let commands = [native_command("compact"), mcp_command("deploy")];
+        let commands = [
+            native_command("compact"),
+            native_command("goal"),
+            mcp_command("deploy"),
+        ];
+        assert_eq!(
+            leading_native_command("/goal Finish the migration", &commands),
+            None
+        );
 
         // Native command with trailing text.
         assert_eq!(

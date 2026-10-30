@@ -211,6 +211,7 @@ struct ActiveThreadInfo {
     icon_from_external_svg: Option<SharedString>,
     is_background: bool,
     is_title_generating: bool,
+    has_pending_question: bool,
     diff_stats: DiffStats,
 }
 
@@ -361,6 +362,7 @@ struct ThreadEntry {
     is_live: bool,
     is_background: bool,
     is_title_generating: bool,
+    has_pending_question: bool,
     draft: Option<DraftKind>,
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -390,6 +392,7 @@ impl ThreadEntry {
         self.is_live = true;
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
+        self.has_pending_question = info.has_pending_question;
         self.diff_stats = info.diff_stats;
     }
 }
@@ -1637,6 +1640,7 @@ impl Sidebar {
                             is_live: false,
                             is_background: false,
                             is_title_generating: false,
+                            has_pending_question: false,
                             draft,
                             highlight_positions: Vec::new(),
                             worktrees,
@@ -1768,7 +1772,9 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::Running {
                         has_running_threads = true;
                     }
-                    if info.status == AgentThreadStatus::WaitingForConfirmation {
+                    if info.status == AgentThreadStatus::WaitingForConfirmation
+                        || info.has_pending_question
+                    {
                         waiting_thread_count += 1;
                     }
                     live_info_by_session.insert(info.session_id.clone(), info);
@@ -1819,7 +1825,9 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::Running {
                         has_running_threads = true;
                     }
-                    if info.status == AgentThreadStatus::WaitingForConfirmation {
+                    if info.status == AgentThreadStatus::WaitingForConfirmation
+                        || info.has_pending_question
+                    {
                         waiting_thread_count += 1;
                     }
                     // Resolve the thread_id for this session so we can
@@ -2373,7 +2381,13 @@ impl Sidebar {
                 .into_any_element()
         };
 
+        let active_project_bg = color.text.grayscale().opacity(0.1);
         let base_bg = color.background.blend(sidebar_base_bg);
+        let base_bg = if is_active {
+            base_bg.blend(active_project_bg)
+        } else {
+            base_bg
+        };
 
         let hover_solid = base_bg.blend(color.ghost_element_hover);
         let active_solid = base_bg.blend(color.ghost_element_active);
@@ -2401,6 +2415,7 @@ impl Sidebar {
             .justify_between()
             .border_1()
             .border_r_2()
+            .when(is_active, |this| this.bg(active_project_bg))
             .map(|this| {
                 if is_focused {
                     this.border_color(color.panel_focused_border)
@@ -2409,8 +2424,20 @@ impl Sidebar {
                 }
             })
             .when(!has_filter, |this| {
-                this.hover(|s| s.bg(color.ghost_element_hover))
-                    .group_active(&group_name, |s| s.bg(color.ghost_element_active))
+                this.hover(|s| {
+                    s.bg(if is_active {
+                        active_project_bg.blend(color.ghost_element_hover)
+                    } else {
+                        color.ghost_element_hover
+                    })
+                })
+                .group_active(&group_name, |s| {
+                    s.bg(if is_active {
+                        active_project_bg.blend(color.ghost_element_active)
+                    } else {
+                        color.ghost_element_active
+                    })
+                })
             })
             .child(
                 h_flex()
@@ -2434,10 +2461,10 @@ impl Sidebar {
                         })
                         .when(waiting_thread_count > 0, |this| {
                             let tooltip_text = if waiting_thread_count == 1 {
-                                "1 thread is waiting for confirmation".to_string()
+                                "1 thread is waiting for input or confirmation".to_string()
                             } else {
                                 format!(
-                                    "{waiting_thread_count} threads are waiting for confirmation",
+                                    "{waiting_thread_count} threads are waiting for input or confirmation",
                                 )
                             };
                             this.child(
@@ -6346,6 +6373,8 @@ impl Sidebar {
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .sidebar_compact(true)
+            .question_pending(thread.has_pending_question && !is_renaming)
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -6675,6 +6704,8 @@ impl Sidebar {
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
+            .sidebar_compact(true)
+            .single_line(true)
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
@@ -8149,6 +8180,7 @@ fn all_thread_infos_for_workspace(
             let has_pending_tool_call = conversation_view
                 .read(cx)
                 .root_thread_has_pending_tool_call(cx);
+            let has_pending_question = conversation_view.read(cx).has_pending_question(cx);
             let conversation_thread_id = conversation_view.read(cx).parent_id();
             let thread_view = conversation_view.read(cx).root_thread_view()?;
             let thread_view_ref = thread_view.read(cx);
@@ -8187,6 +8219,7 @@ fn all_thread_infos_for_workspace(
                 icon_from_external_svg,
                 is_background,
                 is_title_generating,
+                has_pending_question,
                 diff_stats,
             })
         });

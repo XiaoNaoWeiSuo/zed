@@ -122,21 +122,21 @@ impl AgentUsageIndicator {
             five_hour.and_then(|window| Self::semantic_reset_label(window.resets_at_unix, true));
         let weekly_tooltip = weekly.map(|window| {
             format!(
-                "Weekly limit · {:.1}% remaining{}",
+                "Weekly limit · {:.1}% remaining{}\n",
                 (100.0 - window.used_percent).max(0.0),
                 weekly_reset
                     .as_deref()
-                    .map(|reset| format!(" · resets {reset}"))
+                    .map(|reset| format!("Resets {reset}"))
                     .unwrap_or_default()
             )
         });
         let five_hour_tooltip = five_hour.map(|window| {
             format!(
-                "5-hour limit · {:.1}% remaining{}",
+                "5-hour limit · {:.1}% remaining{}\n",
                 (100.0 - window.used_percent).max(0.0),
                 five_hour_reset
                     .as_deref()
-                    .map(|reset| format!(" · resets {reset}"))
+                    .map(|reset| format!("Resets {reset}"))
                     .unwrap_or_default()
             )
         });
@@ -269,18 +269,18 @@ impl AgentUsageIndicator {
         use chrono::{Datelike as _, Local, TimeZone as _, Timelike as _};
         let reset = Local.timestamp_opt(resets_at_unix?, 0).single()?;
         let period = match reset.hour() {
-            0..=5 => "凌晨",
-            6..=11 => "上午",
-            12..=17 => "下午",
-            _ => "晚上",
+            0..=5 => "Morning",
+            6..=11 => "AM.",
+            12..=17 => "PM.",
+            _ => "Night",
         };
         if relative_days {
             let today = Local::now().date_naive();
             let days = (reset.date_naive() - today).num_days();
             let day = match days {
-                0 => "今天".to_string(),
-                1 => "明天".to_string(),
-                2 => "后天".to_string(),
+                0 => "Today".to_string(),
+                1 => "Tomorrow".to_string(),
+                2 => "After tomorrow".to_string(),
                 _ => format!("{}月{}日", reset.month(), reset.day()),
             };
             Some(format!(
