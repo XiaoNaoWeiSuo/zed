@@ -78,6 +78,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         collaboration_page(),
         ai_page(cx),
         network_page(),
+        storage_page(),
         developer_page(cx),
     ]
 }
@@ -463,6 +464,23 @@ fn general_page(cx: &App) -> SettingsPage {
 }
 
 fn appearance_page() -> SettingsPage {
+    fn app_icon_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Application Icon"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Application Icon",
+                description: "Choose the running application's icon. Changes apply immediately on macOS; packaged icons are updated for all platforms.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("app_icon"),
+                    pick: |settings| settings.app_icon.as_ref(),
+                    write: |settings, value, _| settings.app_icon = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
     fn theme_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Theme"),
@@ -1579,6 +1597,7 @@ fn appearance_page() -> SettingsPage {
     }
 
     let items: Box<[SettingsPageItem]> = concat_sections!(
+        app_icon_section(),
         theme_section(),
         buffer_font_section(),
         ui_font_section(),
@@ -9272,6 +9291,155 @@ fn network_page() -> SettingsPage {
     SettingsPage {
         title: "Network",
         items: concat_sections![network_section()],
+    }
+}
+
+fn storage_page() -> SettingsPage {
+    SettingsPage {
+        title: "Storage",
+        items: vec![
+            SettingsPageItem::SectionHeader("Overview"),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Disk Usage".into(),
+                r#type: Default::default(),
+                description: Some(
+                    "Review and reclaim the disk space Lin uses for caches, logs, agent \
+                     worktrees and conversation history."
+                        .into(),
+                ),
+                search_aliases: &[
+                    "cache",
+                    "cleanup",
+                    "disk",
+                    "space",
+                    "storage",
+                    "worktree",
+                    "logs",
+                    "threads",
+                    "conversation history",
+                ],
+                json_path: None,
+                in_json: false,
+                files: USER,
+                render: crate::pages::render_storage_page,
+            }),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "History & Recovery".into(),
+                r#type: Default::default(),
+                description: Some("Review and export project checkpoints.".into()),
+                search_aliases: &["checkpoint", "history", "recovery", "export", "agent"],
+                json_path: None,
+                in_json: false,
+                files: USER,
+                render: crate::pages::render_checkpoint_history_page,
+            }),
+            SettingsPageItem::SectionHeader("Locations"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Default Clone Directory",
+                description: "Default parent directory for cloned repositories. Leave empty to choose each time. Absolute paths and ~/ paths are supported.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("storage.default_project_directory"),
+                    pick: |settings_content| settings_content.storage.as_ref()?.default_project_directory.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.storage.get_or_insert_default().default_project_directory = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata { placeholder: Some("~/Projects"), ..Default::default() })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Worktree Directory",
+                description: "Directory for new Git worktrees. Use an absolute path or a path relative to the repository or its parent. Existing worktrees are not moved.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git.worktree_directory"),
+                    pick: |settings_content| {
+                        settings_content.git.as_ref()?.worktree_directory.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.git.get_or_insert_default().worktree_directory = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("../worktrees"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "New Conversations Use a Worktree",
+                description: "Create a separate Git worktree for a new conversation. External agents require review before the first message is sent.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.new_thread_in_worktree"),
+                    pick: |settings_content| settings_content.agent.as_ref()?.new_thread_in_worktree.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().new_thread_in_worktree = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Remember Worktree Choice Per Project",
+                description: "Remember the choice made in the conversation composer for each local project.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.remember_worktree_choice"),
+                    pick: |settings_content| settings_content.agent.as_ref()?.remember_worktree_choice.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().remember_worktree_choice = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SectionHeader("Cleanup"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Automatically Clean Old Files",
+                description: "After startup, remove expired diagnostic logs, hang traces and top-level temporary files. The active log and temporary directories are kept.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("storage.automatic_cleanup"),
+                    pick: |settings_content| settings_content.storage.as_ref()?.automatic_cleanup.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.storage.get_or_insert_default().automatic_cleanup = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Diagnostic Retention Days",
+                description: "Minimum age in days for logs and hang traces removed automatically. Values below one are treated as one day.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("storage.diagnostic_retention_days"),
+                    pick: |settings_content| settings_content.storage.as_ref()?.diagnostic_retention_days.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.storage.get_or_insert_default().diagnostic_retention_days = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Temporary File Retention Days",
+                description: "Minimum age in days for temporary files removed automatically. Values below one are treated as one day.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("storage.temporary_retention_days"),
+                    pick: |settings_content| settings_content.storage.as_ref()?.temporary_retention_days.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.storage.get_or_insert_default().temporary_retention_days = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+        .into_boxed_slice(),
     }
 }
 

@@ -1,6 +1,7 @@
 mod components;
 mod page_data;
 pub mod pages;
+pub mod storage;
 
 use agent_skills::SkillIndex;
 use anyhow::{Context as _, Result};
@@ -450,6 +451,7 @@ struct SettingsFieldMetadata {
 
 pub fn init(cx: &mut App) {
     init_renderers(cx);
+    storage::init(cx);
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
 
@@ -643,6 +645,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::AgentMessageDetail>(render_dropdown)
         .add_basic_renderer::<settings::ImageFileSizeUnit>(render_dropdown)
         .add_basic_renderer::<settings::StatusStyle>(render_dropdown)
+        .add_basic_renderer::<settings::AppIcon>(render_dropdown)
         .add_basic_renderer::<settings::GitPanelClickBehavior>(render_dropdown)
         .add_basic_renderer::<settings::GitPanelSortBy>(render_dropdown)
         .add_basic_renderer::<settings::GitPanelGroupBy>(render_dropdown)
@@ -1790,6 +1793,9 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let font_family_cache = theme::FontFamilyCache::global(cx);
+
+        let storage_page = storage::global_or_init(cx);
+        cx.observe(&storage_page, |_, _, cx| cx.notify()).detach();
 
         cx.spawn(async move |this, cx| {
             font_family_cache.prefetch(cx).await;

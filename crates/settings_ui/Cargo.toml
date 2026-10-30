@@ -31,6 +31,7 @@ context_server.workspace = true
 copilot.workspace = true
 copilot_ui.workspace = true
 cpal.workspace = true
+db.workspace = true
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
 editor.workspace = true
@@ -42,6 +43,7 @@ futures.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
 heck.workspace = true
+human_bytes.workspace = true
 http_client.workspace = true
 http_proxy.workspace = true
 itertools.workspace = true
@@ -65,6 +67,7 @@ serde_yaml_ng.workspace = true
 settings.workspace = true
 shell_command_parser.workspace = true
 strum.workspace = true
+sysinfo = { workspace = true, features = ["disk"] }
 telemetry.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
@@ -72,6 +75,7 @@ ui.workspace = true
 url.workspace = true
 ui_input.workspace = true
 util.workspace = true
+walkdir.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_credentials_provider.workspace = true
@@ -87,6 +91,7 @@ pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 
 [package.metadata.cargo-shear]

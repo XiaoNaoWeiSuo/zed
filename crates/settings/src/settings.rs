@@ -56,6 +56,36 @@ pub use vscode_import::{VsCodeSettings, VsCodeSettingsSource};
 pub use keymap_file::ActionSequence;
 
 #[derive(Clone, Debug, Default, RegisterSetting)]
+pub struct StorageSettings {
+    pub automatic_cleanup: bool,
+    pub diagnostic_retention_days: usize,
+    pub temporary_retention_days: usize,
+    pub default_project_directory: Option<String>,
+}
+
+impl Settings for StorageSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let storage = content.storage.as_ref();
+        Self {
+            automatic_cleanup: storage
+                .and_then(|value| value.automatic_cleanup)
+                .unwrap_or(false),
+            diagnostic_retention_days: storage
+                .and_then(|value| value.diagnostic_retention_days)
+                .unwrap_or(30)
+                .max(1),
+            temporary_retention_days: storage
+                .and_then(|value| value.temporary_retention_days)
+                .unwrap_or(7)
+                .max(1),
+            default_project_directory: storage
+                .and_then(|value| value.default_project_directory.clone())
+                .filter(|value| !value.trim().is_empty()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, RegisterSetting)]
 pub struct CopilotSettings {
     pub enterprise_uri: Option<String>,
 }

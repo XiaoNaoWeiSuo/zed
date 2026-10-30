@@ -241,6 +241,10 @@ pub struct AutoCompactSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
+    /// Create a separate Git worktree when sending a new conversation's first message.
+    pub new_thread_in_worktree: Option<bool>,
+    /// Remember the worktree choice separately for each project.
+    pub remember_worktree_choice: Option<bool>,
     /// Whether the Agent is enabled.
     ///
     /// Default: true

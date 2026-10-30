@@ -172,6 +172,8 @@ pub enum ReduceMotionMode {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// The application icon shown while Lin is running.
+    pub app_icon: Option<AppIcon>,
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
@@ -208,6 +210,8 @@ pub struct SettingsContent {
     pub preview_tabs: Option<PreviewTabsSettingsContent>,
 
     pub agent: Option<AgentSettingsContent>,
+    /// Automatic maintenance of Lin's diagnostic files.
+    pub storage: Option<StorageSettingsContent>,
     pub agent_servers: Option<AllAgentServersSettings>,
 
     /// Configuration of audio in Lin.
@@ -337,6 +341,49 @@ pub struct SettingsContent {
     pub instrumentation: Option<InstrumentationSettingsContent>,
 }
 
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AppIcon {
+    #[default]
+    CobaltCeramic,
+    Swiss,
+    Titanium,
+    Speed,
+    Glass,
+    Modular,
+    Editorial,
+    Porcelain,
+    Graphite,
+    FoldedMetal,
+    Original,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct StorageSettingsContent {
+    /// Default destination directory for cloned repositories.
+    pub default_project_directory: Option<String>,
+    /// Remove old diagnostic logs, hang traces and temporary files after startup.
+    pub automatic_cleanup: Option<bool>,
+    /// Minimum age in days for diagnostic files removed automatically.
+    pub diagnostic_retention_days: Option<usize>,
+    /// Minimum age in days for temporary files removed automatically.
+    pub temporary_retention_days: Option<usize>,
+}
+
 /// Configuration for developer-oriented instrumentation tools that collect
 /// diagnostic data about a running Lin instance.
 #[with_fallible_options]
@@ -405,8 +452,8 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
-        agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        app_icon, call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
+        agent_servers, storage, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,

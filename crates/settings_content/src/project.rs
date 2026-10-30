@@ -673,8 +673,9 @@ pub struct GitSettings {
     ///
     /// Default: true
     pub show_stage_restore_buttons: Option<bool>,
-    /// Directory where git worktrees are created, relative to the repository
-    /// working directory.
+    /// Directory where git worktrees are created, either absolute or relative
+    /// to the repository working directory.
+    /// Absolute directories use a repository-specific subdirectory.
     ///
     /// When the resolved directory is outside the project root, the
     /// project's directory name is automatically appended so that

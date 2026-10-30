@@ -1,5 +1,7 @@
-use gpui::{App, Context, WeakEntity, Window};
+use gpui::{App, AppContext as _, Context, WeakEntity, Window};
 use notifications::status_toast::StatusToast;
+use settings::{Settings as _, StorageSettings};
+use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{Color, Icon, IconName, IconSize, SharedString};
 use util::ResultExt;
@@ -14,17 +16,58 @@ pub fn clone_and_open(
         dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + Sync + 'static,
     >,
 ) {
-    let destination_prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
-        files: false,
-        directories: true,
-        multiple: false,
-        prompt: Some("Select as Repository Destination".into()),
-    });
+    let configured_directory = StorageSettings::get_global(cx)
+        .default_project_directory
+        .clone()
+        .map(|directory| {
+            if directory == "~" {
+                util::paths::home_dir().to_path_buf()
+            } else if let Some(relative) = directory
+                .strip_prefix("~/")
+                .or_else(|| directory.strip_prefix("~\\"))
+            {
+                util::paths::home_dir().join(relative)
+            } else {
+                PathBuf::from(directory)
+            }
+        });
 
     window
         .spawn(cx, async move |cx| {
-            let mut paths = destination_prompt.await.ok()?.ok()??;
-            let mut destination_dir = paths.pop()?;
+            let selected_directory = if let Some(directory) = configured_directory {
+                let answer = cx.update(|window, cx| window.prompt(
+                    gpui::PromptLevel::Info,
+                    "Choose clone destination",
+                    Some(&format!("Clone into {}?", directory.display())),
+                    &["Use Default", "Choose Folder", "Cancel"], cx,
+                )).ok()?.await.ok()?;
+                match answer {
+                    0 => Some(directory),
+                    1 => None,
+                    _ => return None,
+                }
+            } else { None };
+            let mut destination_dir = if let Some(directory) = selected_directory {
+                let check = directory.clone();
+                let valid = cx.background_spawn(async move { check.is_absolute() && check.is_dir() }).await;
+                if !valid {
+                    workspace.update(cx, |workspace, cx| {
+                        let toast = StatusToast::new("The default clone directory must be an existing absolute directory.", cx, |this, _| {
+                            this.icon(Icon::new(IconName::XCircle).size(IconSize::Small).color(Color::Error)).dismiss_button(true)
+                        });
+                        workspace.toggle_status_toast(toast, cx);
+                    }).log_err();
+                    return None;
+                }
+                directory
+            } else {
+                let destination_prompt = cx.update(|_, cx| cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: false, directories: true, multiple: false,
+                    prompt: Some("Select as Repository Destination".into()),
+                })).ok()?;
+                let mut paths = destination_prompt.await.ok()?.ok()??;
+                paths.pop()?
+            };
 
             let repo_name = repo_url
                 .split('/')

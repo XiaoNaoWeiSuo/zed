@@ -10564,10 +10564,7 @@ pub async fn resolve_git_worktree_to_main_repo(fs: &dyn Fs, path: &Path) -> Opti
     Some(repo_identity_path(&common_dir, PathStyle::local()).to_path_buf())
 }
 
-/// Validates that the resolved worktree directory is acceptable:
-/// - The setting must not be an absolute path.
-/// - The resolved path must be either a subdirectory of the working
-///   directory or a subdirectory of its parent (i.e., a sibling).
+/// Resolves the configured directory for a repository's worktrees.
 ///
 /// Returns `Ok(resolved_path)` or an error with a user-facing message.
 pub fn worktrees_directory_for_repo(
@@ -10575,17 +10572,27 @@ pub fn worktrees_directory_for_repo(
     worktree_directory_setting: &str,
     path_style: PathStyle,
 ) -> Result<PathBuf> {
-    // Check the original setting before trimming, since a path like "///"
-    // is absolute but becomes "" after stripping trailing separators.
-    // Use `has_root` here because `/tmp/worktrees` is also not a relative path
-    if path_style.has_root(Path::new(worktree_directory_setting)) {
-        anyhow::bail!(
-            "git.worktree_directory must be a relative path, got: {worktree_directory_setting:?}"
-        );
-    }
-
     if worktree_directory_setting.is_empty() {
         anyhow::bail!("git.worktree_directory must not be empty");
+    }
+
+    let configured_path = Path::new(worktree_directory_setting);
+    if path_style.is_absolute(configured_path) {
+        let repository_name = path_style
+            .file_name(repository_anchor_path)
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in repository_anchor_path.to_string_lossy().bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        return path_style.join_path(configured_path, &format!("{repository_name}-{hash:016x}"));
+    }
+    if path_style.has_root(configured_path) {
+        anyhow::bail!(
+            "git.worktree_directory must be a relative path or an absolute path with a volume"
+        );
     }
 
     let trimmed = worktree_directory_setting.trim_end_matches(['/', '\\']);

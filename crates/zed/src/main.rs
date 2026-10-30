@@ -28,7 +28,10 @@ use fs::{Fs, RealFs};
 use futures::{FutureExt, StreamExt, channel::oneshot};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
-use gpui::{App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _};
+use gpui::{
+    App, AppContext, Application, AsyncApp, QuitMode, ReadGlobal as _, Task, TaskExt,
+    UpdateGlobal as _,
+};
 use gpui_platform;
 
 use gpui_tokio::Tokio;
@@ -83,6 +86,30 @@ fn build_application() -> Application {
     } else {
         Application::new_inaccessible(platform)
     }
+}
+
+fn application_icon_png(app_icon: settings::AppIcon) -> &'static [u8] {
+    match app_icon {
+        settings::AppIcon::CobaltCeramic => include_bytes!("../resources/icon-options/03.png"),
+        settings::AppIcon::Swiss => include_bytes!("../resources/icon-options/01.png"),
+        settings::AppIcon::Titanium => include_bytes!("../resources/icon-options/02.png"),
+        settings::AppIcon::Speed => include_bytes!("../resources/icon-options/04.png"),
+        settings::AppIcon::Glass => include_bytes!("../resources/icon-options/05.png"),
+        settings::AppIcon::Modular => include_bytes!("../resources/icon-options/06.png"),
+        settings::AppIcon::Editorial => include_bytes!("../resources/icon-options/07.png"),
+        settings::AppIcon::Porcelain => include_bytes!("../resources/icon-options/08.png"),
+        settings::AppIcon::Graphite => include_bytes!("../resources/icon-options/09.png"),
+        settings::AppIcon::FoldedMetal => include_bytes!("../resources/icon-options/10.png"),
+        settings::AppIcon::Original => include_bytes!("../resources/icon-options/original.png"),
+    }
+}
+
+fn apply_application_icon(cx: &mut App) {
+    let app_icon = SettingsStore::global(cx)
+        .merged_settings()
+        .app_icon
+        .unwrap_or_default();
+    gpui_platform::set_application_icon(application_icon_png(app_icon));
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
@@ -435,17 +462,15 @@ fn main() {
         zed_actions::init();
 
         release_channel::init(app_version, cx);
-        gpui_platform::set_application_icon(match *release_channel::RELEASE_CHANNEL {
-            ReleaseChannel::Dev => include_bytes!("../resources/app-icon-dev.png"),
-            ReleaseChannel::Nightly => include_bytes!("../resources/app-icon-nightly.png"),
-            ReleaseChannel::Preview => include_bytes!("../resources/app-icon-preview.png"),
-            ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png"),
-        });
+        gpui_platform::set_application_icon(application_icon_png(settings::AppIcon::default()));
         gpui_tokio::init(cx);
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        apply_application_icon(cx);
+        cx.observe_global::<SettingsStore>(apply_application_icon)
+            .detach();
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
