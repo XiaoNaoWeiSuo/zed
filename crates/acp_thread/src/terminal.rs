@@ -626,6 +626,23 @@ impl Terminal {
         }
     }
 
+    pub fn write_stdin(&mut self, text: String, cx: &mut App) -> Result<()> {
+        anyhow::ensure!(
+            self.is_process_backed(),
+            "Display-only terminals cannot accept stdin"
+        );
+        anyhow::ensure!(self.output.is_none(), "Terminal process has exited");
+        anyhow::ensure!(
+            self.terminal.read(cx).is_pty(),
+            "Terminal stdin is unavailable without a PTY"
+        );
+        anyhow::ensure!(text.len() <= 16 * 1024, "Terminal stdin exceeds 16 KiB");
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.input(text.into_bytes());
+        });
+        Ok(())
+    }
+
     pub fn kill(&mut self, cx: &mut App) {
         if !self.is_process_backed() {
             return;
@@ -662,6 +679,26 @@ impl Terminal {
             let truncated = current_content.len() < original_len;
             ProcessOutput::new(current_content, truncated)
         }
+    }
+
+    /// Returns recent output for background polling without changing foreground output selection.
+    pub fn current_output_tail(&self, cx: &App) -> ProcessOutput {
+        let mut content = self.terminal.read(cx).get_content();
+        let limit = self.output_byte_limit.unwrap_or(16 * 1024).min(16 * 1024);
+        let truncated = content.len() > limit;
+        if truncated {
+            let mut boundary = content.len() - limit;
+            while !content.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+            content.drain(..boundary);
+        }
+        let mut output = ProcessOutput::new(content, truncated);
+        output.exit_status = self
+            .output
+            .as_ref()
+            .map(|output| output.exit_status.clone());
+        output
     }
 
     pub(crate) fn write_display_output(&mut self, data: &[u8], cx: &mut Context<Self>) {

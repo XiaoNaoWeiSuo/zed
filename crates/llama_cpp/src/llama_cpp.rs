@@ -437,6 +437,11 @@ impl ModelEvent {
     }
 }
 
+fn server_base_url(api_url: &str) -> &str {
+    let api_url = api_url.trim().trim_end_matches('/');
+    api_url.strip_suffix("/v1").unwrap_or(api_url)
+}
+
 pub async fn stream_chat_completion(
     client: &dyn HttpClient,
     api_url: &str,
@@ -444,7 +449,7 @@ pub async fn stream_chat_completion(
     request: ChatCompletionRequest,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<ResponseStreamEvent>>> {
-    let uri = format!("{api_url}/v1/chat/completions");
+    let uri = format!("{}/v1/chat/completions", server_base_url(api_url));
     let request_builder = http::Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -499,7 +504,7 @@ pub async fn get_models(
     api_key: Option<&str>,
     extra_headers: &CustomHeaders,
 ) -> Result<Vec<ModelEntry>> {
-    let uri = format!("{api_url}/v1/models");
+    let uri = format!("{}/v1/models", server_base_url(api_url));
     let request = HttpRequest::builder()
         .method(Method::GET)
         .uri(uri)
@@ -540,6 +545,7 @@ pub async fn get_props(
     // Router-mode `/props` takes a `model` query parameter selecting which
     // instance to describe. Model ids contain `/` and `:` (e.g.
     // `unsloth/Qwen3.5-2B-GGUF:Q4_1`), so the value is URL-encoded.
+    let api_url = server_base_url(api_url);
     let uri = match model {
         Some(model) => Url::parse_with_params(&format!("{api_url}/props"), [("model", model)])
             .context("invalid llama.cpp API URL")?
@@ -581,7 +587,7 @@ pub async fn stream_model_events(
     api_key: Option<&str>,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<ModelEvent>>> {
-    let uri = format!("{api_url}/models/sse");
+    let uri = format!("{}/models/sse", server_base_url(api_url));
     let request = HttpRequest::builder()
         .method(Method::GET)
         .uri(uri)
@@ -619,6 +625,22 @@ pub async fn stream_model_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_url_accepts_openai_base_path_and_trailing_slashes() {
+        for url in [
+            "http://server:8080",
+            "http://server:8080/",
+            "http://server:8080/v1",
+            "http://server:8080/v1/",
+        ] {
+            assert_eq!(server_base_url(url), "http://server:8080");
+        }
+        assert_eq!(
+            server_base_url("http://server:8080/proxy/v1/"),
+            "http://server:8080/proxy"
+        );
+    }
 
     #[test]
     fn parse_single_model_listing() {

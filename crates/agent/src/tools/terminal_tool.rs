@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -30,19 +32,19 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 ///
 /// The output results will be shown to the user already, only list it again if necessary, avoid being redundant.
 ///
-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
+/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error. This applies to the outer `command`, not persistent `session.command`.
 ///
-/// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values yourself before calling this tool, or ask the user for the literal value to use.
+/// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values yourself before calling this tool, or ask the user for the literal value to use. This applies to the outer `command`, not persistent `session.command`.
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// Servers, watchers, and interactive commands are permitted only with explicit background mode: `session: {"action": "start"}`. Use the returned terminal ID with session status, output, stdin, stop, or clear. Background sessions survive tool-call completion and ordinary turn cancellation; stop requests termination, while clear stops and forgets them. Clear sessions when they are no longer needed.
 ///
 /// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
-/// Remember that each invocation of this tool will spawn a new shell process, so you can't rely on any state from previous invocations.
+/// Persistent shell actions `shell_open`, `shell_run`, `shell_status`, and `shell_close` use a separate local macOS Bash session only when OS sandboxing is disabled. `shell_open` accepts `cd`; `shell_run` takes `terminal_id`, `command`, and optional `background` inside `session`. Every open and run requires confirmation. Runs are serialized, default to a 120-second timeout, and preserve cwd, variables, and functions; `session.command` may use `cd` and expansions, subject to approval. Bash-tracked jobs are command-scoped and killed before the next command; disowned or `setsid` jobs are unsupported. Use `shell_run` with `background: true` for long-running tests. Cancellation or timeout closes the shell. Output is bounded. The shell protocol is not a security boundary. Close sessions when done.
 ///
-/// The terminal is an interactive pty, so any command that blocks waiting for input will hang the tool until it times out. To avoid this:
+/// The terminal is an interactive PTY. Commands waiting for input block foreground calls: use an explicit background session and stdin interaction for intentional prompts. For foreground commands, avoid accidental prompts:
 ///
 /// - Always insert `--no-pager` immediately after `git` for any read-only git command, including `git log`, `git diff`, `git show`, `git blame`, and `git stash show`. Example: `git --no-pager log -n 5` (NOT `git log -n 5`).
 /// - Prefer Git flags that avoid optional metadata writes when possible, such as `git --no-optional-locks status` instead of `git status`.
@@ -53,8 +55,10 @@ pub struct TerminalToolInput {
     /// The one-liner command to execute. Do not include shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`; resolve those values first or ask the user for the literal value to use.
     ///
     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+    #[serde(default)]
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
+    #[serde(default)]
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
     pub timeout_ms: Option<u64>,
@@ -64,6 +68,9 @@ pub struct TerminalToolInput {
     /// Return only the last N lines of terminal output to the model after the command finishes. Do not pipe output to `tail`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    /// Manage a background terminal or persistent shell. Omit for a foreground command.
+    #[serde(default)]
+    pub session: Option<TerminalSessionRequest>,
 }
 
 /// Executes a shell one-liner and returns the combined output.
@@ -72,19 +79,19 @@ pub struct TerminalToolInput {
 ///
 /// The output results will be shown to the user already, only list it again if necessary, avoid being redundant.
 ///
-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
+/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error. This applies to the outer `command`, not persistent `session.command`.
 ///
-/// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values first or ask the user for the literal value to use.
+/// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values first or ask the user for the literal value to use. This applies to the outer `command`, not persistent `session.command`.
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// Servers, watchers, and interactive commands are permitted only with explicit background mode: `session: {"action": "start"}`. Use the returned terminal ID with session status, output, stdin, stop, or clear. Background sessions survive tool-call completion and ordinary turn cancellation; stop requests termination, while clear stops and forgets them. Clear sessions when they are no longer needed.
 ///
 /// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
-/// Remember that each invocation of this tool will spawn a new shell process, so you can't rely on any state from previous invocations.
+/// Persistent shell actions `shell_open`, `shell_run`, `shell_status`, and `shell_close` use a separate local macOS Bash session only when OS sandboxing is disabled. `shell_open` accepts `cd`; `shell_run` takes `terminal_id`, `command`, and optional `background` inside `session`. Every open and run requires confirmation. Runs are serialized, default to a 120-second timeout, and preserve cwd, variables, and functions; `session.command` may use `cd` and expansions, subject to approval. Bash-tracked jobs are command-scoped and killed before the next command; disowned or `setsid` jobs are unsupported. Use `shell_run` with `background: true` for long-running tests. Cancellation or timeout closes the shell. Output is bounded. The shell protocol is not a security boundary. Close sessions when done.
 ///
-/// The terminal is an interactive pty, so any command that blocks waiting for input will hang the tool until it times out. To avoid this:
+/// The terminal is an interactive PTY. Commands waiting for input block foreground calls: use an explicit background session and stdin interaction for intentional prompts. For foreground commands, avoid accidental prompts:
 ///
 /// - Always insert `--no-pager` immediately after `git` for any read-only git command, including `git log`, `git diff`, `git show`, `git blame`, and `git stash show`. Example: `git --no-pager log -n 5` (NOT `git log -n 5`).
 /// - Prefer Git flags that avoid optional metadata writes when possible, such as `git --no-optional-locks status` instead of `git status`.
@@ -95,8 +102,10 @@ pub struct SandboxedTerminalToolInput {
     /// The one-liner command to execute. Do not include shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`; resolve those values first or ask the user for the literal value to use.
     ///
     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+    #[serde(default)]
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
+    #[serde(default)]
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
     pub timeout_ms: Option<u64>,
@@ -106,6 +115,9 @@ pub struct SandboxedTerminalToolInput {
     /// Return only the last N lines of terminal output to the model after the command finishes. Do not pipe output to `tail`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    /// Manage a background terminal or persistent shell. Omit for a foreground command.
+    #[serde(default)]
+    pub session: Option<TerminalSessionRequest>,
     /// Hosts the command needs outbound network access to.
     ///
     /// Sandboxed commands cannot reach the network by default. List the hosts
@@ -224,11 +236,13 @@ struct TerminalToolRequest {
     timeout_ms: Option<u64>,
     selection: TerminalOutputSelection,
     sandbox: Option<TerminalSandboxInput>,
+    session: Option<TerminalSessionRequest>,
 }
 
 impl From<TerminalToolInput> for TerminalToolRequest {
     fn from(input: TerminalToolInput) -> Self {
         Self {
+            session: input.session,
             command: input.command,
             cd: input.cd,
             timeout_ms: input.timeout_ms,
@@ -244,6 +258,7 @@ impl From<TerminalToolInput> for TerminalToolRequest {
 impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
     fn from(input: SandboxedTerminalToolInput) -> Self {
         Self {
+            session: input.session,
             command: input.command,
             cd: input.cd,
             timeout_ms: input.timeout_ms,
@@ -263,30 +278,808 @@ impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
     }
 }
 
-pub struct TerminalTool {
-    project: Entity<Project>,
-    environment: Rc<dyn ThreadEnvironment>,
+const MAX_TERMINAL_SESSIONS: usize = 32;
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TerminalSessionRequest {
+    Start,
+    /// Open a local, unsandboxed persistent Bash session. Set the initial directory with cd.
+    ShellOpen,
+    /// Run one command in the shell. Concurrent commands are rejected.
+    ShellRun {
+        terminal_id: String,
+        command: String,
+        #[serde(default)]
+        background: bool,
+    },
+    /// Return the latest command and shell state.
+    ShellStatus {
+        terminal_id: String,
+    },
+    /// Close the shell and terminate its process group.
+    ShellClose {
+        terminal_id: String,
+    },
+    Status {
+        terminal_id: String,
+    },
+    Output {
+        terminal_id: String,
+    },
+    /// Writes exact bytes (including any desired newline) to the existing PTY.
+    Stdin {
+        terminal_id: String,
+        text: String,
+    },
+    Stop {
+        terminal_id: String,
+    },
+    /// Stops the process if necessary and removes its registry entry.
+    Clear {
+        terminal_id: String,
+    },
 }
 
-impl TerminalTool {
-    pub fn new(project: Entity<Project>, environment: Rc<dyn ThreadEnvironment>) -> Self {
-        Self {
-            project,
-            environment,
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TerminalSessionState {
+    Running,
+    Exited {
+        status: acp_v2::TerminalExitStatus,
+        timed_out: bool,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalSessionMetadata {
+    pub terminal_id: String,
+    pub command: String,
+    pub state: TerminalSessionState,
+    pub stop_requested: bool,
+    pub sandbox_note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TerminalSessionSnapshot {
+    pub terminal_id: String,
+    pub command: String,
+    pub state: TerminalSessionState,
+    pub stop_requested: bool,
+    pub user_stopped: bool,
+    pub output: String,
+    pub truncated: bool,
+    pub sandbox_note: Option<String>,
+}
+
+struct TerminalCleanup {
+    terminal: Rc<dyn crate::TerminalHandle>,
+    cx: AsyncApp,
+    armed: bool,
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // Tools can be released inside an App update; defer to avoid reborrowing it.
+            let terminal = self.terminal.clone();
+            self.cx
+                .spawn(async move |cx| {
+                    if let Err(error) = terminal.kill(cx) {
+                        log::warn!("Failed to clean up agent terminal: {error:#}");
+                    }
+                })
+                .detach();
         }
     }
 }
 
-pub struct SandboxedTerminalTool {
-    project: Entity<Project>,
-    environment: Rc<dyn ThreadEnvironment>,
+struct TerminalSession {
+    terminal: Rc<dyn crate::TerminalHandle>,
+    state: Rc<RefCell<TerminalSessionState>>,
+    command: String,
+    sandbox_note: Option<String>,
+    stop_requested: bool,
+    _monitor: Task<()>,
 }
 
-impl SandboxedTerminalTool {
+#[derive(Clone)]
+struct TerminalSessions {
+    entries: Rc<RefCell<BTreeMap<String, TerminalSession>>>,
+    cleanup_context: Rc<RefCell<Option<AsyncApp>>>,
+    shells: Rc<ShellRegistry>,
+}
+
+#[derive(Default)]
+struct ShellRegistry {
+    entries: RefCell<BTreeMap<String, Arc<crate::persistent_shell::PersistentShell>>>,
+    generation: std::cell::Cell<u64>,
+}
+
+impl Drop for ShellRegistry {
+    fn drop(&mut self) {
+        let shells = std::mem::take(self.entries.get_mut());
+        if !shells.is_empty() {
+            std::thread::spawn(move || drop(shells));
+        }
+    }
+}
+
+fn bound_session_output(mut output: ProcessOutput) -> ProcessOutput {
+    let limit = COMMAND_OUTPUT_LIMIT as usize;
+    if output.output.len() > limit {
+        let mut boundary = output.output.len() - limit;
+        while !output.output.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        output.output.drain(..boundary);
+        output.truncated = true;
+    }
+    output
+}
+
+impl TerminalSessions {
+    fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
+        self.entries
+            .borrow()
+            .iter()
+            .map(|(terminal_id, session)| TerminalSessionMetadata {
+                terminal_id: terminal_id.clone(),
+                command: session.command.clone(),
+                state: session.state.borrow().clone(),
+                stop_requested: session.stop_requested,
+                sandbox_note: session.sandbox_note.clone(),
+            })
+            .collect()
+    }
+}
+
+impl Default for TerminalSessions {
+    fn default() -> Self {
+        Self {
+            entries: Rc::new(RefCell::new(BTreeMap::new())),
+            cleanup_context: Rc::new(RefCell::new(None)),
+            shells: Rc::new(ShellRegistry::default()),
+        }
+    }
+}
+
+impl Drop for TerminalSessions {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.entries) != 1 {
+            return;
+        }
+        let Some(cx) = self.cleanup_context.borrow_mut().take() else {
+            return;
+        };
+        let terminals = std::mem::take(&mut *self.entries.borrow_mut())
+            .into_values()
+            .map(|entry| entry.terminal)
+            .collect::<Vec<_>>();
+        for terminal in terminals {
+            let cx = cx.clone();
+            cx.spawn(async move |cx| {
+                if let Err(error) = terminal.kill(cx) {
+                    log::warn!("Failed to clean up disposed terminal session: {error:#}");
+                }
+            })
+            .detach();
+        }
+    }
+}
+
+struct ShellRunCleanup {
+    shell: Option<Arc<crate::persistent_shell::PersistentShell>>,
+}
+
+impl Drop for ShellRunCleanup {
+    fn drop(&mut self) {
+        if let Some(shell) = self.shell.take() {
+            std::thread::spawn(move || {
+                if let Err(error) = shell.close() {
+                    log::error!("Failed to close cancelled persistent shell: {error:#}");
+                }
+            });
+        }
+    }
+}
+
+async fn confirm_shell_action(
+    title: String,
+    message: String,
+    permission_input: String,
+    event_stream: &ToolCallEventStream,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let authorization = cx.update(|cx| {
+        event_stream.authorize(
+            title.clone(),
+            crate::ToolPermissionContext::new(TerminalTool::NAME, vec![permission_input.clone()]),
+            cx,
+        )
+    });
+    futures::select! {
+        result = authorization.fuse() => result.map_err(|error| error.to_string())?,
+        _ = event_stream.cancelled_by_user().fuse() => return Err("Persistent shell action cancelled".into()),
+    }
+    if event_stream.was_cancelled_by_user() {
+        return Err("Persistent shell action cancelled".into());
+    }
+    if !needs_stateful_shell_confirmation(event_stream, &permission_input, cx) {
+        return Ok(());
+    }
+    let decision = cx.update(|cx| {
+        event_stream.prompt_for_decision(
+            Some(title),
+            Some(message),
+            vec![
+                acp_v2::PermissionOption::new(
+                    acp_v2::PermissionOptionId::new("allow"),
+                    "Allow once",
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                acp_v2::PermissionOption::new(
+                    acp_v2::PermissionOptionId::new("deny"),
+                    "Deny",
+                    acp_v2::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            cx,
+        )
+    });
+    let decision = futures::select! {
+        result = decision.fuse() => result.map_err(|error| error.to_string())?,
+        _ = event_stream.cancelled_by_user().fuse() => return Err("Persistent shell action cancelled".into()),
+    };
+    if decision.0.as_ref() != "allow" || event_stream.was_cancelled_by_user() {
+        return Err("Persistent shell action denied or cancelled".into());
+    }
+    Ok(())
+}
+
+/// Persistent shells can reinterpret a later command that a static allow
+/// pattern already matched (for example by redefining a function). Only that
+/// case needs an extra prompt: every other case was either already approved by
+/// the normal authorization flow or is covered by the active permission tier.
+fn needs_stateful_shell_confirmation(
+    event_stream: &ToolCallEventStream,
+    command: &str,
+    cx: &mut AsyncApp,
+) -> bool {
+    use crate::permission_tier::PermissionTier;
+    use crate::tool_permissions::{decide_permission_from_settings, is_unconditional_allow_all};
+
+    if event_stream.permission_tier() != PermissionTier::Assisted {
+        return false;
+    }
+
+    cx.update(|cx| {
+        let settings = agent_settings::AgentSettings::get_global(cx);
+        let command = command.to_string();
+        let decision = decide_permission_from_settings(
+            TerminalTool::NAME,
+            std::slice::from_ref(&command),
+            settings,
+        );
+        if !matches!(decision, crate::ToolPermissionDecision::Allow) {
+            return false;
+        }
+        let unconditional = match settings.tool_permissions.tools.get(TerminalTool::NAME) {
+            Some(rules) => is_unconditional_allow_all(rules, settings.tool_permissions.default),
+            None => matches!(
+                settings.tool_permissions.default,
+                settings::ToolPermissionMode::Allow
+            ),
+        };
+        !unconditional
+    })
+}
+
+fn shell_goal_status(
+    status: &crate::persistent_shell::CommandStatus,
+) -> super::goal_verification::GoalCommandStatus {
+    use crate::persistent_shell::CommandStatus;
+    super::goal_verification::GoalCommandStatus {
+        exit_code: match status {
+            CommandStatus::Completed { exit_code } => Some(i64::from(*exit_code)),
+            _ => None,
+        },
+        timed_out: matches!(status, CommandStatus::TimedOut),
+        user_stopped: matches!(status, CommandStatus::Cancelled),
+    }
+}
+
+impl TerminalSessions {
+    fn clear_shells(&self, cx: &AsyncApp) {
+        self.shells
+            .generation
+            .set(self.shells.generation.get().wrapping_add(1));
+        let shells = std::mem::take(&mut *self.shells.entries.borrow_mut());
+        if !shells.is_empty() {
+            cx.background_executor()
+                .spawn(async move {
+                    for (identifier, shell) in shells {
+                        if let Err(error) = shell.close() {
+                            log::error!("Failed to close persistent shell {identifier}: {error:#}");
+                        }
+                    }
+                })
+                .detach();
+        }
+    }
+
+    async fn manage_shell(
+        &self,
+        request: &TerminalSessionRequest,
+        input: &TerminalToolRequest,
+        project: &Entity<Project>,
+        event_stream: &ToolCallEventStream,
+        cx: &mut AsyncApp,
+    ) -> Result<String, String> {
+        if !input.command.is_empty() {
+            return Err("Use session.command for shell_run; outer command must be empty".into());
+        }
+        if let Some(sandbox) = &input.sandbox
+            && (!sandbox.allow_hosts.is_empty()
+                || sandbox.allow_all_hosts.is_some()
+                || !sandbox.fs_write_paths.is_empty()
+                || sandbox.allow_fs_write_all.is_some()
+                || sandbox.unsandboxed.is_some()
+                || sandbox.reason.is_some())
+        {
+            return Err("Persistent shell actions do not accept sandbox permissions".into());
+        }
+        if !matches!(request, TerminalSessionRequest::ShellOpen) && !input.cd.is_empty() {
+            return Err(
+                "Only shell_open accepts cd; change directory inside the shell thereafter".into(),
+            );
+        }
+        if !matches!(request, TerminalSessionRequest::ShellRun { .. }) && input.timeout_ms.is_some()
+        {
+            return Err("Only shell_run accepts timeout_ms".into());
+        }
+        match request {
+            TerminalSessionRequest::ShellOpen => {
+                if !cfg!(target_os = "macos") {
+                    return Err("Persistent shells are supported only on local macOS".into());
+                }
+                let cwd = cx.update(|cx| {
+                    if !project.read(cx).is_local() {
+                        return Err("Persistent shells require a local project".to_string());
+                    }
+                    if sandboxing_enabled_for_project(project.read(cx), cx) {
+                        return Err(
+                            "Persistent shells are unavailable while OS sandboxing is enabled"
+                                .to_string(),
+                        );
+                    }
+                    working_dir(&input.cd, project, cx)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "Persistent shells require a project working directory".to_string()
+                        })
+                })?;
+                if self.entries.borrow().len() + self.shells.entries.borrow().len()
+                    >= MAX_TERMINAL_SESSIONS
+                {
+                    return Err(
+                        "Terminal session limit reached; clear an existing session first".into(),
+                    );
+                }
+                let generation = self.shells.generation.get();
+                confirm_shell_action(
+                    "Open persistent shell".into(),
+                    format!(
+                        "Open an unsandboxed persistent Bash shell in {}?",
+                        cwd.display()
+                    ),
+                    "/bin/bash".into(),
+                    event_stream,
+                    cx,
+                )
+                .await?;
+                if self.shells.generation.get() != generation
+                    || cx.update(|cx| sandboxing_enabled_for_project(project.read(cx), cx))
+                {
+                    return Err(
+                        "Persistent shell open cancelled or OS sandboxing was enabled".into(),
+                    );
+                }
+                let shell = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::persistent_shell::PersistentShell::spawn(cwd).map(Arc::new)
+                    })
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
+                if event_stream.was_cancelled_by_user()
+                    || self.shells.generation.get() != generation
+                    || cx.update(|cx| sandboxing_enabled_for_project(project.read(cx), cx))
+                    || self.entries.borrow().len() + self.shells.entries.borrow().len()
+                        >= MAX_TERMINAL_SESSIONS
+                {
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(error) = shell.close() {
+                                log::error!("Failed to close persistent shell: {error:#}");
+                            }
+                        })
+                        .detach();
+                    return Err("Persistent shell open cancelled or session limit reached".into());
+                }
+                let identifier = format!("shell-{}", uuid::Uuid::new_v4());
+                self.shells
+                    .entries
+                    .borrow_mut()
+                    .insert(identifier.clone(), shell);
+                Ok(serde_json::json!({
+                    "terminal_id": identifier,
+                    "note": "Unsandboxed; stdin is unavailable. The control protocol is not a security boundary."
+                }).to_string())
+            }
+            TerminalSessionRequest::ShellRun {
+                terminal_id,
+                command,
+                background,
+            } => {
+                if cx.update(|cx| sandboxing_enabled_for_project(project.read(cx), cx)) {
+                    return Err("Persistent shells are unavailable while OS sandboxing is enabled; close this session".into());
+                }
+                if command.trim().is_empty() {
+                    return Err("Persistent shell command must not be empty".into());
+                }
+                let shell = self
+                    .shells
+                    .entries
+                    .borrow()
+                    .get(terminal_id)
+                    .cloned()
+                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
+                confirm_shell_action(
+                    format!("Run command in persistent shell {terminal_id}"),
+                    format!("Unsandboxed persistent shell command:\n{command}"),
+                    command.clone(),
+                    event_stream,
+                    cx,
+                )
+                .await?;
+                if cx.update(|cx| sandboxing_enabled_for_project(project.read(cx), cx)) {
+                    return Err("Persistent shells are unavailable while OS sandboxing is enabled; close this session".into());
+                }
+                if !self
+                    .shells
+                    .entries
+                    .borrow()
+                    .get(terminal_id)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &shell))
+                {
+                    return Err("Persistent shell was closed".into());
+                }
+                let command_id = shell
+                    .submit(
+                        command.clone(),
+                        Duration::from_millis(input.timeout_ms.unwrap_or(120_000)),
+                    )
+                    .map_err(|error| format!("{error:#}"))?;
+                if *background {
+                    return Ok(serde_json::json!({
+                        "terminal_id": terminal_id,
+                        "command_id": command_id,
+                        "snapshot": shell.snapshot(),
+                    })
+                    .to_string());
+                }
+                let mut cleanup = ShellRunCleanup {
+                    shell: Some(shell.clone()),
+                };
+                loop {
+                    let snapshot = shell.snapshot();
+                    if let Some(command) = &snapshot.command {
+                        if command.id != command_id {
+                            return Err("Persistent shell command was replaced".into());
+                        }
+                        if !matches!(
+                            command.status,
+                            crate::persistent_shell::CommandStatus::Running
+                        ) {
+                            cleanup.shell = None;
+                            event_stream.set_command_status(shell_goal_status(&command.status));
+                            return Ok(serde_json::json!({
+                                "terminal_id": terminal_id,
+                                "command_id": command_id,
+                                "snapshot": snapshot,
+                            })
+                            .to_string());
+                        }
+                    }
+                    futures::select! {
+                        _ = cx.background_executor().timer(Duration::from_millis(50)).fuse() => {},
+                        _ = event_stream.cancelled_by_user().fuse() => {
+                            event_stream.set_command_status(super::goal_verification::GoalCommandStatus {
+                                exit_code: None,
+                                timed_out: false,
+                                user_stopped: true,
+                            });
+                            return Err("Persistent shell command cancelled; shell closed".into());
+                        },
+                    }
+                }
+            }
+            TerminalSessionRequest::ShellStatus { terminal_id } => {
+                let shell = self
+                    .shells
+                    .entries
+                    .borrow()
+                    .get(terminal_id)
+                    .cloned()
+                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
+                serde_json::to_string(&shell.snapshot()).map_err(|error| error.to_string())
+            }
+            TerminalSessionRequest::ShellClose { terminal_id } => {
+                let shell = self
+                    .shells
+                    .entries
+                    .borrow_mut()
+                    .remove(terminal_id)
+                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                cx.background_executor()
+                    .spawn(async move {
+                        let result = shell.close().map_err(|error| format!("{error:#}"));
+                        if let Err(result) = sender.send(result) {
+                            if let Err(error) = result {
+                                log::error!("Failed to close persistent shell: {error}");
+                            }
+                        }
+                    })
+                    .detach();
+                receiver
+                    .await
+                    .map_err(|error| format!("Shell cleanup worker failed: {error}"))?
+                    .map_err(|error| format!("Failed to close persistent shell: {error}"))?;
+                Ok(format!("Closed persistent shell {terminal_id}"))
+            }
+            _ => Err("Expected a persistent shell action".into()),
+        }
+    }
+
+    fn snapshot(&self, identifier: &str, cx: &AsyncApp) -> Result<TerminalSessionSnapshot> {
+        let entries = self.entries.borrow();
+        let entry = entries
+            .get(identifier)
+            .ok_or_else(|| anyhow::anyhow!("Unknown terminal session: {identifier}"))?;
+        let output = bound_session_output(entry.terminal.current_output_tail(cx)?);
+        Ok(TerminalSessionSnapshot {
+            terminal_id: identifier.to_owned(),
+            command: entry.command.clone(),
+            state: entry.state.borrow().clone(),
+            stop_requested: entry.stop_requested,
+            user_stopped: entry.terminal.was_stopped_by_user(cx)?,
+            output: output.output,
+            truncated: output.truncated,
+            sandbox_note: entry.sandbox_note.clone(),
+        })
+    }
+
+    fn clear(&self, identifier: &str, cx: &AsyncApp) -> Result<()> {
+        let mut entries = self.entries.borrow_mut();
+        let entry = entries
+            .get(identifier)
+            .ok_or_else(|| anyhow::anyhow!("Unknown terminal session: {identifier}"))?;
+        entry.terminal.kill(cx)?;
+        entries.remove(identifier);
+        Ok(())
+    }
+
+    async fn manage(
+        &self,
+        request: &TerminalSessionRequest,
+        input: &TerminalToolRequest,
+        event_stream: &ToolCallEventStream,
+        cx: &mut AsyncApp,
+    ) -> Result<String, String> {
+        if !input.command.is_empty() || !input.cd.is_empty() || input.timeout_ms.is_some() {
+            return Err("Session management cannot include command, cd, or timeout_ms".into());
+        }
+        if let Some(sandbox) = &input.sandbox
+            && (!sandbox.allow_hosts.is_empty()
+                || sandbox.allow_all_hosts.is_some()
+                || !sandbox.fs_write_paths.is_empty()
+                || sandbox.allow_fs_write_all.is_some()
+                || sandbox.unsandboxed.is_some()
+                || sandbox.reason.is_some())
+        {
+            return Err(
+                "Session management cannot change sandbox permissions; start a new terminal".into(),
+            );
+        }
+        let identifier = match request {
+            TerminalSessionRequest::Start
+            | TerminalSessionRequest::ShellOpen
+            | TerminalSessionRequest::ShellRun { .. }
+            | TerminalSessionRequest::ShellStatus { .. }
+            | TerminalSessionRequest::ShellClose { .. } => {
+                return Err("Expected an existing background terminal".into());
+            }
+            TerminalSessionRequest::Status { terminal_id }
+            | TerminalSessionRequest::Output { terminal_id }
+            | TerminalSessionRequest::Stdin { terminal_id, .. }
+            | TerminalSessionRequest::Stop { terminal_id }
+            | TerminalSessionRequest::Clear { terminal_id } => terminal_id,
+        };
+        if !self.entries.borrow().contains_key(identifier) {
+            return Err(format!("Unknown terminal session: {identifier}"));
+        }
+        if let TerminalSessionRequest::Stdin { text, .. } = request {
+            if text.len() > COMMAND_OUTPUT_LIMIT as usize {
+                return Err("Terminal stdin exceeds 16 KiB".into());
+            }
+            // Stdin can execute new commands in an interactive shell; command-pattern grants
+            // for the original start must not authorize arbitrary subsequent input.
+            let authorize = cx.update(|cx| {
+                event_stream.authorize(
+                    SharedString::new(format!("Write input to terminal {identifier}")),
+                    crate::ToolPermissionContext::new(TerminalTool::NAME, vec![text.clone()]),
+                    cx,
+                )
+            });
+            authorize.await.map_err(|error| error.to_string())?;
+            if event_stream.was_cancelled_by_user() {
+                return Err("Terminal input cancelled".into());
+            }
+            let entries = self.entries.borrow();
+            let entry = entries
+                .get(identifier)
+                .ok_or_else(|| "Terminal session was cleared".to_string())?;
+            if entry.stop_requested
+                || !matches!(*entry.state.borrow(), TerminalSessionState::Running)
+            {
+                return Err("Terminal session is no longer accepting input".into());
+            }
+            entry
+                .terminal
+                .write_stdin(text.clone(), cx)
+                .map_err(|error| error.to_string())?;
+        }
+        if matches!(request, TerminalSessionRequest::Clear { .. }) {
+            self.clear(identifier, cx)
+                .map_err(|error| error.to_string())?;
+            return Ok(format!("Cleared terminal session {identifier}"));
+        }
+        if matches!(request, TerminalSessionRequest::Stop { .. }) {
+            let mut entries = self.entries.borrow_mut();
+            let entry = entries
+                .get_mut(identifier)
+                .ok_or_else(|| "Terminal session was cleared".to_string())?;
+            entry.terminal.kill(cx).map_err(|error| error.to_string())?;
+            entry.stop_requested = true;
+        }
+        let mut snapshot = self
+            .snapshot(identifier, cx)
+            .map_err(|error| error.to_string())?;
+        if matches!(request, TerminalSessionRequest::Status { .. }) {
+            snapshot.output.clear();
+        } else {
+            let selected = select_terminal_output_lines(&snapshot.output, input.selection);
+            let bounded = bound_session_output(ProcessOutput::new(selected, snapshot.truncated));
+            snapshot.output = bounded.output;
+            snapshot.truncated = bounded.truncated;
+        }
+        serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone)]
+pub struct TerminalTool {
+    project: Entity<Project>,
+    environment: Rc<dyn ThreadEnvironment>,
+    sessions: TerminalSessions,
+}
+
+impl TerminalTool {
+    pub fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
+        self.sessions.session_metadata()
+    }
+
+    /// Poll from the foreground context; output is bounded to 16 KiB per session.
+    pub fn session_snapshots(&self, cx: &AsyncApp) -> Result<Vec<TerminalSessionSnapshot>> {
+        let identifiers = self
+            .sessions
+            .entries
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        identifiers
+            .iter()
+            .map(|identifier| self.sessions.snapshot(identifier, cx))
+            .collect()
+    }
+
+    /// Call on thread disposal or explicit session reset, not on normal turn completion.
+    pub fn clear_sessions(&self, cx: &AsyncApp) -> Result<()> {
+        let identifiers = self
+            .sessions
+            .entries
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for identifier in identifiers {
+            if let Err(error) = self.sessions.clear(&identifier, cx) {
+                errors.push(format!("{identifier}: {error:#}"));
+            }
+        }
+        self.sessions.clear_shells(cx);
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
+    }
+
     pub fn new(project: Entity<Project>, environment: Rc<dyn ThreadEnvironment>) -> Self {
         Self {
             project,
             environment,
+            sessions: TerminalSessions::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SandboxedTerminalTool {
+    project: Entity<Project>,
+    environment: Rc<dyn ThreadEnvironment>,
+    sessions: TerminalSessions,
+}
+
+impl SandboxedTerminalTool {
+    pub fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
+        self.sessions.session_metadata()
+    }
+
+    /// Poll from the foreground context; output is bounded to 16 KiB per session.
+    pub fn session_snapshots(&self, cx: &AsyncApp) -> Result<Vec<TerminalSessionSnapshot>> {
+        let identifiers = self
+            .sessions
+            .entries
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        identifiers
+            .iter()
+            .map(|identifier| self.sessions.snapshot(identifier, cx))
+            .collect()
+    }
+
+    /// Call on thread disposal or explicit session reset, not on normal turn completion.
+    pub fn clear_sessions(&self, cx: &AsyncApp) -> Result<()> {
+        let identifiers = self
+            .sessions
+            .entries
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for identifier in identifiers {
+            if let Err(error) = self.sessions.clear(&identifier, cx) {
+                errors.push(format!("{identifier}: {error:#}"));
+            }
+        }
+        self.sessions.clear_shells(cx);
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
+    }
+
+    pub fn new(project: Entity<Project>, environment: Rc<dyn ThreadEnvironment>) -> Self {
+        Self {
+            project,
+            environment,
+            sessions: TerminalSessions::default(),
         }
     }
 }
@@ -325,6 +1118,7 @@ impl AgentTool for TerminalTool {
                 self.project.clone(),
                 self.environment.clone(),
                 input.into(),
+                self.sessions.clone(),
                 event_stream,
                 cx,
             )
@@ -367,6 +1161,7 @@ impl AgentTool for SandboxedTerminalTool {
                 self.project.clone(),
                 self.environment.clone(),
                 input.into(),
+                self.sessions.clone(),
                 event_stream,
                 cx,
             )
@@ -418,9 +1213,34 @@ async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
     input: TerminalToolRequest,
+    sessions: TerminalSessions,
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
+    if let Some(request) = input.session.as_ref() {
+        match request {
+            TerminalSessionRequest::ShellOpen
+            | TerminalSessionRequest::ShellRun { .. }
+            | TerminalSessionRequest::ShellStatus { .. }
+            | TerminalSessionRequest::ShellClose { .. } => {
+                return sessions
+                    .manage_shell(request, &input, &project, &event_stream, cx)
+                    .await;
+            }
+            TerminalSessionRequest::Start => {}
+            _ => return sessions.manage(request, &input, &event_stream, cx).await,
+        }
+    }
+    if input.command.trim().is_empty() || input.cd.trim().is_empty() {
+        return Err("Starting a terminal requires command and cd".into());
+    }
+    let background = input.session.is_some();
+    if background
+        && sessions.entries.borrow().len() + sessions.shells.entries.borrow().len()
+            >= MAX_TERMINAL_SESSIONS
+    {
+        return Err("Terminal session limit reached; clear an existing session first".into());
+    }
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 
@@ -842,7 +1662,7 @@ async fn run_terminal_tool(
         None
     };
 
-    let output_byte_limit = if selection.is_enabled() {
+    let output_byte_limit = if selection.is_enabled() && !background {
         None
     } else {
         Some(COMMAND_OUTPUT_LIMIT)
@@ -861,8 +1681,8 @@ async fn run_terminal_tool(
         let mut retries = 0usize;
         let mut effective_wrap = sandbox_wrap.clone();
         loop {
-            let error = match environment
-                .create_terminal(
+            let task = if background {
+                environment.create_background_terminal(
                     input.command.clone(),
                     extra_env.clone(),
                     working_dir.clone(),
@@ -870,8 +1690,17 @@ async fn run_terminal_tool(
                     effective_wrap.clone(),
                     cx,
                 )
-                .await
-            {
+            } else {
+                environment.create_terminal(
+                    input.command.clone(),
+                    extra_env.clone(),
+                    working_dir.clone(),
+                    output_byte_limit,
+                    effective_wrap.clone(),
+                    cx,
+                )
+            };
+            let error = match task.await {
                 Ok(terminal) => break terminal,
                 Err(error) => error,
             };
@@ -927,8 +1756,8 @@ async fn run_terminal_tool(
         }
     };
     #[cfg(not(target_os = "windows"))]
-    let terminal = environment
-        .create_terminal(
+    let terminal = if background {
+        environment.create_background_terminal(
             input.command.clone(),
             extra_env,
             working_dir.clone(),
@@ -936,8 +1765,18 @@ async fn run_terminal_tool(
             sandbox_wrap.clone(),
             cx,
         )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    } else {
+        environment.create_terminal(
+            input.command.clone(),
+            extra_env,
+            working_dir.clone(),
+            output_byte_limit,
+            sandbox_wrap.clone(),
+            cx,
+        )
+    }
+    .await
+    .map_err(|e| format!("{e:#}"))?;
 
     // When sandboxing was active but the command ran without a sandbox (a
     // settings opt-out, a thread grant, or a sandbox-creation failure the user
@@ -981,10 +1820,15 @@ async fn run_terminal_tool(
         note
     });
 
+    let mut cleanup = TerminalCleanup {
+        terminal: terminal.clone(),
+        cx: cx.clone(),
+        armed: true,
+    };
     let terminal_id = terminal.id(cx).map_err(|e| e.to_string())?;
     event_stream.update_fields(|update| {
         let update = update.content(vec![acp_v2::ToolCallContent::Terminal(
-            acp_v2::Terminal::new(terminal_id),
+            acp_v2::Terminal::new(terminal_id.clone()),
         )]);
         match &sandbox_not_applied {
             Some(reason) => update.meta(acp_thread::meta_with_sandbox_not_applied(reason)),
@@ -993,6 +1837,68 @@ async fn run_terminal_tool(
     });
 
     let timeout = input.timeout_ms.map(Duration::from_millis);
+    if background {
+        *sessions.cleanup_context.borrow_mut() = Some(cx.clone());
+        if event_stream.was_cancelled_by_user() {
+            return Err("Background terminal start cancelled".into());
+        }
+        if sessions.entries.borrow().len() + sessions.shells.entries.borrow().len()
+            >= MAX_TERMINAL_SESSIONS
+        {
+            return Err("Terminal session limit reached; clear an existing session first".into());
+        }
+        let identifier = terminal_id.to_string();
+        if sessions.entries.borrow().contains_key(&identifier) {
+            return Err("Terminal environment reused an active session ID".into());
+        }
+        let snapshot = Rc::new(RefCell::new(TerminalSessionState::Running));
+        let state = Rc::downgrade(&snapshot);
+        let wait_for_exit = terminal
+            .wait_for_exit(cx)
+            .map_err(|error| error.to_string())?;
+        let monitor = cx.spawn(async move |cx| {
+            let mut cleanup = cleanup;
+            let result = if let Some(timeout) = timeout {
+                futures::select! {
+                    status = wait_for_exit.clone().fuse() => Ok((status, false)),
+                    _ = cx.background_executor().timer(timeout).fuse() => {
+                        match cleanup.terminal.kill(cx) {
+                            Ok(()) => Ok((wait_for_exit.await, true)),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                }
+            } else {
+                Ok((wait_for_exit.await, false))
+            };
+            if let Some(state) = state.upgrade() {
+                *state.borrow_mut() = match result {
+                    Ok((status, timed_out)) => {
+                        cleanup.armed = false;
+                        TerminalSessionState::Exited { status, timed_out }
+                    }
+                    Err(error) => TerminalSessionState::Failed { error },
+                };
+            }
+        });
+        sessions.entries.borrow_mut().insert(
+            identifier.clone(),
+            TerminalSession {
+                terminal,
+                state: snapshot,
+                command: input.command,
+                sandbox_note: sandbox_note.clone(),
+                stop_requested: false,
+                _monitor: monitor,
+            },
+        );
+        return Ok(format!(
+            "Background terminal started: {identifier}{}",
+            sandbox_note
+                .map(|note| format!("\n{note}"))
+                .unwrap_or_default()
+        ));
+    }
 
     let mut timed_out = false;
     let mut user_stopped_via_signal = false;
@@ -1028,6 +1934,7 @@ async fn run_terminal_tool(
         }
     };
 
+    cleanup.armed = false;
     let user_stopped_via_signal = user_stopped_via_signal || event_stream.was_cancelled_by_user();
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
     let user_stopped = user_stopped_via_signal || user_stopped_via_terminal;
@@ -1432,6 +2339,659 @@ fn resolve_cd_in_worktrees(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persistent_shell_goal_status_distinguishes_outcomes() {
+        use crate::persistent_shell::CommandStatus;
+        let success = super::shell_goal_status(&CommandStatus::Completed { exit_code: 0 });
+        assert_eq!(success.exit_code, Some(0));
+        assert!(!success.timed_out && !success.user_stopped);
+        let failure = super::shell_goal_status(&CommandStatus::Completed { exit_code: 7 });
+        assert_eq!(failure.exit_code, Some(7));
+        let timeout = super::shell_goal_status(&CommandStatus::TimedOut);
+        assert_eq!(timeout.exit_code, None);
+        assert!(timeout.timed_out);
+        let cancelled = super::shell_goal_status(&CommandStatus::Cancelled);
+        assert_eq!(cancelled.exit_code, None);
+        assert!(cancelled.user_stopped);
+        let failed = super::shell_goal_status(&CommandStatus::Failed {
+            reason: "protocol".into(),
+        });
+        assert_eq!(failed.exit_code, None);
+    }
+
+    #[test]
+    fn persistent_shell_request_schema_and_defaults() {
+        let input: super::TerminalToolInput = serde_json::from_value(serde_json::json!({
+            "session": { "action": "shell_run", "terminal_id": "shell-1", "command": "pwd" }
+        }))
+        .expect("valid shell run");
+        assert!(
+            matches!(input.session, Some(super::TerminalSessionRequest::ShellRun {
+            terminal_id, command, background: false
+        }) if terminal_id == "shell-1" && command == "pwd")
+        );
+        for action in ["shell_open", "shell_status", "shell_close"] {
+            let session = if action == "shell_open" {
+                serde_json::json!({ "action": action })
+            } else {
+                serde_json::json!({ "action": action, "terminal_id": "shell-1" })
+            };
+            assert!(serde_json::from_value::<super::TerminalSessionRequest>(session).is_ok());
+        }
+        assert!(serde_json::from_value::<super::TerminalSessionRequest>(serde_json::json!({
+            "action": "shell_run", "terminal_id": "shell-1", "command": "pwd", "unexpected": true
+        })).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn persistent_shell_rejects_enabled_sandbox_before_prompt(cx: &mut gpui::TestAppContext) {
+        use feature_flags::FeatureFlagAppExt as _;
+        crate::tests::init_test(cx);
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["sandboxing".into()]);
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.sandbox_permissions = agent_settings::SandboxPermissions::default();
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/tmp", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/tmp".as_ref()], cx).await;
+        let environment = std::rc::Rc::new(crate::tests::FakeThreadEnvironment::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(super::TerminalTool::new(project, environment));
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(super::TerminalToolInput {
+                    cd: "tmp".into(),
+                    session: Some(super::TerminalSessionRequest::ShellOpen),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        });
+        assert!(
+            task.await
+                .expect_err("sandbox must reject shell")
+                .contains("OS sandboxing is enabled")
+        );
+        assert!(tool.sessions.shells.entries.borrow().is_empty());
+        assert!(!matches!(
+            receiver.try_recv(),
+            Ok(Ok(crate::ThreadEvent::ToolCallAuthorization(_)))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn persistent_shell_permissions_and_lifecycle(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        crate::tests::init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.sandbox_permissions.allow_unsandboxed = true;
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            settings.tool_permissions.tools.remove(TerminalTool::NAME);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/tmp", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/tmp".as_ref()], cx).await;
+        let environment = Rc::new(crate::tests::FakeThreadEnvironment::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(TerminalTool::new(project, environment));
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    cd: "tmp".into(),
+                    session: Some(TerminalSessionRequest::ShellOpen),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        });
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve open");
+        let opened: serde_json::Value =
+            serde_json::from_str(&task.await.expect("open shell")).expect("open JSON");
+        let identifier = opened["terminal_id"]
+            .as_str()
+            .expect("shell id")
+            .to_string();
+        let shell = tool
+            .sessions
+            .shells
+            .entries
+            .borrow()
+            .get(&identifier)
+            .cloned()
+            .expect("registered shell");
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let input = TerminalToolInput {
+            session: Some(TerminalSessionRequest::ShellRun {
+                terminal_id: identifier.clone(),
+                command: "printf ready".into(),
+                background: false,
+            }),
+            ..Default::default()
+        };
+        let task = cx.update(|cx| {
+            tool.clone()
+                .run(crate::ToolInput::resolved(input), stream.clone(), cx)
+        });
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve successful command");
+        let successful: serde_json::Value =
+            serde_json::from_str(&task.await.expect("successful command")).expect("run JSON");
+        assert_eq!(successful["snapshot"]["command"]["status"]["exit_code"], 0);
+        assert!(
+            successful["snapshot"]["command"]["output"]
+                .as_str()
+                .expect("output")
+                .contains("ready")
+        );
+        assert_eq!(
+            stream.command_status().and_then(|status| status.exit_code),
+            Some(0)
+        );
+        let setup_id = shell
+            .submit(
+                "function true() { return 7; }".into(),
+                std::time::Duration::from_secs(2),
+            )
+            .expect("setup");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while matches!(
+            shell.snapshot().status,
+            crate::persistent_shell::ShellStatus::Running
+        ) {
+            assert!(std::time::Instant::now() < deadline, "setup timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            shell.snapshot().command.as_ref().map(|command| command.id),
+            Some(setup_id)
+        );
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Deny;
+            settings.tool_permissions.tools.insert(
+                TerminalTool::NAME.into(),
+                agent_settings::ToolRules {
+                    default: Some(settings::ToolPermissionMode::Deny),
+                    always_allow: vec![
+                        agent_settings::CompiledRegex::new(r"^true$", false).expect("pattern"),
+                    ],
+                    always_deny: vec![],
+                    always_confirm: vec![],
+                    invalid_patterns: vec![],
+                },
+            );
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        for cancel in [false, true] {
+            let (stream, mut receiver, mut cancellation) =
+                crate::ToolCallEventStream::test_with_cancellation();
+            let input = TerminalToolInput {
+                session: Some(TerminalSessionRequest::ShellRun {
+                    terminal_id: identifier.clone(),
+                    command: "true".into(),
+                    background: false,
+                }),
+                ..Default::default()
+            };
+            let task = cx.update(|cx| {
+                tool.clone()
+                    .run(crate::ToolInput::resolved(input), stream, cx)
+            });
+            let authorization = receiver.expect_authorization().await;
+            assert!(
+                authorization.context.is_none(),
+                "allow pattern must still require explicit decision"
+            );
+            if cancel {
+                crate::ToolCallEventStream::signal_cancellation_with_sender(&mut cancellation);
+                assert!(task.await.is_err());
+                drop(authorization);
+            } else {
+                authorization
+                    .response
+                    .send(acp_thread::SelectedPermissionOutcome::new(
+                        acp_v2::PermissionOptionId::new("deny"),
+                        acp_v2::PermissionOptionKind::RejectOnce,
+                    ))
+                    .expect("deny command");
+                assert!(task.await.is_err());
+            }
+            assert_eq!(
+                shell.snapshot().command.as_ref().map(|command| command.id),
+                Some(setup_id)
+            );
+        }
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let input = TerminalToolInput {
+            session: Some(TerminalSessionRequest::ShellRun {
+                terminal_id: identifier.clone(),
+                command: "true".into(),
+                background: false,
+            }),
+            ..Default::default()
+        };
+        let task = cx.update(|cx| {
+            tool.clone()
+                .run(crate::ToolInput::resolved(input), stream.clone(), cx)
+        });
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve command");
+        let result: serde_json::Value =
+            serde_json::from_str(&task.await.expect("run shell command")).expect("run JSON");
+        assert_eq!(result["terminal_id"], identifier);
+        assert_eq!(result["snapshot"]["command"]["status"]["exit_code"], 7);
+        assert_eq!(
+            stream.command_status().and_then(|status| status.exit_code),
+            Some(7)
+        );
+        let (stream, _) = crate::ToolCallEventStream::test();
+        let status = cx
+            .update(|cx| {
+                tool.clone().run(
+                    crate::ToolInput::resolved(TerminalToolInput {
+                        session: Some(TerminalSessionRequest::ShellStatus {
+                            terminal_id: identifier.clone(),
+                        }),
+                        ..Default::default()
+                    }),
+                    stream,
+                    cx,
+                )
+            })
+            .await
+            .expect("status");
+        assert!(status.contains("exit_code"));
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let input = TerminalToolInput {
+            session: Some(TerminalSessionRequest::ShellRun {
+                terminal_id: identifier.clone(),
+                command: "true".into(),
+                background: true,
+            }),
+            ..Default::default()
+        };
+        let task = cx.update(|cx| {
+            tool.clone()
+                .run(crate::ToolInput::resolved(input), stream.clone(), cx)
+        });
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve background command");
+        let background: serde_json::Value =
+            serde_json::from_str(&task.await.expect("background run")).expect("background JSON");
+        assert_eq!(background["terminal_id"], identifier);
+        assert_eq!(
+            background["command_id"],
+            background["snapshot"]["command"]["id"]
+        );
+        assert!(stream.command_status().is_none());
+        {
+            let mut shells = tool.sessions.shells.entries.borrow_mut();
+            for index in 1..MAX_TERMINAL_SESSIONS {
+                shells.insert(format!("cap-test-{index}"), shell.clone());
+            }
+        }
+        let (stream, _) = crate::ToolCallEventStream::test();
+        let cap_result = cx
+            .update(|cx| {
+                tool.clone().run(
+                    crate::ToolInput::resolved(TerminalToolInput {
+                        command: "true".into(),
+                        cd: "tmp".into(),
+                        session: Some(TerminalSessionRequest::Start),
+                        ..Default::default()
+                    }),
+                    stream,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            cap_result
+                .expect_err("shared session cap")
+                .contains("limit reached")
+        );
+        tool.sessions
+            .shells
+            .entries
+            .borrow_mut()
+            .retain(|key, _| key == &identifier);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while matches!(
+            shell.snapshot().status,
+            crate::persistent_shell::ShellStatus::Running
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background command timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            settings.tool_permissions.tools.remove(TerminalTool::NAME);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let input = TerminalToolInput {
+            session: Some(TerminalSessionRequest::ShellRun {
+                terminal_id: identifier.clone(),
+                command: "sleep 1".into(),
+                background: false,
+            }),
+            timeout_ms: Some(25),
+            ..Default::default()
+        };
+        let task = cx.update(|cx| {
+            tool.clone()
+                .run(crate::ToolInput::resolved(input), stream.clone(), cx)
+        });
+        receiver
+            .expect_authorization()
+            .await
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("approve timed command");
+        let timed_out: serde_json::Value =
+            serde_json::from_str(&task.await.expect("timed command result")).expect("timeout JSON");
+        assert_eq!(
+            timed_out["snapshot"]["command"]["status"]["state"],
+            "timed_out"
+        );
+        let command_status = stream.command_status().expect("timeout status");
+        assert!(command_status.timed_out);
+        assert_eq!(command_status.exit_code, None);
+        let (stream, _) = crate::ToolCallEventStream::test();
+        cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    session: Some(TerminalSessionRequest::ShellClose {
+                        terminal_id: identifier.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        })
+        .await
+        .expect("close");
+        assert!(
+            !tool
+                .sessions
+                .shells
+                .entries
+                .borrow()
+                .contains_key(&identifier)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn persistent_shell_full_access_does_not_prompt(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        crate::tests::init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.sandbox_permissions.allow_unsandboxed = true;
+            // Confirm-by-default makes the tier, not the settings, the only
+            // reason these operations may proceed without a prompt.
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            settings.tool_permissions.tools.remove(TerminalTool::NAME);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/tmp", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/tmp".as_ref()], cx).await;
+        let environment = Rc::new(crate::tests::FakeThreadEnvironment::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(TerminalTool::new(project, environment));
+
+        fn assert_no_authorization(receiver: &mut crate::ToolCallEventStreamReceiver) {
+            while let Ok(event) = receiver.try_recv() {
+                assert!(
+                    !matches!(event, Ok(crate::ThreadEvent::ToolCallAuthorization(_))),
+                    "full access must not prompt"
+                );
+            }
+        }
+
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let stream =
+            stream.with_permission_tier(crate::permission_tier::PermissionTier::FullAccess);
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    cd: "tmp".into(),
+                    session: Some(TerminalSessionRequest::ShellOpen),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        });
+        let opened: serde_json::Value =
+            serde_json::from_str(&task.await.expect("open shell")).expect("open JSON");
+        assert_no_authorization(&mut receiver);
+        let identifier = opened["terminal_id"]
+            .as_str()
+            .expect("shell id")
+            .to_string();
+
+        let (stream, mut receiver) = crate::ToolCallEventStream::test();
+        let stream =
+            stream.with_permission_tier(crate::permission_tier::PermissionTier::FullAccess);
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    session: Some(TerminalSessionRequest::ShellRun {
+                        terminal_id: identifier.clone(),
+                        command: "printf full-access".into(),
+                        background: false,
+                    }),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        });
+        let result: serde_json::Value =
+            serde_json::from_str(&task.await.expect("run shell command")).expect("run JSON");
+        assert_no_authorization(&mut receiver);
+        assert_eq!(result["snapshot"]["command"]["status"]["exit_code"], 0);
+        assert!(
+            result["snapshot"]["command"]["output"]
+                .as_str()
+                .expect("output")
+                .contains("full-access")
+        );
+
+        let (stream, _) = crate::ToolCallEventStream::test();
+        cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    session: Some(TerminalSessionRequest::ShellClose {
+                        terminal_id: identifier.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                stream,
+                cx,
+            )
+        })
+        .await
+        .expect("close");
+    }
+
+    #[gpui::test]
+    fn test_background_cleanup_guard_kills_on_drop(cx: &mut gpui::TestAppContext) {
+        let terminal =
+            std::rc::Rc::new(cx.update(|cx| crate::tests::FakeTerminalHandle::new_never_exits(cx)));
+        let cleanup = super::TerminalCleanup {
+            terminal: terminal.clone(),
+            cx: cx.to_async(),
+            armed: true,
+        };
+        assert!(!terminal.was_killed());
+        cx.update(|_cx| drop(cleanup));
+        cx.run_until_parked();
+        assert!(terminal.was_killed());
+    }
+
+    #[test]
+    fn test_background_session_schema_and_defaults() {
+        let input: super::TerminalToolInput = serde_json::from_value(serde_json::json!({
+            "session": { "action": "output", "terminal_id": "session-1" }
+        }))
+        .expect("session request");
+        assert!(input.command.is_empty());
+        assert!(matches!(
+            input.session,
+            Some(super::TerminalSessionRequest::Output { .. })
+        ));
+        assert!(
+            serde_json::from_value::<super::TerminalSessionRequest>(serde_json::json!({
+                "action": "stop", "terminal_id": "session-1", "text": "unexpected"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_background_stdin_preserves_exact_text_and_enforces_cap() {
+        let text = "prompt\r\n\u{0000}界";
+        let request = TerminalSessionRequest::Stdin {
+            terminal_id: "terminal-1".into(),
+            text: text.into(),
+        };
+        let value = serde_json::to_value(&request).expect("stdin request should serialize");
+        assert_eq!(value["text"].as_str(), Some(text));
+        assert!(
+            serde_json::from_value::<TerminalSessionRequest>(serde_json::json!({
+                "action": "stdin",
+                "terminal_id": "terminal-1",
+                "text": "x".repeat(COMMAND_OUTPUT_LIMIT as usize + 1),
+            }))
+            .is_ok()
+        );
+        assert!(text.len() <= COMMAND_OUTPUT_LIMIT as usize);
+    }
+
+    #[test]
+    fn test_background_session_output_is_utf8_bounded_tail() {
+        let content = format!("{}{}", "old".repeat(10000), "界".repeat(6000));
+        let output =
+            super::bound_session_output(acp_thread::ProcessOutput::new(content.clone(), false));
+        assert!(output.truncated);
+        assert!(output.output.len() <= super::COMMAND_OUTPUT_LIMIT as usize);
+        assert!(content.ends_with(&output.output));
+        assert!(output.output.ends_with('界'));
+    }
+
+    #[gpui::test]
+    async fn test_background_session_survives_start_and_clear_kills(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = Rc::new(cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.tool_permissions.tools.remove(TerminalTool::NAME);
+            agent_settings::AgentSettings::override_global(settings, cx);
+            crate::tests::FakeThreadEnvironment::default()
+                .with_terminal(crate::tests::FakeTerminalHandle::new_never_exits(cx))
+        }));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(TerminalTool::new(project, environment.clone()));
+        let (event_stream, mut receiver) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "sleep 1000".into(),
+                    cd: "root".into(),
+                    session: Some(TerminalSessionRequest::Start),
+                    head_lines: Some(100000),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        receiver.expect_update_fields().await;
+        assert!(
+            task.await
+                .expect("start")
+                .contains("Background terminal started:")
+        );
+        assert_eq!(
+            environment.terminal_output_limits(),
+            vec![Some(COMMAND_OUTPUT_LIMIT)]
+        );
+        let metadata = cx.update(|_cx| tool.session_metadata());
+        assert_eq!(metadata.len(), 1);
+        assert!(matches!(metadata[0].state, TerminalSessionState::Running));
+        let snapshots = tool.session_snapshots(&cx.to_async()).expect("snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(metadata[0].terminal_id, snapshots[0].terminal_id);
+        assert!(matches!(snapshots[0].state, TerminalSessionState::Running));
+        let cloned_tool = tool.as_ref().clone();
+        assert!(Rc::ptr_eq(
+            &tool.sessions.entries,
+            &cloned_tool.sessions.entries
+        ));
+        cloned_tool.clear_sessions(&cx.to_async()).expect("clear");
+        assert!(
+            tool.session_snapshots(&cx.to_async())
+                .expect("snapshots")
+                .is_empty()
+        );
+    }
     use super::*;
 
     #[test]
@@ -2460,6 +4020,7 @@ mod tests {
                     timeout_ms: None,
                     head_lines: Some(1),
                     tail_lines: Some(1),
+                    session: None,
                 }),
                 event_stream,
                 cx,

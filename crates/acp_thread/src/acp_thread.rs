@@ -7819,6 +7819,29 @@ impl AcpThread {
         sandbox_wrap: Option<SandboxWrap>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_with_stdin(
+            command,
+            args,
+            extra_env,
+            cwd,
+            output_byte_limit,
+            sandbox_wrap,
+            false,
+            cx,
+        )
+    }
+
+    pub fn create_terminal_with_stdin(
+        &self,
+        command: String,
+        args: Vec<String>,
+        extra_env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<SandboxWrap>,
+        allow_stdin: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let env = match &cwd {
             Some(dir) => self.project.update(cx, |project, cx| {
                 project.environment().update(cx, |env, cx| {
@@ -7845,6 +7868,7 @@ impl AcpThread {
         // setup fails with `ENOTTY`. Run the command non-interactively and
         // without a PTY in that case.
         let headless = HeadlessTerminal::is_enabled(cx);
+        let allow_stdin = allow_stdin && !headless;
 
         let terminal_id = acp_v2::TerminalId::new(Uuid::new_v4().to_string());
         let terminal_task = cx.spawn({
@@ -7866,13 +7890,15 @@ impl AcpThread {
                 #[cfg(target_os = "windows")]
                 let (task_command, task_args, task_env, sandbox, spawn_cwd) =
                     if sandbox_wrap.is_some() {
-                        let (task_command, task_args) = task::ShellBuilder::new(
+                        let mut builder = task::ShellBuilder::new(
                             &Shell::Program("/bin/sh".to_string()),
                             false,
                         )
-                        .non_interactive()
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                        .non_interactive();
+                        if !allow_stdin {
+                            builder = builder.redirect_stdin_to_dev_null();
+                        }
+                        let (task_command, task_args) = builder.build(Some(command.clone()), &args);
                         let wrap = cx.background_spawn(prepare_sandbox_wrap(
                             task_command,
                             task_args,
@@ -7900,9 +7926,10 @@ impl AcpThread {
                         if headless {
                             builder = builder.non_interactive();
                         }
-                        let (task_command, task_args) = builder
-                            .redirect_stdin_to_dev_null()
-                            .build(Some(command.clone()), &args);
+                        if !allow_stdin {
+                            builder = builder.redirect_stdin_to_dev_null();
+                        }
+                        let (task_command, task_args) = builder.build(Some(command.clone()), &args);
                         (task_command, task_args, env, None, cwd.clone())
                     };
 
@@ -7912,9 +7939,10 @@ impl AcpThread {
                     if headless || (cfg!(target_os = "linux") && sandbox_wrap.is_some()) {
                         builder = builder.non_interactive();
                     }
-                    let (task_command, task_args) = builder
-                        .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                    if !allow_stdin {
+                        builder = builder.redirect_stdin_to_dev_null();
+                    }
+                    let (task_command, task_args) = builder.build(Some(command.clone()), &args);
                     let (task_command, task_args, task_env, sandbox) = cx
                         .background_spawn(prepare_sandbox_wrap(
                             task_command,

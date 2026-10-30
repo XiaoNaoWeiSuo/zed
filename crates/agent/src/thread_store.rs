@@ -62,6 +62,24 @@ impl ThreadStore {
         })
     }
 
+    pub fn branch_thread(
+        &mut self,
+        snapshot: Task<DbThread>,
+        message_id: acp_v2::MessageId,
+        folder_paths: PathList,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<acp_v2::SessionId>> {
+        cx.spawn(async move |this, cx| {
+            let thread = snapshot.await.branch_at_message(&message_id)?;
+            let id = acp_v2::SessionId::new(uuid::Uuid::new_v4().to_string());
+            this.update(cx, |this, cx| {
+                this.save_thread(id.clone(), thread, folder_paths, cx)
+            })?
+            .await?;
+            Ok(id)
+        })
+    }
+
     pub fn save_thread(
         &mut self,
         id: acp_v2::SessionId,
@@ -175,6 +193,61 @@ mod tests {
             deferred_questions: Default::default(),
             permission_tier: Default::default(),
         }
+    }
+
+    #[gpui::test]
+    async fn test_branch_thread_persists_distinct_sessions(cx: &mut TestAppContext) {
+        let store = cx.new(ThreadStore::new);
+        cx.run_until_parked();
+        let mut branch_ids = Vec::new();
+        for _ in 0..2 {
+            let mut source = make_thread("Source", Utc::now());
+            source
+                .messages
+                .push(Arc::new(crate::Message::Agent(crate::AgentMessage {
+                    content: vec![crate::AgentMessageContent::Text("Selected".into())],
+                    ..Default::default()
+                })));
+            let branch = store.update(cx, |store, cx| {
+                store.branch_thread(
+                    Task::ready(source),
+                    acp_v2::MessageId::new("native-message-0-0"),
+                    PathList::default(),
+                    cx,
+                )
+            });
+            branch_ids.push(branch.await.expect("save branch"));
+        }
+        assert_ne!(branch_ids[0], branch_ids[1]);
+        cx.run_until_parked();
+        for id in branch_ids {
+            let loaded = store
+                .update(cx, |store, cx| store.load_thread(id.clone(), cx))
+                .await
+                .expect("load branch")
+                .expect("saved branch");
+            assert_eq!(loaded.messages.len(), 1);
+            assert!(loaded.subagent_context.is_none());
+            assert!(store.read_with(cx, |store, _| store.thread_from_session_id(&id).is_some()));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_branch_thread_failure_does_not_persist(cx: &mut TestAppContext) {
+        let store = cx.new(ThreadStore::new);
+        cx.run_until_parked();
+        let source = make_thread("Source", Utc::now());
+        let branch = store.update(cx, |store, cx| {
+            store.branch_thread(
+                Task::ready(source),
+                acp_v2::MessageId::new("native-message-0-0"),
+                PathList::default(),
+                cx,
+            )
+        });
+        assert!(branch.await.is_err());
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.is_empty()));
     }
 
     #[gpui::test]

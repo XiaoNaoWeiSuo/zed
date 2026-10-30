@@ -23,6 +23,9 @@ pub const fn default_max_ancestor_lines() -> u32 {
 pub const fn default_context_lines() -> u32 {
     2
 }
+pub const fn default_results_per_page() -> u32 {
+    RESULTS_PER_PAGE
+}
 
 /// Searches the contents of files in the project with a regular expression
 ///
@@ -31,7 +34,7 @@ pub const fn default_context_lines() -> u32 {
 /// - Pass an `include_pattern` if you know how to narrow your search on the files system
 /// - Never use this tool to search for paths. Only search file contents with this tool.
 /// - Use this tool when you need to find files containing specific patterns
-/// - Results are paginated with 20 matches per page. Use the optional 'offset' parameter to request subsequent pages.
+/// - Results are paginated. The response reports how many snippets were returned and, when the search stopped early, which `offset` to pass next; that `offset` is the count of snippets already shown, not a page number.
 /// - DO NOT use HTML entities solely to escape characters in the tool parameters.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepToolInput {
@@ -56,10 +59,16 @@ pub struct GrepToolInput {
     /// Use "**/*.rs" to search Rust files across all root directories.
     /// </example>
     pub include_pattern: Option<String>,
-    /// Optional starting position for paginated results (0-based).
-    /// When not provided, starts from the beginning.
+    /// How many result snippets to skip before collecting results. Pass the total number of snippets
+    /// already returned by previous calls (for example 20 after a first page of 20) to continue.
+    /// Defaults to 0, which starts from the first match.
     #[serde(default)]
     pub offset: u32,
+    /// The maximum number of merged snippets to return in this page, clamped to 1–100.
+    /// Defaults to 20. Raise it when a search is expected to be broad and you want fewer round trips;
+    /// lower it when snippets are large.
+    #[serde(default = "default_results_per_page")]
+    pub results_per_page: u32,
     /// Whether the regex is case-sensitive. Defaults to false (case-insensitive).
     #[serde(default)]
     pub case_sensitive: bool,
@@ -79,7 +88,12 @@ pub struct GrepToolInput {
 impl GrepToolInput {
     /// Which page of search results this is.
     pub fn page(&self) -> u32 {
-        1 + (self.offset / RESULTS_PER_PAGE)
+        let per_page = self.page_size();
+        (self.offset / per_page).saturating_add(1)
+    }
+
+    fn page_size(&self) -> u32 {
+        self.results_per_page.clamp(1, 100)
     }
 }
 
@@ -197,6 +211,7 @@ impl AgentTool for GrepTool {
             let mut content = Vec::new();
             let mut locations = Vec::new();
             let mut skips_remaining = input.offset;
+            let page_size = input.page_size();
             let mut matches_found = 0;
             let mut has_more_matches = false;
 
@@ -296,24 +311,25 @@ impl AgentTool for GrepTool {
                 let mut file_header_written = false;
 
                 while let Some((mut range, ancestor_range, parent_symbols)) = ranges.next(){
-                    if skips_remaining > 0 {
-                        skips_remaining -= 1;
-                        continue;
-                    }
-
                     // We'd already found a full page of matches, and we just found one more.
-                    if matches_found >= RESULTS_PER_PAGE {
+                    if matches_found >= page_size {
                         has_more_matches = true;
                         break 'outer;
                     }
 
                     while let Some((next_range, _, _)) = ranges.peek() {
                         if range.end.row >= next_range.start.row {
-                            range.end = next_range.end;
+                            range.end = cmp::max(range.end, next_range.end);
                             ranges.next();
                         } else {
                             break;
                         }
+                    }
+
+                    // Offsets count merged snippets, just like the displayed result count.
+                    if skips_remaining > 0 {
+                        skips_remaining -= 1;
+                        continue;
                     }
 
                     if !file_header_written {
@@ -396,9 +412,9 @@ impl AgentTool for GrepTool {
             } else if has_more_matches {
                 Ok(format!(
                     "Showing matches {}-{} (there were more matches found; use offset: {} to see next page):\n{output}",
-                    input.offset + 1,
-                    input.offset + matches_found,
-                    input.offset + RESULTS_PER_PAGE,
+                    input.offset.saturating_add(1),
+                    input.offset.saturating_add(matches_found),
+                    input.offset.saturating_add(matches_found),
                 ))
             } else {
                 Ok(format!("Found {matches_found} matches:\n{output}"))
@@ -449,6 +465,7 @@ mod tests {
             regex: "println".to_string(),
             include_pattern: Some("root/**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -470,6 +487,7 @@ mod tests {
             regex: "fn".to_string(),
             include_pattern: Some("root/**/src/**".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -494,6 +512,7 @@ mod tests {
             regex: "fn".to_string(),
             include_pattern: None,
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -532,6 +551,7 @@ mod tests {
             regex: "uppercase".to_string(),
             include_pattern: Some("**/*.txt".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -548,6 +568,7 @@ mod tests {
             regex: "uppercase".to_string(),
             include_pattern: Some("**/*.txt".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: true,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -564,6 +585,7 @@ mod tests {
             regex: "LOWERCASE".to_string(),
             include_pattern: Some("**/*.txt".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: true,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -581,6 +603,7 @@ mod tests {
             regex: "lowercase".to_string(),
             include_pattern: Some("**/*.txt".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: true,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -621,6 +644,7 @@ mod tests {
             regex: "needle".to_string(),
             include_pattern: None,
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -725,6 +749,7 @@ mod tests {
             regex: "NEEDLE".to_string(),
             include_pattern: None,
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -849,6 +874,7 @@ mod tests {
             regex: "This is at the top level".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -880,6 +906,7 @@ mod tests {
             regex: "Function in nested module".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -913,6 +940,7 @@ mod tests {
             regex: "second_arg".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -950,6 +978,7 @@ mod tests {
             regex: "Inside if block".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -982,6 +1011,7 @@ mod tests {
             regex: "Line 5".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -1024,6 +1054,7 @@ mod tests {
             regex: "Line 12".to_string(),
             include_pattern: Some("**/*.rs".to_string()),
             offset: 0,
+            results_per_page: default_results_per_page(),
             case_sensitive: false,
             max_ancestor_lines: default_max_ancestor_lines(),
             context_lines: default_context_lines(),
@@ -1200,6 +1231,7 @@ mod tests {
                 regex: "outside_function".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1220,6 +1252,7 @@ mod tests {
                 regex: "main".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1240,6 +1273,7 @@ mod tests {
                 regex: "special_configuration".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1259,6 +1293,7 @@ mod tests {
                 regex: "custom_metadata".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1279,6 +1314,7 @@ mod tests {
                 regex: "SECRET_KEY".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1298,6 +1334,7 @@ mod tests {
                 regex: "private_key_content".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1318,6 +1355,7 @@ mod tests {
                 regex: "sensitive_data".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1338,6 +1376,7 @@ mod tests {
                 regex: "normal_file_content".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1358,6 +1397,7 @@ mod tests {
                 regex: "outside_function".to_string(),
                 include_pattern: Some("../outside_project/**/*.rs".to_string()),
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1455,6 +1495,7 @@ mod tests {
                 regex: "secret".to_string(),
                 include_pattern: None,
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1511,6 +1552,7 @@ mod tests {
                 regex: "secret".to_string(),
                 include_pattern: Some("worktree1/**/*.rs".to_string()),
                 offset: 0,
+                results_per_page: default_results_per_page(),
                 case_sensitive: false,
                 max_ancestor_lines: default_max_ancestor_lines(),
                 context_lines: default_context_lines(),
@@ -1553,5 +1595,150 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    fn extract_line_labels(results: &str) -> Vec<String> {
+        results
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("### ")
+                    .and_then(|rest| rest.rsplit(" › ").next())
+                    .or_else(|| line.strip_prefix("### "))
+                    .map(|label| label.trim().to_string())
+            })
+            .collect()
+    }
+
+    async fn setup_paging_project(cx: &mut TestAppContext, match_count: usize) -> Entity<Project> {
+        init_test(cx);
+
+        let contents = (1..=match_count)
+            .map(|index| format!("needle_{index:03}_first needle_{index:03}_second\n"))
+            .collect::<String>();
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "matches.txt": contents }))
+            .await;
+        Project::test(fs, [path!("/root").as_ref()], cx).await
+    }
+
+    #[gpui::test]
+    async fn test_grep_pagination_does_not_repeat_matches(cx: &mut TestAppContext) {
+        let project = setup_paging_project(cx, 5).await;
+
+        let first_page = run_grep_tool(
+            GrepToolInput {
+                regex: "needle_".to_string(),
+                include_pattern: None,
+                offset: 0,
+                results_per_page: 2,
+                case_sensitive: false,
+                max_ancestor_lines: 0,
+                context_lines: 0,
+            },
+            project.clone(),
+            cx,
+        )
+        .await;
+        assert!(
+            first_page.starts_with("Showing matches 1-2"),
+            "{first_page}"
+        );
+        assert!(
+            first_page.contains("use offset: 2 to see next page"),
+            "offset should be the number of matches already shown: {first_page}"
+        );
+
+        let second_page = run_grep_tool(
+            GrepToolInput {
+                regex: "needle_".to_string(),
+                include_pattern: None,
+                offset: 2,
+                results_per_page: 2,
+                case_sensitive: false,
+                max_ancestor_lines: 0,
+                context_lines: 0,
+            },
+            project.clone(),
+            cx,
+        )
+        .await;
+        assert!(
+            second_page.starts_with("Showing matches 3-4"),
+            "{second_page}"
+        );
+        assert!(
+            second_page.contains("use offset: 4 to see next page"),
+            "{second_page}"
+        );
+
+        let third_page = run_grep_tool(
+            GrepToolInput {
+                regex: "needle_".to_string(),
+                include_pattern: None,
+                offset: 4,
+                results_per_page: 2,
+                case_sensitive: false,
+                max_ancestor_lines: 0,
+                context_lines: 0,
+            },
+            project,
+            cx,
+        )
+        .await;
+        assert!(third_page.starts_with("Found 1 matches"), "{third_page}");
+
+        // Each page must contain distinct matches; a pagination bug here silently
+        // re-surfaces the previous page's last match and hides a real one.
+        let mut labels = extract_line_labels(&first_page);
+        labels.extend(extract_line_labels(&second_page));
+        labels.extend(extract_line_labels(&third_page));
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            5,
+            "expected 5 distinct matches, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("L5")),
+            "{labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_grep_results_per_page_controls_page_size(cx: &mut TestAppContext) {
+        let project = setup_paging_project(cx, 3).await;
+
+        let payload = json!({
+            "regex": "needle_",
+            "results_per_page": 10,
+            "context_lines": 0,
+            "max_ancestor_lines": 0,
+        });
+        let input: GrepToolInput =
+            serde_json::from_value(payload).expect("results_per_page defaults are not required");
+        assert_eq!(input.offset, 0);
+        assert_eq!(input.results_per_page, 10);
+        assert_eq!(input.page(), 1);
+
+        let defaults: GrepToolInput = serde_json::from_value(json!({ "regex": "needle_" }))
+            .expect("minimal grep input deserializes");
+        assert_eq!(defaults.results_per_page, RESULTS_PER_PAGE);
+        for (requested, expected) in [(0, 1), (1, 1), (60, 60), (100, 100), (u32::MAX, 100)] {
+            let input: GrepToolInput = serde_json::from_value(json!({
+                "regex": "needle_",
+                "results_per_page": requested,
+                "offset": u32::MAX,
+            }))
+            .expect("valid boundary input");
+            assert_eq!(input.page_size(), expected);
+            assert!(input.page() >= 1);
+        }
+
+        let result = run_grep_tool(input, project, cx).await;
+        assert!(
+            result.starts_with("Found 3 matches"),
+            "a page larger than the result set should report all matches at once: {result}"
+        );
     }
 }

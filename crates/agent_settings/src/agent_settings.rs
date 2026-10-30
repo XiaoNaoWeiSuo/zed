@@ -210,6 +210,8 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
+    pub new_thread_in_worktree: bool,
+    pub remember_worktree_choice: bool,
     pub enabled: bool,
     pub button: bool,
     pub dock: DockPosition,
@@ -773,6 +775,8 @@ impl Settings for AgentSettings {
         let agent = content.agent.clone().unwrap();
         let threads_sidebar = agent.threads_sidebar.unwrap();
         Self {
+            new_thread_in_worktree: agent.new_thread_in_worktree.unwrap_or(false),
+            remember_worktree_choice: agent.remember_worktree_choice.unwrap_or(false),
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),

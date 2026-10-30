@@ -4,6 +4,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 pub mod permission_tier;
+mod persistent_shell;
 mod project_checkpoint;
 pub mod run_metrics;
 mod sandboxing;
@@ -189,6 +190,7 @@ impl From<&Skill> for NativeAvailableSkill {
 }
 
 pub const COMPACT_COMMAND_NAME: &str = "compact";
+pub const GOAL_COMMAND_NAME: &str = "goal";
 
 /// Returns the set of MCP prompt names that must be server-qualified
 /// (`/<server>.<name>`) to stay unambiguous in the slash-command popup: names
@@ -289,6 +291,9 @@ impl NativeRetryAction {
         if let Some(parsed_command) = Command::parse(&content) {
             if parsed_command.is_unqualified(COMPACT_COMMAND_NAME) {
                 return Self::Compact;
+            }
+            if parsed_command.is_unqualified(GOAL_COMMAND_NAME) {
+                return Self::Prompt(content);
             }
 
             // Skill scope qualifiers (`/:<name>` and
@@ -1835,13 +1840,22 @@ impl NativeAgent {
             acp_thread::CommandCategory::Native,
         ));
 
+        let goal_command =
+            acp_v2::AvailableCommand::new(GOAL_COMMAND_NAME, "Create and start a sustained goal")
+                .input(acp_v2::AvailableCommandInput::Text(
+                    acp_v2::TextCommandInput::new("<objective>"),
+                ))
+                .meta(acp_thread::meta_with_command_category(
+                    acp_thread::CommandCategory::Native,
+                ));
+
         let registry = state.context_server_registry.read(cx);
 
         // Reserve the built-in command name so a same-named MCP prompt is
         // force-prefixed (`/<server>.compact`) and stays reachable: an
         // unqualified `/compact` always routes to the native command.
         let ambiguous_prompt_names = ambiguous_mcp_prompt_names(
-            [COMPACT_COMMAND_NAME],
+            [COMPACT_COMMAND_NAME, GOAL_COMMAND_NAME],
             registry.prompts().map(|p| p.prompt.name.as_str()),
         );
 
@@ -1880,7 +1894,8 @@ impl NativeAgent {
             Some(command)
         });
 
-        std::iter::once(compact_command)
+        [compact_command, goal_command]
+            .into_iter()
             .chain(mcp_commands)
             .collect()
     }
@@ -3616,6 +3631,12 @@ impl NativeAgentConnection {
             return Task::ready(Err(error));
         }
 
+        let goal_objective = Command::parse(&params.prompt)
+            .filter(|command| command.is_unqualified(GOAL_COMMAND_NAME))
+            .map(|command| command.arg_value.trim().to_string());
+        if goal_objective.as_ref().is_some_and(String::is_empty) {
+            return Task::ready(Err(anyhow!("Provide an objective after /goal")));
+        }
         let path_style = project_state.project.read(cx).path_style(cx);
         let agent = self.0.downgrade();
         let prepared_session_id = session_id.clone();
@@ -3629,9 +3650,16 @@ impl NativeAgentConnection {
             log::debug!("Client user message id: {:?}", client_user_message_id);
             log::debug!("Message content: {:?}", content);
 
-            thread.update(cx, |thread, cx| {
-                thread.upsert_user_message(client_user_message_id, content.into(), cx)
-            });
+            thread.update(cx, |thread, cx| -> Result<()> {
+                if let Some(objective) = goal_objective {
+                    let mut goal =
+                        crate::ThreadGoal::new(objective.clone(), vec![objective.clone()])?;
+                    goal.verification_surfaces.push(objective);
+                    thread.set_goal(goal, cx)?;
+                }
+                thread.upsert_user_message(client_user_message_id, content.into(), cx);
+                Ok(())
+            })?;
             agent.update(cx, |agent, _cx| {
                 agent.mark_execution_history_prepared(&prepared_session_id)
             })??;
@@ -3872,22 +3900,26 @@ impl NativeThreadEnvironment {
             anyhow::Ok((session.thread.clone(), acp_thread))
         })??;
 
+        let parent_thread_entity = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?;
+        anyhow::ensure!(
+            parent_thread_entity != subagent_thread,
+            "A subagent cannot resume its own parent session"
+        );
         let depth = subagent_thread.read(cx).depth();
 
-        if let Some(parent_thread_entity) = self.thread.upgrade() {
-            if parent_thread_entity != subagent_thread {
-                subagent_thread.update(cx, |thread, cx| {
-                    thread.inherit_permission_tier(&parent_thread_entity, cx)
-                })?;
-            }
-            telemetry::event!(
-                "Subagent Started",
-                session = parent_thread_entity.read(cx).id().to_string(),
-                subagent_session = session_id.to_string(),
-                depth,
-                is_resumed = true,
-            );
-        }
+        subagent_thread.update(cx, |thread, cx| {
+            thread.inherit_permission_tier(&parent_thread_entity, cx)
+        })?;
+        telemetry::event!(
+            "Subagent Started",
+            session = parent_thread_entity.read(cx).id().to_string(),
+            subagent_session = session_id.to_string(),
+            depth,
+            is_resumed = true,
+        );
 
         self.prompt_subagent(session_id, subagent_thread, acp_thread)
     }
@@ -3910,14 +3942,15 @@ impl NativeThreadEnvironment {
     }
 }
 
-impl ThreadEnvironment for NativeThreadEnvironment {
-    fn create_terminal(
+impl NativeThreadEnvironment {
+    fn create_terminal_with_stdin(
         &self,
         command: String,
         extra_env: Vec<(String, String)>,
         cwd: Option<PathBuf>,
         output_byte_limit: Option<u64>,
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        allow_stdin: bool,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>> {
         // On Seatbelt-style sandboxes (macOS) there's no tmpfs overlay, so to
@@ -3982,13 +4015,14 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             };
         }
         let task = self.acp_thread.update(cx, |thread, cx| {
-            thread.create_terminal(
+            thread.create_terminal_with_stdin(
                 command,
                 vec![],
                 extra_env,
                 cwd,
                 output_byte_limit,
                 sandbox_wrap,
+                allow_stdin,
                 cx,
             )
         });
@@ -4013,6 +4047,48 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 
             Ok(Rc::new(handle) as _)
         })
+    }
+}
+
+impl ThreadEnvironment for NativeThreadEnvironment {
+    fn create_terminal(
+        &self,
+        command: String,
+        extra_env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+        self.create_terminal_with_stdin(
+            command,
+            extra_env,
+            cwd,
+            output_byte_limit,
+            sandbox_wrap,
+            false,
+            cx,
+        )
+    }
+
+    fn create_background_terminal(
+        &self,
+        command: String,
+        extra_env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+        self.create_terminal_with_stdin(
+            command,
+            extra_env,
+            cwd,
+            output_byte_limit,
+            sandbox_wrap,
+            true,
+            cx,
+        )
     }
 
     fn create_subagent(
@@ -4070,8 +4146,8 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 pub struct NativeSubagentHandle {
     session_id: acp_v2::SessionId,
     parent_thread: WeakEntity<Thread>,
-    subagent_thread: Entity<Thread>,
-    acp_thread: Entity<acp_thread::AcpThread>,
+    subagent_thread: WeakEntity<Thread>,
+    acp_thread: WeakEntity<acp_thread::AcpThread>,
 }
 
 impl NativeSubagentHandle {
@@ -4083,9 +4159,9 @@ impl NativeSubagentHandle {
     ) -> Self {
         NativeSubagentHandle {
             session_id,
-            subagent_thread,
+            subagent_thread: subagent_thread.downgrade(),
             parent_thread: parent_thread_entity.downgrade(),
-            acp_thread,
+            acp_thread: acp_thread.downgrade(),
         }
     }
 }
@@ -4096,7 +4172,26 @@ impl SubagentHandle for NativeSubagentHandle {
     }
 
     fn num_entries(&self, cx: &App) -> usize {
-        self.acp_thread.read(cx).entries().len()
+        match self
+            .acp_thread
+            .read_with(cx, |thread, _| thread.entries().len())
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::debug!(
+                    "Subagent {} was released while reading entries: {error:#}",
+                    self.session_id
+                );
+                0
+            }
+        }
+    }
+
+    fn cancel(&self, cx: &mut App) -> Result<()> {
+        self.subagent_thread
+            .update(cx, |thread, cx| thread.request_cancel(cx))?
+            .detach();
+        Ok(())
     }
 
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
@@ -4107,6 +4202,15 @@ impl SubagentHandle for NativeSubagentHandle {
 
         cx.spawn(async move |cx| {
             let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+                // Only borrow the ACP owner while submitting; retaining it across the
+                // wait would keep the agent, its sessions, and the parent tool alive.
+                let acp_thread = acp_thread.upgrade().context("Subagent ACP session was released")?;
+                let thread = thread.upgrade().context("Subagent native session was released")?;
+                anyhow::ensure!(
+                    thread.read(cx).is_turn_complete()
+                        && !acp_thread.read(cx).foreground_activity().is_active(),
+                    "Subagent already has a running turn"
+                );
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
@@ -4138,17 +4242,17 @@ impl SubagentHandle for NativeSubagentHandle {
                     ),
                     Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
                 };
-                (task, token_limit_rx, subscription)
-            });
+                anyhow::Ok((task, token_limit_rx, subscription))
+            })?;
 
             let mut task = task.fuse();
             let response = futures::select_biased! {
                 response = task => response,
                 _ = token_limit_rx.fuse() => {
-                    if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
+                    if thread.read_with(cx, |thread, _| thread.is_turn_complete())? {
                         task.await
                     } else {
-                        thread.update(cx, |thread, cx| thread.request_cancel(cx)).await;
+                        thread.update(cx, |thread, cx| thread.request_cancel(cx))?.await;
                         Err(anyhow!(
                             "The agent is nearing the end of its context window and has been \
                              stopped. You can prompt the thread again to have the agent wrap up \
@@ -4190,7 +4294,7 @@ impl SubagentHandle for NativeSubagentHandle {
                                 }
                             })
                             .context("No response from subagent")
-                    }),
+                    }).and_then(|response| response),
                     _ => Err(anyhow!("Native subagent returned an unsupported stop reason")),
                 },
                 Err(error) => Err(error),
@@ -4206,7 +4310,10 @@ impl SubagentHandle for NativeSubagentHandle {
                 result
             } else {
                 result.map_err(|error| {
-                    let partial_output = thread.read_with(cx, |thread, _| thread.subagent_partial_output());
+                    let partial_output = match thread.read_with(cx, |thread, _| thread.subagent_partial_output()) {
+                        Ok(output) => output,
+                        Err(released) => return anyhow!("{error:#} (subagent released: {released:#})"),
+                    };
                     if partial_output.is_empty() {
                         anyhow!("{error:#}")
                     } else {
@@ -4237,6 +4344,19 @@ impl TerminalHandle for AcpTerminalHandle {
         Ok(self
             .terminal
             .read_with(cx, |term, cx| term.current_output(cx)))
+    }
+
+    fn current_output_tail(&self, cx: &AsyncApp) -> Result<ProcessOutput> {
+        Ok(self
+            .terminal
+            .read_with(cx, |terminal, cx| terminal.current_output_tail(cx)))
+    }
+
+    fn write_stdin(&self, text: String, cx: &AsyncApp) -> Result<()> {
+        cx.update(|cx| {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.write_stdin(text, cx))
+        })
     }
 
     fn kill(&self, cx: &AsyncApp) -> Result<()> {
@@ -6177,17 +6297,209 @@ mod internal_tests {
         cx.update(|cx| {
             let commands = acp_thread.read(cx).available_commands();
 
-            assert_eq!(
-                commands,
-                &[acp_v2::AvailableCommand::new(
-                    COMPACT_COMMAND_NAME,
-                    "Summarize the conversation so far to free up context",
-                )
-                .meta(acp_thread::meta_with_command_category(
-                    acp_thread::CommandCategory::Native,
-                ))],
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.name == COMPACT_COMMAND_NAME)
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.name == GOAL_COMMAND_NAME)
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_goal_command_creates_goal_and_starts_work(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("goal-command");
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["/goal Finish the migration".into()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            let goal = thread.goal().expect("goal created");
+            assert_eq!(goal.objective, "Finish the migration");
+            assert_eq!(goal.success_criteria, ["Finish the migration"]);
+            assert_eq!(goal.status, crate::ThreadGoalStatus::Active);
+        });
+        assert!(!fake.pending_completions_for(&model).is_empty());
+        thread.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .edit_goal_objective("Changed while running".into(), cx)
+                    .is_err()
+            );
+            assert!(thread.delete_goal(cx).is_err());
+        });
+        cx.update(|cx| connection.cancel(&session_id, cx))
+            .expect("cancel");
+        send.await.expect("stopped");
+        thread.update(cx, |thread, cx| {
+            let old_id = thread.goal().expect("goal").id.clone();
+            thread
+                .edit_goal_objective("Finish the migration and verify it".into(), cx)
+                .expect("edit");
+            let goal = thread.goal().expect("edited goal");
+            assert_ne!(goal.id, old_id);
+            assert_eq!(
+                goal.success_criteria,
+                ["Finish the migration and verify it"]
+            );
+            assert_eq!(goal.status, crate::ThreadGoalStatus::Paused);
+        });
+        let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert_eq!(
+            saved.goal.expect("saved goal").objective,
+            "Finish the migration and verify it"
+        );
+        thread.update(cx, |thread, cx| {
+            thread.delete_goal(cx).expect("delete");
+            assert!(thread.goal().is_none());
+        });
+        let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert!(saved.goal.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_editing_goal_invalidates_evidence(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        thread.update(cx, |thread, cx| {
+            let mut goal =
+                crate::ThreadGoal::new("Original".into(), vec!["Run tests".into()]).expect("goal");
+            goal.constraints.push("Preserve permissions".into());
+            goal.verification_receipts
+                .push(crate::GoalVerificationReceipt {
+                    id: "receipt".into(),
+                    tool_call_id: "tool".into(),
+                    tool_name: "test".into(),
+                    tool_input: json!({}),
+                    observed_at: chrono::Utc::now(),
+                    dependencies: Vec::new(),
+                    outcome: crate::GoalVerificationOutcome::Passed,
+                    command_status: None,
+                    output_digest: "digest".into(),
+                    preview: "passed".into(),
+                    stale_reason: None,
+                    criterion_indices: vec![0],
+                });
+            goal.evidence.push(crate::GoalCriterionEvidence {
+                assessment: "Previously verified".into(),
+                sources: Vec::new(),
+                historical: false,
+                limitations: String::new(),
+            });
+            let previous_id = goal.id.clone();
+            thread.set_goal(goal, cx).expect("set goal");
+            thread
+                .edit_goal_objective("Revised".into(), cx)
+                .expect("edit");
+            let goal = thread.goal().expect("edited goal");
+            assert_ne!(goal.id, previous_id);
+            assert!(goal.verification_receipts.is_empty());
+            assert!(goal.evidence.is_empty());
+            assert_eq!(goal.success_criteria, ["Run tests"]);
+            assert_eq!(goal.constraints, ["Preserve permissions"]);
+            assert_eq!(goal.status, crate::ThreadGoalStatus::Paused);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_goal_stop_requires_confirmation(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+        let fake = init_test(cx);
+        cx.update(|cx| settings::SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(&json!({"agent":{"profiles":{"goal-confirmation":{"name":"Goal confirmation","tools":{"manage_goal":true}}}}}).to_string(), cx).result().expect("profile");
+        }));
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("goal-confirmation");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.set_profile(
+                agent_settings::AgentProfileId("goal-confirmation".into()),
+                cx,
+            );
+            thread
+                .set_goal(
+                    crate::ThreadGoal::new("Finish".into(), vec!["Verified".into()]).expect("goal"),
+                    cx,
+                )
+                .expect("set goal");
+        });
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Start".into()], cx)
+        });
+        cx.run_until_parked();
+        for (action, answer, status_before) in [
+            ("pause", "Continue working", crate::ThreadGoalStatus::Active),
+            ("blocked", "Stop", crate::ThreadGoalStatus::Active),
+            ("resume", "Keep paused", crate::ThreadGoalStatus::Blocked),
+        ] {
+            let input = json!({"action": action, "evidence": "Waiting for an external change"});
+            fake.send_last_event(
+                &model,
+                LanguageModelCompletionEvent::ToolUse(language_model::LanguageModelToolUse {
+                    id: action.into(),
+                    name: "manage_goal".into(),
+                    raw_input: input.to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(input),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            );
+            fake.end_last(&model);
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, _| {
+                assert_eq!(thread.goal().expect("goal").status, status_before)
+            });
+            let entry_id = acp_thread.read_with(cx, |thread, _| {
+                thread
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        acp_thread::AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .expect("confirmation")
+            });
+            acp_thread.update(cx, |thread, cx| {
+                thread.respond_to_elicitation(
+                    &entry_id,
+                    acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                        acp_v2::ElicitationAcceptAction::new().content(
+                            std::collections::BTreeMap::from([("choice".into(), answer.into())]),
+                        ),
+                    )),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        }
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.goal().expect("goal").status,
+                crate::ThreadGoalStatus::Blocked
+            )
+        });
+        fake.send_last_text(&model, "Waiting for the external change.");
+        fake.end_last(&model);
+        cx.run_until_parked();
+        send.await.expect("finished");
     }
 
     #[gpui::test]
@@ -9616,8 +9928,10 @@ mod internal_tests {
         // the parent own it: that would be a reference cycle or a self-update.
         cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, cx))
             .expect("resume an unrelated live session");
-        cx.update(|cx| environment.resume_subagent_thread(parent_session_id, cx))
-            .expect("resume the parent's own session");
+        assert!(
+            cx.update(|cx| environment.resume_subagent_thread(parent_session_id, cx))
+                .is_err()
+        );
 
         parent.read_with(cx, |parent, cx| {
             assert_eq!(
@@ -10411,6 +10725,29 @@ mod internal_tests {
         }
         call("pause", json!({"action":"pause"}));
         cx.run_until_parked();
+        let entry_id = acp_thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .expect("pause confirmation")
+        });
+        acp_thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([("choice".into(), "Stop".into())]),
+                    ),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
         fake.send_last_text(&model, "The checks did not establish completion.");
         fake.end_last(&model);
         send.await.expect("paused goal");
@@ -10469,7 +10806,7 @@ mod internal_tests {
             json!({"action":"create", "objective":"Inspect current source", "success_criteria":["Current source inspected"], "verification_surfaces":["read_file a/src/source.txt"]}),
         );
         cx.run_until_parked();
-        let verify = json!({"action":"verify", "verification":{"tool_name":"read_file", "tool_input":{"path":"a/src/source.txt"}, "dependencies":["a/src"]}});
+        let verify = json!({"action":"verify", "verification":{"tool_name":"read_file", "tool_input":{"path":"a/src/source.txt"}, "dependencies":["a/src"], "criterion_indices":[0]}});
         call("verify-first", verify.clone());
         cx.run_until_parked();
         let first = native.read_with(cx, |thread, _| {
@@ -10480,6 +10817,7 @@ mod internal_tests {
                 .last()
                 .expect("receipt");
             assert_eq!(receipt.outcome, crate::GoalVerificationOutcome::Passed);
+            assert_eq!(receipt.criterion_indices, [0]);
             receipt.id.clone()
         });
         filesystem
@@ -10507,8 +10845,7 @@ mod internal_tests {
             .write(Path::new("/a/src/source.txt"), b"changed")
             .await
             .expect("source edit");
-        let completion = |id: &str| json!({"action":"complete", "criterion_evidence":[{"assessment":"The read covers the source dependency", "verification_ids":[id]}]});
-        call("reject-stale", completion(&first));
+        call("reject-stale", json!({"action":"complete"}));
         cx.run_until_parked();
         native.read_with(cx, |thread, _| {
             let goal = thread.goal().expect("goal");
@@ -10520,6 +10857,13 @@ mod internal_tests {
                     .stale_reason
                     .is_some()
             );
+            let (_, result, _) = thread
+                .retained_tool_results()
+                .find(|(_, _, tool_use)| tool_use.id.to_string() == "reject-stale")
+                .expect("structured completion rejection");
+            let text = result.text_contents();
+            assert!(text.contains("missing_evidence"), "{text}");
+            assert!(text.contains("stale_dependencies"), "{text}");
         });
         call(
             "historical-bypass",
@@ -10600,7 +10944,7 @@ mod internal_tests {
                 .clone()
         });
         assert_ne!(first, second);
-        call("finish", completion(&second));
+        call("finish", json!({"action":"complete"}));
         cx.run_until_parked();
         native.read_with(cx, |thread, _| {
             let goal = thread.goal().expect("goal");

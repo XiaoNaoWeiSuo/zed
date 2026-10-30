@@ -2,7 +2,7 @@ use crate::tools::edit_file_tool::*;
 use crate::{
     AgentTool, ContextServerRegistry, EditFileTool, GrepTool, GrepToolInput, ReadFileTool,
     ReadFileToolInput, Template, Templates, Thread, ToolCallEventStream, ToolInput,
-    default_context_lines, default_max_ancestor_lines,
+    default_context_lines, default_max_ancestor_lines, default_results_per_page,
 };
 use Role::*;
 use anyhow::{Context as _, Result};
@@ -954,6 +954,7 @@ fn eval_disable_cursor_blinking() {
                             regex: "blink".into(),
                             include_pattern: None,
                             offset: 0,
+                            results_per_page: default_results_per_page(),
                             case_sensitive: false,
                             max_ancestor_lines: default_max_ancestor_lines(),
                             context_lines: default_context_lines(),
@@ -1039,6 +1040,7 @@ fn eval_from_pixels_constructor() {
                             regex: "mod\\s+tests".into(),
                             include_pattern: Some("font-kit/src/canvas.rs".into()),
                             offset: 0,
+                            results_per_page: default_results_per_page(),
                             case_sensitive: false,
                             max_ancestor_lines: default_max_ancestor_lines(),
                             context_lines: default_context_lines(),
@@ -1058,6 +1060,7 @@ fn eval_from_pixels_constructor() {
                             regex: "mod\\s+tests".into(),
                             include_pattern: Some("font-kit/src/**/*.rs".into()),
                             offset: 0,
+                            results_per_page: default_results_per_page(),
                             case_sensitive: false,
                             max_ancestor_lines: default_max_ancestor_lines(),
                             context_lines: default_context_lines(),
@@ -1077,6 +1080,7 @@ fn eval_from_pixels_constructor() {
                             regex: "#\\[test\\]".into(),
                             include_pattern: Some("font-kit/src/**/*.rs".into()),
                             offset: 0,
+                            results_per_page: default_results_per_page(),
                             case_sensitive: false,
                             max_ancestor_lines: default_max_ancestor_lines(),
                             context_lines: default_context_lines(),

@@ -372,11 +372,7 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     next_thread.read_with(cx, |thread, _| {
-        assert!(
-            thread
-                .project_checkpoint_context()
-                .is_some_and(|context| context.contains("Verify recovery"))
-        );
+        assert!(thread.project_checkpoint_context().is_none());
     });
     next_thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -388,20 +384,9 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
     cx.run_until_parked();
     let requests = fake.pending_completions_for(&model);
     let request = requests.last().expect("next request");
-    let handoff = request
-        .messages
-        .iter()
-        .filter(|message| message.role == Role::User)
-        .flat_map(|message| &message.content)
-        .find_map(|content| match content {
-            MessageContent::Text(text) if text.contains("Verify recovery") => Some(text),
-            _ => None,
-        })
-        .expect("historical handoff in next session request");
-    assert!(handoff.contains("Historical background"));
-    assert!(handoff.contains("automatically supplied by the harness"));
-    assert!(handoff.contains("not authored by the user"));
-    assert!(handoff.contains("does not replace the current user request"));
+    assert!(!request.messages.iter().flat_map(|message| &message.content).any(
+        |content| matches!(content, MessageContent::Text(text) if text.contains("Verify recovery"))
+    ));
     let list_input = json!({"action":"list", "limit":1});
     fake.send_last_event(
         &model,
@@ -462,6 +447,31 @@ async fn test_project_checkpoint_tool_persists_handoff(cx: &mut TestAppContext) 
         assert!(result["current_revision_changed"].is_null());
         assert!(result["new_dirty_files"].is_null());
         assert_eq!(result["checkpoint"]["scope"], "agent.questions");
+        assert_eq!(result["checkpoint"]["remaining"][0], "Verify recovery");
+        assert_eq!(result["checkpoint"]["detail"], "summary");
+        assert!(result["checkpoint"].get("evidence").is_none());
+        assert!(result["checkpoint"].get("changed_files").is_none());
+    });
+    let full_input = json!({"action":"read", "scope":"agent.questions", "detail":"full"});
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "read-full-checkpoint".into(),
+            name: ProjectCheckpointTool::NAME.into(),
+            raw_input: full_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(full_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    next_session.read_with(cx, |thread, _| {
+        assert!(thread.entries().iter().any(|entry| matches!(entry,
+            AgentThreadEntry::ToolCall(call) if call.raw_output.as_ref().is_some_and(|output|
+                output["checkpoint"]["evidence"].as_array().is_some_and(|entries| !entries.is_empty())
+            )
+        )));
     });
     let evidence_input = json!({"checkpoint_source": evidence_source.clone(), "checkpoint_scope": "agent.questions"});
     fake.send_last_event(
@@ -613,6 +623,7 @@ pub(crate) struct FakeTerminalHandle {
     exit_sender: std::cell::RefCell<Option<futures::channel::oneshot::Sender<()>>>,
     wait_for_exit: Shared<Task<acp_v2::TerminalExitStatus>>,
     output: ProcessOutput,
+    stdin: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     id: acp_v2::TerminalId,
 }
 
@@ -637,6 +648,7 @@ impl FakeTerminalHandle {
             exit_sender: std::cell::RefCell::new(Some(exit_sender)),
             wait_for_exit,
             output: ProcessOutput::new("partial output".to_string(), false),
+            stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
             id: acp_v2::TerminalId::new("fake_terminal".to_string()),
         }
     }
@@ -656,6 +668,7 @@ impl FakeTerminalHandle {
             exit_sender: std::cell::RefCell::new(Some(exit_sender)),
             wait_for_exit,
             output: ProcessOutput::new("command output".to_string(), false),
+            stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
             id: acp_v2::TerminalId::new("fake_terminal".to_string()),
         }
     }
@@ -667,6 +680,10 @@ impl FakeTerminalHandle {
 
     pub(crate) fn was_killed(&self) -> bool {
         self.killed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn stdin_bytes(&self) -> Vec<Vec<u8>> {
+        self.stdin.lock().expect("fake terminal stdin lock").clone()
     }
 
     pub(crate) fn set_stopped_by_user(&self, stopped: bool) {
@@ -687,6 +704,14 @@ impl crate::TerminalHandle for FakeTerminalHandle {
 
     fn current_output(&self, _cx: &AsyncApp) -> Result<ProcessOutput> {
         Ok(self.output.clone())
+    }
+
+    fn write_stdin(&self, text: String, _cx: &AsyncApp) -> Result<()> {
+        self.stdin
+            .lock()
+            .expect("fake terminal stdin lock")
+            .push(text.into_bytes());
+        Ok(())
     }
 
     fn wait_for_exit(&self, _cx: &AsyncApp) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
@@ -968,6 +993,276 @@ async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
         cx.run_until_parked();
         cx.background_executor.timer(Duration::from_millis(1)).await;
     }
+}
+
+#[gpui::test]
+async fn test_background_terminal_forwards_exact_stdin(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment.terminal_handle.clone().expect("fake terminal");
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment));
+    let (events, mut receiver) = crate::ToolCallEventStream::test();
+    let start = cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "cat".into(),
+                cd: ".".into(),
+                session: Some(crate::TerminalSessionRequest::Start),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    });
+    receiver.expect_update_fields().await;
+    let started = start.await.expect("background start");
+    let terminal_id = tool.session_snapshots(&cx.to_async()).expect("snapshot")[0]
+        .terminal_id
+        .clone();
+    assert!(started.contains(&terminal_id));
+
+    let (events, _receiver) = crate::ToolCallEventStream::test();
+    let input = "exact\r\n\u{0000}界".to_string();
+    let result = cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                session: Some(crate::TerminalSessionRequest::Stdin {
+                    terminal_id,
+                    text: input.clone(),
+                }),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    });
+    result
+        .await
+        .expect("stdin should be authorized and forwarded");
+    assert_eq!(handle.stdin_bytes(), vec![input.into_bytes()]);
+}
+
+#[gpui::test]
+async fn test_background_terminal_stdin_requires_terminal_authorization(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment));
+    let (events, mut receiver) = crate::ToolCallEventStream::test();
+    let start = cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "cat".into(),
+                cd: ".".into(),
+                session: Some(crate::TerminalSessionRequest::Start),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    });
+    receiver.expect_update_fields().await;
+    start.await.expect("background start");
+    let terminal_id = tool.session_snapshots(&cx.to_async()).expect("snapshot")[0]
+        .terminal_id
+        .clone();
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.tool_permissions.default = settings::ToolPermissionMode::Deny;
+        settings
+            .tool_permissions
+            .tools
+            .remove(crate::TerminalTool::NAME);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+    let (events, _receiver) = crate::ToolCallEventStream::test();
+    let result = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(crate::TerminalToolInput {
+                    session: Some(crate::TerminalSessionRequest::Stdin {
+                        terminal_id,
+                        text: "blocked\n".into(),
+                    }),
+                    ..Default::default()
+                }),
+                events,
+                cx,
+            )
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "stdin must not bypass terminal authorization"
+    );
+}
+
+#[gpui::test]
+async fn test_background_terminal_stop_retains_status_until_clear(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment.terminal_handle.clone().expect("fake terminal");
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment));
+    let (events, mut receiver) = crate::ToolCallEventStream::test();
+    let start = cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "cat".into(),
+                cd: ".".into(),
+                session: Some(crate::TerminalSessionRequest::Start),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    });
+    receiver.expect_update_fields().await;
+    start.await.expect("background start");
+    let terminal_id = tool.session_snapshots(&cx.to_async()).expect("snapshot")[0]
+        .terminal_id
+        .clone();
+    let (events, _receiver) = crate::ToolCallEventStream::test();
+    let stopped = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(crate::TerminalToolInput {
+                    session: Some(crate::TerminalSessionRequest::Stop {
+                        terminal_id: terminal_id.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                events,
+                cx,
+            )
+        })
+        .await
+        .expect("stop");
+    assert!(handle.was_killed());
+    assert!(stopped.contains("stop_requested"));
+    let snapshot = tool
+        .session_snapshots(&cx.to_async())
+        .expect("retained status");
+    assert_eq!(snapshot.len(), 1);
+    assert!(snapshot[0].stop_requested);
+    let (events, _receiver) = crate::ToolCallEventStream::test();
+    cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                session: Some(crate::TerminalSessionRequest::Clear { terminal_id }),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    })
+    .await
+    .expect("clear");
+    assert!(
+        tool.session_snapshots(&cx.to_async())
+            .expect("cleared")
+            .is_empty()
+    );
+}
+
+#[gpui::test]
+async fn test_background_terminal_timeout_reports_exit_and_output(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(
+            FakeTerminalHandle::new_never_exits(cx)
+                .with_output(ProcessOutput::new("timeout output", false)),
+        )
+    }));
+    let handle = environment.terminal_handle.clone().expect("fake terminal");
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment));
+    let (events, mut receiver) = crate::ToolCallEventStream::test();
+    let start = cx.update(|cx| {
+        tool.clone().run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "sleep 1000".into(),
+                cd: ".".into(),
+                timeout_ms: Some(1),
+                session: Some(crate::TerminalSessionRequest::Start),
+                ..Default::default()
+            }),
+            events,
+            cx,
+        )
+    });
+    receiver.expect_update_fields().await;
+    start.await.expect("background start");
+    cx.background_executor.timer(Duration::from_millis(5)).await;
+    cx.run_until_parked();
+    let snapshot = tool
+        .session_snapshots(&cx.to_async())
+        .expect("timeout snapshot");
+    assert_eq!(snapshot.len(), 1);
+    assert!(handle.was_killed());
+    assert!(matches!(
+        snapshot[0].state,
+        crate::TerminalSessionState::Exited {
+            timed_out: true,
+            ..
+        }
+    ));
+    assert_eq!(snapshot[0].output, "timeout output");
+}
+
+#[gpui::test]
+async fn test_background_terminal_disposal_kills_without_clear(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment.terminal_handle.clone().expect("fake terminal");
+    {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(crate::TerminalTool::new(project, environment.clone()));
+        let (events, mut receiver) = crate::ToolCallEventStream::test();
+        let start = cx.update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(crate::TerminalToolInput {
+                    command: "sleep 1000".into(),
+                    cd: ".".into(),
+                    session: Some(crate::TerminalSessionRequest::Start),
+                    ..Default::default()
+                }),
+                events,
+                cx,
+            )
+        });
+        receiver.expect_update_fields().await;
+        start.await.expect("background start");
+    }
+    cx.run_until_parked();
+    assert!(
+        handle.was_killed(),
+        "dropping the final registry owner must kill the session"
+    );
 }
 
 #[gpui::test]
@@ -7154,6 +7449,9 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     message: "prompt".to_string(),
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
+                    background: false,
+                    action: Default::default(),
+                    wait: false,
                 }),
                 event_stream,
                 cx,
@@ -7187,6 +7485,9 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     message: "prompt".to_string(),
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
+                    background: false,
+                    action: Default::default(),
+                    wait: false,
                 }),
                 event_stream,
                 cx,
@@ -7257,6 +7558,9 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7406,6 +7710,9 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7565,6 +7872,9 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7703,6 +8013,9 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the first task".to_string(),
         session_id: None,
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7775,6 +8088,9 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -8744,6 +9060,9 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
+        action: Default::default(),
+        wait: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

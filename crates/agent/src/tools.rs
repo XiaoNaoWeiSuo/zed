@@ -34,9 +34,7 @@ mod web_search_tool;
 mod write_file_tool;
 
 use crate::AgentTool;
-use feature_flags::{
-    CreateThreadToolFeatureFlag, FeatureFlagAppExt as _, LspToolFeatureFlag, RenameToolFeatureFlag,
-};
+use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlag, FeatureFlagAppExt as _};
 use gpui::App;
 use language_model::LanguageModelRequestTool;
 use serde::{
@@ -102,13 +100,80 @@ pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
 
-pub use terminal_tool::*;
+pub use terminal_tool::{
+    SandboxedTerminalTool, SandboxedTerminalToolInput, TerminalSessionMetadata,
+    TerminalSessionRequest, TerminalSessionSnapshot, TerminalSessionState, TerminalTool,
+    TerminalToolInput,
+};
 pub use tool_permissions::*;
 pub use web_search_tool::*;
 pub use write_file_tool::*;
 
+/// Availability metadata shares the schema catalog so tooling can distinguish
+/// rollout policy from missing registration without assuming every schema is enabled.
+#[derive(Clone, Copy)]
+pub struct BuiltInTool {
+    pub name: &'static str,
+    pub feature_flag: Option<&'static str>,
+    schema: fn() -> LanguageModelRequestTool,
+    feature_enabled: fn(&App) -> bool,
+    supports_provider: fn(&language_model::LanguageModelProviderId) -> bool,
+    allowed_in_restricted_mode: fn() -> bool,
+}
+
+impl BuiltInTool {
+    pub fn schema(&self) -> LanguageModelRequestTool {
+        (self.schema)()
+    }
+
+    pub fn feature_enabled(&self, cx: &App) -> bool {
+        (self.feature_enabled)(cx)
+    }
+
+    pub fn supports_provider(&self, provider: &language_model::LanguageModelProviderId) -> bool {
+        (self.supports_provider)(provider)
+    }
+
+    pub fn allowed_in_restricted_mode(&self) -> bool {
+        (self.allowed_in_restricted_mode)()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolRollout {
+    General,
+    SiblingThreads,
+}
+
+impl ToolRollout {
+    const fn feature_flag(self) -> Option<&'static str> {
+        match self {
+            Self::General => None,
+            Self::SiblingThreads => Some(CreateThreadToolFeatureFlag::NAME),
+        }
+    }
+
+    fn enabled(self, cx: &App) -> bool {
+        match self {
+            Self::General => true,
+            Self::SiblingThreads => cx.has_flag::<CreateThreadToolFeatureFlag>(),
+        }
+    }
+}
+
+fn language_model_tool<T: AgentTool>() -> LanguageModelRequestTool {
+    let mut input_schema = T::input_schema().to_value();
+    language_model::tool_schema::normalize_tool_schema(&mut input_schema);
+    LanguageModelRequestTool::function(
+        T::NAME.to_string(),
+        T::description().to_string(),
+        input_schema,
+        T::supports_input_streaming(),
+    )
+}
+
 macro_rules! tools {
-    ($($tool:ty),* $(,)?) => {
+    ($($tool:ty => $rollout:ident),* $(,)?) => {
         /// Every built-in tool name, determined at compile time.
         pub const ALL_TOOL_NAMES: &[&str] = &[
             $(<$tool>::NAME,)*
@@ -145,116 +210,189 @@ macro_rules! tools {
             }
         };
 
+        pub const BUILT_IN_TOOL_CATALOG: &[BuiltInTool] = &[
+            $(BuiltInTool {
+                name: <$tool>::NAME,
+                feature_flag: ToolRollout::$rollout.feature_flag(),
+                schema: language_model_tool::<$tool>,
+                feature_enabled: |cx| ToolRollout::$rollout.enabled(cx),
+                supports_provider: <$tool>::supports_provider,
+                allowed_in_restricted_mode: <$tool>::allow_in_restricted_mode,
+            },)*
+        ];
+
         /// Returns whether the tool with the given name supports the given provider.
         pub fn tool_supports_provider(name: &str, provider: &language_model::LanguageModelProviderId) -> bool {
-            $(
-                if name == <$tool>::NAME {
-                    return <$tool>::supports_provider(provider);
-                }
-            )*
-            false
+            built_in_tool(name).is_some_and(|tool| tool.supports_provider(provider))
         }
 
         /// Returns whether the tool with the given name may be provided to an
         /// agent in a restricted workspace. Unknown tools (e.g. MCP tools) are
         /// considered allowed.
         pub fn tool_allowed_in_restricted_mode(name: &str) -> bool {
-            $(
-                if name == <$tool>::NAME {
-                    return <$tool>::allow_in_restricted_mode();
-                }
-            )*
-            true
+            built_in_tool(name).is_none_or(|tool| tool.allowed_in_restricted_mode())
         }
 
         /// A list of all built-in tools
         pub fn built_in_tools() -> impl Iterator<Item = LanguageModelRequestTool> {
-            fn language_model_tool<T: AgentTool>() -> LanguageModelRequestTool {
-                let mut input_schema = T::input_schema().to_value();
-                language_model::tool_schema::normalize_tool_schema(&mut input_schema);
-                LanguageModelRequestTool::function(
-                    T::NAME.to_string(),
-                    T::description().to_string(),
-                    input_schema,
-                    T::supports_input_streaming(),
-                )
-            }
-            [
-                $(
-                    language_model_tool::<$tool>(),
-                )*
-            ]
-            .into_iter()
+            BUILT_IN_TOOL_CATALOG.iter().map(BuiltInTool::schema)
         }
     };
 }
 
-// Adding a tool here (and constructing it in `Thread::add_default_tools`) is
-// not enough to make the model actually receive it. Three further gates will
-// silently drop the tool rather than fail to compile:
-//
-// 1. `assets/settings/default.json`: the `write` and `ask` agent profiles each
-//    carry an explicit `tools` allowlist. `Thread::enabled_tools` filters out
-//    any tool not present there with value `true`, so it never reaches the
-//    model.
-// 2. `test_all_tools_are_in_tool_info_or_excluded` in
-//    `crates/settings_ui/src/pages/tool_permissions_setup.rs`: every tool must
-//    be in the permission-UI `TOOLS` list (if it calls
-//    `decide_permission_from_settings`) or in `EXCLUDED_TOOLS`.
-// 3. `tool_feature_flag_enabled`: some tools are gated behind a feature flag and
-//    are dropped unless it is active. The agent-profile UI uses the same gate so
-//    it never offers a tool the agent can't actually use.
 tools! {
-    ApplyCodeActionTool,
-    AskUserTool,
-    CopyPathTool,
-    CreateDirectoryTool,
-    CreateThreadTool,
-    DeletePathTool,
-    DiagnosticsTool,
-    EditFileTool,
-    FetchTool,
-    FindPathTool,
-    FindReferencesTool,
-    GetCodeActionsTool,
-    GoToDefinitionTool,
-    GoalTool,
-    InspectToolResultTool,
-    GrepTool,
-    ListAgentsAndModelsTool,
-    ListDirectoryTool,
-    MovePathTool,
-    ReadFileTool,
-    RenameTool,
-    SkillTool,
-    SpawnAgentTool,
-    TerminalTool,
-    WebSearchTool,
-    WriteFileTool,
+    ApplyCodeActionTool => General,
+    AskUserTool => General,
+    CopyPathTool => General,
+    CreateDirectoryTool => General,
+    CreateThreadTool => SiblingThreads,
+    DeletePathTool => General,
+    DiagnosticsTool => General,
+    EditFileTool => General,
+    FetchTool => General,
+    FindPathTool => General,
+    FindReferencesTool => General,
+    GetCodeActionsTool => General,
+    GoToDefinitionTool => General,
+    GoalTool => General,
+    InspectToolResultTool => General,
+    GrepTool => General,
+    ListAgentsAndModelsTool => General,
+    ListDirectoryTool => General,
+    MovePathTool => General,
+    ProjectCheckpointTool => General,
+    ReadFileTool => General,
+    RenameTool => General,
+    SkillTool => General,
+    SpawnAgentTool => General,
+    TerminalTool => General,
+    WebSearchTool => General,
+    WriteFileTool => General,
 }
 
-/// Some built-in tools are gated behind a feature flag and only become usable
-/// once that flag is active. Tools without a flag are always available.
-///
-/// This is the single source of truth for that gating: `Thread::enabled_tools`
-/// uses it to decide what the model receives, and the agent-profile
-/// configuration UI uses it to decide what to offer — so the UI can never list
-/// a tool the agent would silently drop (see #56778).
+pub fn built_in_tool(name: &str) -> Option<&'static BuiltInTool> {
+    BUILT_IN_TOOL_CATALOG.iter().find(|tool| tool.name == name)
+}
+
+/// Shared by request filtering and the profile UI. This only checks rollout;
+/// profiles, provider support, registration and workspace trust still apply.
 pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
-    match tool_name {
-        RenameTool::NAME => cx.has_flag::<RenameToolFeatureFlag>(),
-        FindReferencesTool::NAME
-        | GetCodeActionsTool::NAME
-        | ApplyCodeActionTool::NAME
-        | GoToDefinitionTool::NAME => cx.has_flag::<LspToolFeatureFlag>(),
-        CreateThreadTool::NAME => cx.has_flag::<CreateThreadToolFeatureFlag>(),
-        _ => true,
-    }
+    built_in_tool(tool_name).is_none_or(|tool| tool.feature_enabled(cx))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn lsp_tools_do_not_require_rollout_flags(cx: &mut App) {
+        let store = settings::SettingsStore::test(cx);
+        cx.set_global(store);
+        cx.update_flags(false, Vec::new());
+        for name in [
+            FindReferencesTool::NAME,
+            GoToDefinitionTool::NAME,
+            GetCodeActionsTool::NAME,
+            ApplyCodeActionTool::NAME,
+            RenameTool::NAME,
+        ] {
+            assert!(tool_feature_flag_enabled(name, cx), "{name}");
+            assert_eq!(
+                built_in_tool(name).expect("catalog entry").feature_flag,
+                None
+            );
+        }
+        assert_eq!(
+            tool_feature_flag_enabled(CreateThreadTool::NAME, cx),
+            cx.has_flag::<CreateThreadToolFeatureFlag>()
+        );
+        assert_eq!(
+            built_in_tool(CreateThreadTool::NAME)
+                .expect("catalog entry")
+                .feature_flag,
+            Some(CreateThreadToolFeatureFlag::NAME)
+        );
+        assert!(tool_feature_flag_enabled("some_mcp_tool", cx));
+    }
+
+    #[gpui::test]
+    fn default_profile_tools_have_schemas_and_preserve_read_only_policy(cx: &mut App) {
+        use agent_settings::{AgentProfileId, AgentSettings, builtin_profiles};
+        use settings::Settings as _;
+
+        let store = settings::SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(settings.default_profile.as_str(), builtin_profiles::WRITE);
+        let write = settings
+            .profiles
+            .get(&AgentProfileId(builtin_profiles::WRITE.into()))
+            .expect("default write profile");
+        let ask = settings
+            .profiles
+            .get(&AgentProfileId(builtin_profiles::ASK.into()))
+            .expect("default ask profile");
+        for profile in settings.profiles.values() {
+            for name in profile.tools.keys() {
+                assert!(
+                    built_in_tool(name).is_some(),
+                    "profile tool `{name}` has no schema"
+                );
+            }
+        }
+        for name in ALL_TOOL_NAMES {
+            assert!(write.is_tool_enabled(name), "write profile omits `{name}`");
+        }
+        for name in [
+            FindReferencesTool::NAME,
+            GoToDefinitionTool::NAME,
+            GetCodeActionsTool::NAME,
+        ] {
+            assert!(ask.is_tool_enabled(name), "ask profile omits `{name}`");
+        }
+        for name in [ApplyCodeActionTool::NAME, RenameTool::NAME] {
+            assert!(
+                !ask.is_tool_enabled(name),
+                "ask profile enables mutation `{name}`"
+            );
+        }
+        assert!(built_in_tool(ProjectCheckpointTool::NAME).is_some());
+        // A schema and profile toggle do not override a disabled backend.
+        assert!(!tool_supports_provider(
+            WebSearchTool::NAME,
+            &language_model::LanguageModelProviderId::from("openai".to_string())
+        ));
+    }
+
+    #[test]
+    fn catalog_schemas_include_background_control_inputs() {
+        for (name, fields) in [
+            (TerminalTool::NAME, &["session"][..]),
+            (
+                SpawnAgentTool::NAME,
+                &["background", "action", "wait", "session_id"][..],
+            ),
+        ] {
+            let schema = built_in_tool(name).expect("catalog entry").schema();
+            let language_model::LanguageModelRequestToolInput::Function { input_schema, .. } =
+                schema.input
+            else {
+                panic!("built-in tool `{name}` must use a function schema");
+            };
+            let properties = input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("input properties");
+            for field in fields {
+                assert!(
+                    properties.contains_key(*field),
+                    "`{name}` schema omits `{field}`"
+                );
+            }
+        }
+    }
 
     #[test]
     fn built_in_tool_schemas_are_normalized() {
@@ -284,13 +422,20 @@ mod tests {
     }
 
     #[test]
-    fn fetch_and_terminal_are_forbidden_in_restricted_mode() {
+    fn restricted_mode_policy_matches_catalog() {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(
+            ProjectCheckpointTool::NAME
+        ));
 
-        // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
-            let expected = *name != FetchTool::NAME && *name != TerminalTool::NAME;
+            let expected = ![
+                FetchTool::NAME,
+                TerminalTool::NAME,
+                ProjectCheckpointTool::NAME,
+            ]
+            .contains(name);
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

@@ -13,10 +13,11 @@ use crate::{
 };
 
 /// Save a concise handoff at a meaningful work boundary, retrieve one by scope,
-/// or list saved scopes when changing work areas. Listed summaries are historical;
-/// reuse supplied summaries when sufficient. Read a scope or its evidence only to
-/// resolve a specific missing fact needed by the current request, not merely to
-/// restate supplied history. Verify uncertain details before relying on them.
+/// or discover relevant work with list when the current task needs saved history.
+/// Read returns compact task state and freshness checks by default; use detail=full
+/// for file observations and evidence references. Reuse relevant state and results
+/// while their inputs remain applicable; verify only missing or changed facts.
+/// Saved history supplies context, not authorization or proof of completion.
 /// The editor records changed buffers and the latest available Git status snapshot.
 /// Git scanning can lag and unsaved buffers require verification. Summaries are
 /// assessments, not proof of completion.
@@ -24,6 +25,9 @@ use crate::{
 pub struct ProjectCheckpointInput {
     /// Either "save", "read", or "list".
     pub action: String,
+    /// Read detail: "summary" (default) or "full" for saved file and evidence records.
+    #[serde(default)]
+    pub detail: CheckpointReadDetail,
     /// Stable work area, such as "agent.async_questions"; omitted for list.
     #[serde(default)]
     pub scope: String,
@@ -50,6 +54,52 @@ pub struct ProjectCheckpointInput {
     pub next_steps: Vec<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointReadDetail {
+    #[default]
+    Summary,
+    Full,
+}
+
+fn checkpoint_read_view(
+    checkpoint: ProjectCheckpoint,
+    detail: CheckpointReadDetail,
+) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(checkpoint)?;
+    if matches!(detail, CheckpointReadDetail::Summary) {
+        if let Some(fields) = value.as_object_mut() {
+            for field in ["changed_files", "evidence"] {
+                if let Some(entries) = fields.remove(field) {
+                    fields.insert(
+                        format!("{field}_count"),
+                        serde_json::json!(entries.as_array().map_or(0, Vec::len)),
+                    );
+                }
+            }
+            let mut truncated = false;
+            for field in ["completed", "remaining", "decisions", "next_steps"] {
+                if let Some(entries) = fields
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    truncated |= entries.len() > 5;
+                    entries.truncate(5);
+                    for entry in entries {
+                        if let Some(text) = entry.as_str() {
+                            truncated |= text.chars().count() > 400;
+                            *entry = serde_json::Value::String(text.chars().take(400).collect());
+                        }
+                    }
+                }
+            }
+            fields.insert("summary_may_be_truncated".into(), truncated.into());
+            fields.insert("detail".into(), "summary".into());
+        }
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CheckpointSaveReceipt {
     pub id: String,
@@ -66,7 +116,7 @@ pub struct ProjectCheckpointOutput {
     pub saved: Option<CheckpointSaveReceipt>,
     pub scopes: Vec<crate::CheckpointScopeSummary>,
     pub next_offset: Option<usize>,
-    pub checkpoint: Option<ProjectCheckpoint>,
+    pub checkpoint: Option<serde_json::Value>,
     pub changed_since_checkpoint: Vec<PathBuf>,
     pub files_not_checked: Vec<PathBuf>,
     pub current_revision_changed: Option<bool>,
@@ -206,6 +256,7 @@ impl AgentTool for ProjectCheckpointTool {
                         let mut new_dirty_files = checkpoint.as_ref().and_then(|checkpoint| git.as_ref().map(|git| git.dirty_files.iter().filter(|path| !checkpoint.changed_files.iter().any(|file| &file.path == *path)).cloned().collect::<Vec<_>>()));
                         let new_dirty_files_truncated = new_dirty_files.as_ref().is_some_and(|files| files.len() > 50);
                         if let Some(files) = &mut new_dirty_files { files.truncate(50); }
+                        let checkpoint = checkpoint.map(|checkpoint| checkpoint_read_view(checkpoint, input.detail)).transpose()?;
                         return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint, changed_since_checkpoint: changed, files_not_checked: unknown, current_revision_changed: revision_changed, current_branch_changed: branch_changed, new_dirty_files, new_dirty_files_truncated, error: None });
                     }
                     let mut changed_files = Vec::new();
@@ -238,5 +289,39 @@ impl AgentTool for ProjectCheckpointTool {
             }.await;
             result.map_err(|error: anyhow::Error| ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: Some(format!("{error:#}")) })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_read_defaults_to_compact_state_and_preserves_full_record() -> anyhow::Result<()> {
+        let input: ProjectCheckpointInput = serde_json::from_value(serde_json::json!({
+            "action": "read", "scope": "task"
+        }))?;
+        assert!(matches!(input.detail, CheckpointReadDetail::Summary));
+        let checkpoint: ProjectCheckpoint = serde_json::from_value(serde_json::json!({
+            "id": "checkpoint", "session_id": "session", "scope": "task",
+            "created_at": "2026-10-29T00:00:00Z", "base_revision": null,
+            "branch": null, "git_scan_id": null,
+            "completed": ["a".repeat(500)], "remaining": ["Verify"],
+            "decisions": [], "next_steps": [],
+            "changed_files": [{"path": "file.rs", "fingerprint": "fingerprint"}],
+            "evidence": [{"description": "Observation", "source": "session:old/tool:one", "revision": null}],
+            "interrupted": false
+        }))?;
+        let compact = checkpoint_read_view(checkpoint.clone(), input.detail)?;
+        assert_eq!(compact["remaining"][0], "Verify");
+        assert_eq!(compact["summary_may_be_truncated"], true);
+        assert_eq!(compact["changed_files_count"], 1);
+        assert_eq!(compact["evidence_count"], 1);
+        assert!(compact.get("evidence").is_none());
+        assert!(compact.get("changed_files").is_none());
+        assert!(!compact.to_string().contains("session:old/tool:one"));
+        let full = checkpoint_read_view(checkpoint.clone(), CheckpointReadDetail::Full)?;
+        assert_eq!(full, serde_json::to_value(checkpoint)?);
+        Ok(())
     }
 }

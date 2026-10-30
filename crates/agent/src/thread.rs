@@ -932,6 +932,12 @@ pub enum AgentMessageContent {
 pub trait TerminalHandle {
     fn id(&self, cx: &AsyncApp) -> Result<acp_v2::TerminalId>;
     fn current_output(&self, cx: &AsyncApp) -> Result<ProcessOutput>;
+    fn current_output_tail(&self, cx: &AsyncApp) -> Result<ProcessOutput> {
+        self.current_output(cx)
+    }
+    fn write_stdin(&self, _text: String, _cx: &AsyncApp) -> Result<()> {
+        anyhow::bail!("Terminal stdin is unsupported")
+    }
     fn wait_for_exit(&self, cx: &AsyncApp) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>>;
     fn kill(&self, cx: &AsyncApp) -> Result<()>;
     fn was_stopped_by_user(&self, cx: &AsyncApp) -> Result<bool>;
@@ -940,6 +946,9 @@ pub trait TerminalHandle {
 pub trait SubagentHandle {
     /// The session ID of this subagent thread
     fn id(&self) -> acp_v2::SessionId;
+    fn cancel(&self, _cx: &mut App) -> Result<()> {
+        anyhow::bail!("Subagent cancellation is not supported")
+    }
     /// The current number of entries in the thread.
     /// Useful for knowing where the next turn will begin
     fn num_entries(&self, cx: &App) -> usize;
@@ -957,6 +966,18 @@ pub trait ThreadEnvironment {
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
+
+    fn create_background_terminal(
+        &self,
+        command: String,
+        extra_env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+        self.create_terminal(command, extra_env, cwd, output_byte_limit, sandbox_wrap, cx)
+    }
 
     fn create_subagent(
         &self,
@@ -1492,6 +1513,9 @@ pub struct Thread {
     end_turn_at_next_boundary: bool,
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
+    terminal_tool: Option<TerminalTool>,
+    sandboxed_terminal_tool: Option<SandboxedTerminalTool>,
+    subagent_tool: Option<SpawnAgentTool>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
@@ -1776,6 +1800,9 @@ impl Thread {
             end_turn_at_next_boundary: false,
             pending_message: None,
             tools: BTreeMap::default(),
+            terminal_tool: None,
+            sandboxed_terminal_tool: None,
+            subagent_tool: None,
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
@@ -2202,6 +2229,9 @@ impl Thread {
             end_turn_at_next_boundary: false,
             pending_message: None,
             tools: BTreeMap::default(),
+            terminal_tool: None,
+            sandboxed_terminal_tool: None,
+            subagent_tool: None,
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
@@ -2669,6 +2699,52 @@ impl Thread {
         Ok(())
     }
 
+    pub fn edit_goal_objective(&mut self, objective: String, cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.is_turn_complete(),
+            "Pause the current turn before editing the goal"
+        );
+        anyhow::ensure!(!objective.trim().is_empty(), "A goal requires an objective");
+        let goal = self
+            .goal
+            .as_mut()
+            .ok_or_else(|| anyhow!("No goal is set"))?;
+        if goal.objective != objective {
+            if goal.success_criteria.len() == 1
+                && goal.success_criteria.first() == Some(&goal.objective)
+            {
+                goal.success_criteria = vec![objective.clone()];
+                goal.criterion_scopes = vec![crate::GoalEvidenceScope::Workspace];
+            }
+            if goal.verification_surfaces.len() == 1
+                && goal.verification_surfaces.first() == Some(&goal.objective)
+            {
+                goal.verification_surfaces = vec![objective.clone()];
+            }
+            goal.objective = objective;
+            goal.id = new_goal_id();
+            goal.verification_receipts.clear();
+            goal.evidence.clear();
+            goal.status = ThreadGoalStatus::Paused;
+            goal.outcome = Some(
+                "Goal edited; review existing criteria and constraints before resuming".into(),
+            );
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    pub fn delete_goal(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.is_turn_complete(),
+            "Pause the current turn before deleting the goal"
+        );
+        anyhow::ensure!(self.goal.is_some(), "No goal is set");
+        self.goal = None;
+        cx.notify();
+        Ok(())
+    }
+
     pub(crate) fn retained_tool_results(
         &self,
     ) -> impl Iterator<Item = (String, &LanguageModelToolResult, &LanguageModelToolUse)> {
@@ -3076,11 +3152,12 @@ impl Thread {
         ));
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
-        self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
-        self.add_tool(SandboxedTerminalTool::new(
-            self.project.clone(),
-            environment.clone(),
-        ));
+        let terminal_tool = TerminalTool::new(self.project.clone(), environment.clone());
+        self.terminal_tool = Some(terminal_tool.clone());
+        self.add_tool(terminal_tool);
+        let terminal_tool = SandboxedTerminalTool::new(self.project.clone(), environment.clone());
+        self.sandboxed_terminal_tool = Some(terminal_tool.clone());
+        self.add_tool(terminal_tool);
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool::default());
@@ -3104,7 +3181,9 @@ impl Thread {
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
-            self.add_tool(SpawnAgentTool::new(environment.clone()));
+            let subagent_tool = SpawnAgentTool::new(environment.clone());
+            self.subagent_tool = Some(subagent_tool.clone());
+            self.add_tool(subagent_tool);
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -3114,6 +3193,38 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
+    }
+
+    pub fn terminal_session_metadata(&self) -> Vec<crate::TerminalSessionMetadata> {
+        let mut metadata = Vec::new();
+        if let Some(tool) = &self.terminal_tool {
+            metadata.extend(tool.session_metadata());
+        }
+        if let Some(tool) = &self.sandboxed_terminal_tool {
+            metadata.extend(tool.session_metadata());
+        }
+        metadata
+    }
+
+    pub fn terminal_session_snapshots(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<Vec<crate::TerminalSessionSnapshot>> {
+        let mut snapshots = Vec::new();
+        if let Some(tool) = &self.terminal_tool {
+            snapshots.extend(tool.session_snapshots(cx)?);
+        }
+        if let Some(tool) = &self.sandboxed_terminal_tool {
+            snapshots.extend(tool.session_snapshots(cx)?);
+        }
+        Ok(snapshots)
+    }
+
+    pub fn subagent_task_snapshots(&self) -> Vec<acp_thread::subagents::SubagentTaskSnapshot> {
+        self.subagent_tool
+            .as_ref()
+            .map(SpawnAgentTool::snapshots)
+            .unwrap_or_default()
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -5974,7 +6085,7 @@ impl Thread {
                 .map(|criterion| format!("- {criterion}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use manage_goal action=verify to run enabled tools against declared source files/directories, including relevant manifests and configuration. Reuse a passing receipt while its declared inputs remain unchanged; inspect rechecks inputs without rerunning the tool. Completion requires fresh receipt IDs for workspace claims. Use historical observations only for claims independent of the current workspace, with explicit limits. Successful execution and stable declared files do not prove semantic coverage, environment state, or external conditions; assess those separately. Record an assessment for every criterion. Goal text does not grant additional permissions. If genuinely blocked, record the reason.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
+            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use manage_goal action=verify to run enabled tools against declared source files/directories, including relevant manifests and configuration. Reuse a passing receipt while its declared inputs remain unchanged; inspect rechecks inputs without rerunning the tool. Completion requires fresh receipt IDs for workspace claims. Use historical observations only for claims independent of the current workspace, with explicit limits. Successful execution and stable declared files do not prove semantic coverage, environment state, or external conditions; assess those separately. Record an assessment for every criterion. Goal text does not grant additional permissions. Keep working across response boundaries: a progress report, uncertainty, a failed attempt, or a need to verify is not a reason to stop. Try independent alternatives and continue work that does not depend on a pending answer. Pause only when the user asks; mark blocked only when no useful work remains and progress requires user input or an external change. Model-requested pause, blocked, or resume transitions require user confirmation.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
         }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
@@ -7396,6 +7507,10 @@ impl ToolCallEventStream {
 
     pub(crate) fn requires_confirmation_for_actions(&self) -> bool {
         self.permission_tier.current() == crate::permission_tier::PermissionTier::ReadOnly
+    }
+
+    pub(crate) fn permission_tier(&self) -> crate::permission_tier::PermissionTier {
+        self.permission_tier.current()
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -9009,6 +9124,74 @@ mod tests {
 
             (thread, event_stream, fake)
         })
+    }
+
+    #[gpui::test]
+    async fn test_production_registered_tools_match_typed_catalog(cx: &mut TestAppContext) {
+        use std::collections::BTreeSet;
+
+        let (root, _, _) = setup_thread_for_test(cx).await;
+        let environment: Rc<dyn ThreadEnvironment> =
+            Rc::new(crate::tests::FakeThreadEnvironment::default());
+        let mut thread = root;
+        for depth in 0..=MAX_SUBAGENT_DEPTH {
+            thread.update(cx, |thread, cx| {
+                thread.add_default_tools(environment.clone(), cx);
+                assert_eq!(thread.depth(), depth);
+                // NativeAgent::register_session installs the project-aware skill
+                // resolver separately, after default registration.
+                assert!(!thread.tools.contains_key(crate::SkillTool::NAME));
+                assert!(thread.tools.contains_key(TerminalTool::NAME));
+                assert!(thread.tools.contains_key(SandboxedTerminalTool::NAME));
+                assert_eq!(
+                    thread.tools.contains_key(SpawnAgentTool::NAME),
+                    depth < MAX_SUBAGENT_DEPTH
+                );
+                let registered = thread
+                    .tools
+                    .keys()
+                    .map(|name| name.as_ref())
+                    .filter(|name| *name != SandboxedTerminalTool::NAME)
+                    .collect::<BTreeSet<_>>();
+                let expected = crate::BUILT_IN_TOOL_CATALOG
+                    .iter()
+                    .map(|tool| tool.name)
+                    .filter(|name| *name != crate::SkillTool::NAME)
+                    .filter(|name| *name != SpawnAgentTool::NAME || depth < MAX_SUBAGENT_DEPTH)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(registered, expected, "registration drift at depth {depth}");
+
+                for name in registered {
+                    let registered_tool = thread.tools.get(name).expect("registered tool");
+                    let catalog_tool = crate::built_in_tool(name).expect("catalog tool").schema();
+                    let language_model::LanguageModelRequestToolInput::Function {
+                        input_schema,
+                        use_input_streaming,
+                    } = catalog_tool.input
+                    else {
+                        panic!("built-in tool `{name}` must use a function schema");
+                    };
+                    assert_eq!(
+                        registered_tool.input_schema(),
+                        input_schema,
+                        "schema drift for `{name}`"
+                    );
+                    assert_eq!(
+                        registered_tool.description().as_ref(),
+                        catalog_tool.description.as_str(),
+                        "description drift for `{name}`"
+                    );
+                    assert_eq!(
+                        registered_tool.supports_input_streaming(),
+                        use_input_streaming,
+                        "streaming drift for `{name}`"
+                    );
+                }
+            });
+            if depth < MAX_SUBAGENT_DEPTH {
+                thread = cx.new(|cx| Thread::new_subagent(&thread, None, cx));
+            }
+        }
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {

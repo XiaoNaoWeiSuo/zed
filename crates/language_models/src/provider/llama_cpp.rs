@@ -134,7 +134,13 @@ impl State {
                 }
             }
             let fetch_models_task = this.update(cx, |this, cx| this.fetch_models(cx))?;
-            match fetch_models_task.await {
+            let result = fetch_models_task.await;
+            this.update(cx, |this, cx| {
+                this.last_fetch_models_error =
+                    result.as_ref().err().map(|error| format!("{error:#}"));
+                cx.notify();
+            })?;
+            match result {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     // A refused connection means the server isn't running yet, not an error.
@@ -170,6 +176,10 @@ impl State {
                 &extra_headers,
             )
             .await?;
+            anyhow::ensure!(
+                !entries.is_empty(),
+                "The server returned no models. Load a model and try again."
+            );
 
             let is_router = entries.iter().any(ModelEntry::is_router_entry);
 
@@ -335,12 +345,15 @@ impl State {
     }
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
+        self.last_fetch_models_error = None;
+        cx.notify();
         let fetch_task = self.fetch_models(cx);
         let task = cx.spawn(async move |this, cx| {
             let result = fetch_task.await;
-            this.update(cx, |this, _cx| {
+            this.update(cx, |this, cx| {
                 this.last_fetch_models_error =
                     result.as_ref().err().map(|error| format!("{error:#}"));
+                cx.notify();
             })
             .ok();
             result.log_err();
@@ -483,6 +496,7 @@ impl LlamaCppLanguageModelProvider {
                             let url_changed = last_settings.api_url != current_settings.api_url;
                             last_settings = current_settings.clone();
                             if url_changed {
+                                this.fetch_model_task = None;
                                 let credentials_provider = this.credentials_provider.clone();
                                 let api_url = Self::api_url(cx);
                                 this.api_key_state.handle_url_change(
@@ -1351,6 +1365,7 @@ impl ConfigurationView {
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_authenticated = self.state.read(cx).is_authenticated();
+        let connection_error = self.state.read(cx).last_fetch_models_error.clone();
 
         v_flex()
             .gap_2()
@@ -1359,6 +1374,9 @@ impl Render for ConfigurationView {
             .child(self.render_api_url_editor(cx))
             .child(self.render_context_window_editor(cx))
             .child(self.render_api_key_editor(cx))
+            .when_some(connection_error, |this, error| {
+                this.child(Label::new(format!("Connection failed: {error}")).color(Color::Error))
+            })
             .child(Divider::horizontal())
             .child(
                 h_flex()

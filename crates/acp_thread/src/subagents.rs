@@ -2,6 +2,33 @@ use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
 use anyhow::Result;
 use gpui::SharedString;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLifecycle {
+    Running,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentLifecycle {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SubagentTaskSnapshot {
+    pub session_id: acp_v2::SessionId,
+    pub label: String,
+    pub generation: u64,
+    pub state: SubagentLifecycle,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub session_info: crate::SubagentSessionInfo,
+}
+
 /// What a parent ACP session has reported about a subagent session it owns.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubagentAssociation {
@@ -65,6 +92,25 @@ mod tests {
 
     fn v2_update(value: serde_json::Value) -> acp_v2::SubagentUpdate {
         serde_json::from_value(value).expect("v2 subagent update")
+    }
+
+    #[test]
+    fn lifecycle_activity_and_wire_values() -> Result<()> {
+        for (state, active, wire) in [
+            (SubagentLifecycle::Running, true, "running"),
+            (SubagentLifecycle::Cancelling, true, "cancelling"),
+            (SubagentLifecycle::Completed, false, "completed"),
+            (SubagentLifecycle::Failed, false, "failed"),
+            (SubagentLifecycle::Cancelled, false, "cancelled"),
+        ] {
+            assert_eq!(state.is_active(), active);
+            assert_eq!(serde_json::to_value(state)?, json!(wire));
+            assert_eq!(
+                serde_json::from_value::<SubagentLifecycle>(json!(wire))?,
+                state
+            );
+        }
+        Ok(())
     }
 
     #[test]

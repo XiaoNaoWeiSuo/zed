@@ -430,7 +430,10 @@ fn check_commands(
     }
 }
 
-fn is_unconditional_allow_all(rules: &ToolRules, global_default: ToolPermissionMode) -> bool {
+pub(crate) fn is_unconditional_allow_all(
+    rules: &ToolRules,
+    global_default: ToolPermissionMode,
+) -> bool {
     // `always_allow` is intentionally not checked here: when the effective default
     // is already Allow and there are no deny/confirm restrictions, allow patterns
     // are redundant — the user has opted into allowing everything.
@@ -568,6 +571,8 @@ mod tests {
 
     fn test_agent_settings(tool_permissions: ToolPermissions) -> AgentSettings {
         AgentSettings {
+            new_thread_in_worktree: false,
+            remember_worktree_choice: false,
             enabled: true,
             button: true,
             dock: DockPosition::Right,

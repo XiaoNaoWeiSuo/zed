@@ -195,6 +195,80 @@ impl SharedThread {
 }
 
 impl DbThread {
+    pub fn branch_at_message(mut self, message_id: &acp_v2::MessageId) -> Result<Self> {
+        let (message_index, content_index) = message_id
+            .0
+            .strip_prefix("native-message-")
+            .and_then(|suffix| suffix.split_once('-'))
+            .and_then(|(message, content)| {
+                Some((
+                    message.parse::<usize>().ok()?,
+                    content.parse::<usize>().ok()?,
+                ))
+            })
+            .ok_or_else(|| anyhow::anyhow!("This message cannot be branched"))?;
+        let Some(crate::Message::Agent(message)) =
+            self.messages.get(message_index).map(Arc::as_ref)
+        else {
+            anyhow::bail!("The selected agent message is no longer available");
+        };
+        anyhow::ensure!(
+            matches!(
+                message.content.get(content_index),
+                Some(AgentMessageContent::Text(_))
+            ),
+            "The selected response is no longer available"
+        );
+
+        let mut selected_message = message.clone();
+        selected_message.content.truncate(content_index + 1);
+        selected_message.tool_results.retain(|id, _| {
+            selected_message.content.iter().any(|content| {
+                matches!(content, AgentMessageContent::ToolUse(tool_use) if &tool_use.id == id)
+            })
+        });
+        // Opaque reasoning can cover the entire provider message. Keeping it can
+        // leak later context, while dropping it can invalidate signed history.
+        anyhow::ensure!(
+            content_index + 1 == message.content.len() || message.reasoning_details.is_none(),
+            "Cannot branch inside a message with opaque provider reasoning; select its final response instead"
+        );
+        self.messages.truncate(message_index);
+        self.messages
+            .push(Arc::new(crate::Message::Agent(selected_message)));
+        for message in &self.messages {
+            if let crate::Message::Agent(message) = message.as_ref() {
+                anyhow::ensure!(
+                    message.content.iter().all(|content| match content {
+                        AgentMessageContent::ToolUse(tool_use) => {
+                            tool_use.is_input_complete
+                                && message.tool_results.contains_key(&tool_use.id)
+                        }
+                        _ => true,
+                    }),
+                    "Cannot branch across an unfinished tool call"
+                );
+            }
+        }
+
+        self.title = format!("{} (branch)", self.title).into();
+        self.updated_at = Utc::now();
+        self.detailed_summary = None;
+        self.cumulative_token_usage = Default::default();
+        self.request_token_usage.clear();
+        self.subagent_context = None;
+        self.draft_prompt = None;
+        self.ui_scroll_position = None;
+        self.sandboxed_terminal_temp_dir = None;
+        self.sandbox_grants = Default::default();
+        if self.permission_tier != crate::permission_tier::PermissionTier::ReadOnly {
+            self.permission_tier = Default::default();
+        }
+        self.goal = None;
+        self.deferred_questions.clear();
+        Ok(self)
+    }
+
     pub const VERSION: &'static str = "0.3.0";
 
     pub fn to_markdown(&self) -> String {
@@ -964,6 +1038,246 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_branch_retains_only_selected_context() {
+        let mut thread = make_thread("Source", Utc::now());
+        let original = Arc::new(crate::Message::Agent(AgentMessage {
+            content: vec![
+                AgentMessageContent::Thinking {
+                    text: "Reasoning".into(),
+                    signature: Some("signature".into()),
+                },
+                AgentMessageContent::Text("Selected response".into()),
+                AgentMessageContent::Text("Later response".into()),
+            ],
+            ..Default::default()
+        }));
+        thread.messages = vec![original.clone(), Arc::new(crate::Message::Resume)];
+        thread.detailed_summary = Some("Later summary".into());
+        thread.draft_prompt = Some(vec!["Unsent draft".into()]);
+        thread.sandboxed_terminal_temp_dir = Some(PathBuf::from("/source-only"));
+        thread.sandbox_grants.unsandboxed = true;
+        thread.goal = Some(
+            crate::ThreadGoal::new("Source goal".into(), vec!["Done".into()]).expect("valid goal"),
+        );
+
+        let branch = thread
+            .branch_at_message(&acp_v2::MessageId::new("native-message-0-1"))
+            .expect("branch created");
+        assert_eq!(branch.title.as_ref(), "Source (branch)");
+        assert_eq!(branch.messages.len(), 1);
+        let crate::Message::Agent(selected) = branch.messages[0].as_ref() else {
+            panic!("expected agent message");
+        };
+        assert_eq!(selected.content.len(), 2);
+        assert!(
+            matches!(&selected.content[0], AgentMessageContent::Thinking { signature: Some(signature), .. } if signature == "signature")
+        );
+        assert!(selected.reasoning_details.is_none());
+        assert!(branch.detailed_summary.is_none());
+        assert!(branch.draft_prompt.is_none());
+        assert!(branch.goal.is_none());
+        assert!(branch.sandboxed_terminal_temp_dir.is_none());
+        assert!(!branch.sandbox_grants.unsandboxed);
+        let crate::Message::Agent(source) = original.as_ref() else {
+            panic!("expected source agent message");
+        };
+        assert_eq!(source.content.len(), 3);
+        assert!(source.reasoning_details.is_none());
+    }
+
+    #[test]
+    fn test_branch_preserves_opaque_reasoning_only_at_complete_message_boundary() {
+        for content_index in [0, 1] {
+            let mut thread = make_thread("Source", Utc::now());
+            let reasoning = Arc::new(serde_json::json!({"encrypted_content": "signed-reasoning"}));
+            thread
+                .messages
+                .push(Arc::new(crate::Message::Agent(AgentMessage {
+                    content: vec![
+                        AgentMessageContent::Text("First response".into()),
+                        AgentMessageContent::Text("Final response".into()),
+                    ],
+                    reasoning_details: Some(reasoning.clone()),
+                    ..Default::default()
+                })));
+            let branch = thread.branch_at_message(&acp_v2::MessageId::new(format!(
+                "native-message-0-{content_index}"
+            )));
+            if content_index == 0 {
+                assert!(branch.is_err());
+            } else {
+                let branch = branch.expect("complete signed message can be retained");
+                let crate::Message::Agent(message) = branch.messages[0].as_ref() else {
+                    panic!("expected agent message");
+                };
+                assert_eq!(message.reasoning_details.as_ref(), Some(&reasoning));
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_reuses_compaction_only_before_cutoff() {
+        let mut thread = make_thread("Source", Utc::now());
+        let earlier = Arc::new(crate::Message::Compaction(crate::CompactionInfo::Summary(
+            "Earlier context".into(),
+        )));
+        thread.messages = vec![
+            earlier.clone(),
+            Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text("Selected".into())],
+                ..Default::default()
+            })),
+            Arc::new(crate::Message::Compaction(crate::CompactionInfo::Summary(
+                "Later context".into(),
+            ))),
+        ];
+        let branch = thread
+            .branch_at_message(&acp_v2::MessageId::new("native-message-1-0"))
+            .expect("branch created");
+        assert_eq!(branch.messages.len(), 2);
+        assert!(Arc::ptr_eq(&branch.messages[0], &earlier));
+    }
+
+    #[test]
+    fn test_branch_keeps_completed_tools_and_excludes_later_tools() {
+        let tool_use = language_model::LanguageModelToolUse {
+            id: "tool".into(),
+            name: "read_file".into(),
+            raw_input: "{}".into(),
+            input: language_model::LanguageModelToolUseInput::Json(serde_json::json!({})),
+            is_input_complete: true,
+            thought_signature: Some("tool-signature".into()),
+        };
+        let result = language_model::LanguageModelToolResult {
+            tool_use_id: tool_use.id.clone(),
+            tool_name: tool_use.name.clone(),
+            is_error: false,
+            content: vec![],
+            output: Some(serde_json::json!({"retained": true})),
+        };
+        for (completed, input_complete) in [(false, true), (true, false), (true, true)] {
+            let mut thread = make_thread("Source", Utc::now());
+            let mut agent_message = AgentMessage {
+                content: vec![
+                    AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                        is_input_complete: input_complete,
+                        ..tool_use.clone()
+                    }),
+                    AgentMessageContent::Text("Selected response".into()),
+                    AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                        id: "later-tool".into(),
+                        ..tool_use.clone()
+                    }),
+                ],
+                ..Default::default()
+            };
+            if completed {
+                agent_message
+                    .tool_results
+                    .insert(tool_use.id.clone(), result.clone());
+            }
+            thread
+                .messages
+                .push(Arc::new(crate::Message::Agent(agent_message)));
+            let branch = thread.branch_at_message(&acp_v2::MessageId::new("native-message-0-1"));
+            if completed && input_complete {
+                let branch = branch.expect("completed tool can be branched");
+                let crate::Message::Agent(message) = branch.messages[0].as_ref() else {
+                    panic!("expected agent message");
+                };
+                assert_eq!(message.content.len(), 2);
+                assert_eq!(message.tool_results.get(&tool_use.id), Some(&result));
+                assert_eq!(
+                    message.content[0],
+                    AgentMessageContent::ToolUse(tool_use.clone())
+                );
+            } else {
+                assert!(branch.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_does_not_elevate_read_only_permissions() {
+        let mut source = make_thread("Source", Utc::now());
+        source.permission_tier = crate::permission_tier::PermissionTier::ReadOnly;
+        source
+            .messages
+            .push(Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text("Selected".into())],
+                ..Default::default()
+            })));
+        let branch = source
+            .branch_at_message(&acp_v2::MessageId::new("native-message-0-0"))
+            .expect("branch");
+        assert_eq!(
+            branch.permission_tier,
+            crate::permission_tier::PermissionTier::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_branch_rejects_unfinished_tool_in_earlier_message() {
+        let mut source = make_thread("Source", Utc::now());
+        source.messages = vec![
+            Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::ToolUse(
+                    language_model::LanguageModelToolUse {
+                        id: "unfinished".into(),
+                        name: "read_file".into(),
+                        raw_input: "{}".into(),
+                        input: language_model::LanguageModelToolUseInput::Json(serde_json::json!(
+                            {}
+                        )),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    },
+                )],
+                ..Default::default()
+            })),
+            Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text("Selected".into())],
+                ..Default::default()
+            })),
+        ];
+        assert!(
+            source
+                .branch_at_message(&acp_v2::MessageId::new("native-message-1-0"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_branch_rejects_invalid_message_boundaries() {
+        for id in [
+            "external-message",
+            "native-message-3-0",
+            "native-message-0-2",
+            "native-message-0-0",
+        ] {
+            let mut thread = make_thread("Source", Utc::now());
+            thread
+                .messages
+                .push(Arc::new(crate::Message::Agent(AgentMessage {
+                    content: vec![
+                        AgentMessageContent::Thinking {
+                            text: "Thinking".into(),
+                            signature: None,
+                        },
+                        AgentMessageContent::Text("Response".into()),
+                    ],
+                    ..Default::default()
+                })));
+            assert!(
+                thread
+                    .branch_at_message(&acp_v2::MessageId::new(id))
+                    .is_err(),
+                "{id}"
+            );
+        }
+    }
+
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
             title: title.to_string().into(),
@@ -987,6 +1301,112 @@ mod tests {
             deferred_questions: Default::default(),
             permission_tier: Default::default(),
         }
+    }
+
+    #[gpui::test]
+    async fn test_branch_persistence_preserves_configuration_and_parent_independence(
+        cx: &mut TestAppContext,
+    ) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("database");
+        let source_id = session_id("branch-source");
+        let branch_id = session_id("independent-branch");
+        let mut source = make_thread("Source", Utc::now());
+        source.model = Some(DbLanguageModel {
+            provider: "provider".into(),
+            model: "model".into(),
+        });
+        source.profile = Some(AgentProfileId("branch-profile".into()));
+        source.speed = Some(Speed::Fast);
+        source.thinking_enabled = true;
+        source.thinking_effort = Some("high".into());
+        source.subagent_context = Some(crate::SubagentContext {
+            parent_thread_id: session_id("original-parent"),
+            depth: 1,
+        });
+        source.permission_tier = crate::permission_tier::PermissionTier::FullAccess;
+        source.sandbox_grants.unsandboxed = true;
+        source.messages = vec![
+            Arc::new(crate::Message::Compaction(
+                crate::CompactionInfo::ProviderNative {
+                    provider: "provider".to_string().into(),
+                    items: vec![serde_json::json!({"encrypted_content": "earlier-compaction"})],
+                },
+            )),
+            Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![
+                    AgentMessageContent::Thinking {
+                        text: "Reasoning".into(),
+                        signature: Some("signed-thinking".into()),
+                    },
+                    AgentMessageContent::RedactedThinking("redacted-signature".into()),
+                    AgentMessageContent::Text("Selected response".into()),
+                ],
+                reasoning_details: Some(Arc::new(serde_json::json!({"phase": "final_answer"}))),
+                ..Default::default()
+            })),
+            Arc::new(crate::Message::Resume),
+        ];
+        database
+            .save_thread(source_id.clone(), source, PathList::default())
+            .await
+            .expect("save source");
+        let source = database
+            .load_thread(source_id.clone())
+            .await
+            .expect("load source")
+            .expect("source exists");
+        let branch = source
+            .branch_at_message(&acp_v2::MessageId::new("native-message-1-2"))
+            .expect("branch");
+        let expected_messages = branch.messages.clone();
+        database
+            .save_thread(branch_id.clone(), branch, PathList::default())
+            .await
+            .expect("save branch");
+        let restored = database
+            .load_thread(branch_id.clone())
+            .await
+            .expect("load branch")
+            .expect("branch exists");
+        assert_eq!(restored.messages, expected_messages);
+        let model = restored.model.expect("saved model");
+        assert_eq!(model.provider, "provider");
+        assert_eq!(model.model, "model");
+        assert_eq!(
+            restored.profile,
+            Some(AgentProfileId("branch-profile".into()))
+        );
+        assert_eq!(restored.speed, Some(Speed::Fast));
+        assert!(restored.thinking_enabled);
+        assert_eq!(restored.thinking_effort.as_deref(), Some("high"));
+        assert!(restored.subagent_context.is_none());
+        assert_eq!(restored.permission_tier, Default::default());
+        assert_eq!(restored.sandbox_grants, DbSandboxGrants::default());
+        let metadata = database.list_threads().await.expect("list threads");
+        assert!(
+            metadata
+                .iter()
+                .any(|entry| entry.id == branch_id && entry.parent_session_id.is_none())
+        );
+        let original = database
+            .load_thread(source_id.clone())
+            .await
+            .expect("reload source")
+            .expect("source exists");
+        assert_eq!(original.messages.len(), 3);
+        assert!(original.subagent_context.is_some());
+        assert!(original.sandbox_grants.unsandboxed);
+        database
+            .delete_thread(source_id)
+            .await
+            .expect("delete source");
+        assert!(
+            database
+                .load_thread(branch_id)
+                .await
+                .expect("load independent branch")
+                .is_some()
+        );
     }
 
     #[gpui::test]

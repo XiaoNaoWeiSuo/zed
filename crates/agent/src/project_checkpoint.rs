@@ -178,6 +178,7 @@ pub struct CheckpointGitSnapshot {
 }
 
 pub const AUTOMATIC_CHECKPOINT_SCOPE_PREFIX: &str = "@automatic/";
+pub const COMPACTION_CHECKPOINT_SCOPE_PREFIX: &str = "@compaction/";
 
 pub struct AutomaticCheckpoint {
     pub root: PathBuf,
@@ -190,6 +191,21 @@ pub struct AutomaticCheckpoint {
 
 impl AutomaticCheckpoint {
     pub fn save(self) -> Result<()> {
+        self.save_with_summary(None)
+    }
+
+    pub fn save_compaction(self, summary: String) -> Result<()> {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Ok(());
+        }
+        self.save_with_summary(Some(summary.to_owned()))
+    }
+
+    fn save_with_summary(self, summary: Option<String>) -> Result<()> {
+        if self.files.is_empty() && self.evidence.is_empty() && summary.is_none() {
+            return Ok(());
+        }
         ensure!(
             self.root.is_dir(),
             "Project root {} is unavailable",
@@ -211,7 +227,11 @@ impl AutomaticCheckpoint {
         }
         let checkpoint = ProjectCheckpoint {
             id: uuid::Uuid::new_v4().to_string(),
-            scope: format!("{AUTOMATIC_CHECKPOINT_SCOPE_PREFIX}{}", self.session_id),
+            scope: if summary.is_some() {
+                format!("{COMPACTION_CHECKPOINT_SCOPE_PREFIX}{}", self.session_id)
+            } else {
+                format!("{AUTOMATIC_CHECKPOINT_SCOPE_PREFIX}{}", self.session_id)
+            },
             session_id: self.session_id,
             created_at: Utc::now(),
             base_revision: self.git.as_ref().and_then(|git| git.revision.clone()),
@@ -219,7 +239,7 @@ impl AutomaticCheckpoint {
             git_scan_id: self.git.as_ref().map(|git| git.scan_id),
             completed: Vec::new(),
             remaining: Vec::new(),
-            decisions: Vec::new(),
+            decisions: summary.into_iter().map(|summary| format!("Harness-saved context compaction summary (historical model assessment, not verified completion):\n{summary}")).collect(),
             next_steps: Vec::new(),
             changed_files,
             evidence: self.evidence,
@@ -323,20 +343,41 @@ pub fn checkpoint_model_context(context: &str) -> String {
 }
 
 pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String>> {
+    load_checkpoint_context_for_session(roots, None)
+}
+
+pub fn load_checkpoint_context_for_session(
+    roots: &[CheckpointRoot],
+    session_id: Option<&str>,
+) -> Result<Option<String>> {
     let mut sections = Vec::new();
     for root in roots {
         let checkpoints =
             ProjectCheckpointStore::open_existing(&root.path).and_then(|store| match store {
-                Some(store) => Ok((
-                    store.latest_any()?,
-                    store.latest_automatic()?,
-                    store.list_scopes(0, 6)?,
-                )),
-                None => Ok((None, None, Vec::new())),
+                Some(store) => {
+                    if let Some(session_id) = session_id {
+                        Ok((
+                            store.latest_handoff_for_session(session_id)?,
+                            store.latest_observation_for_session(session_id)?,
+                            store.latest(&format!(
+                                "{COMPACTION_CHECKPOINT_SCOPE_PREFIX}{session_id}"
+                            ))?,
+                            store.list_scopes(0, 6)?,
+                        ))
+                    } else {
+                        Ok((
+                            store.latest_any()?,
+                            store.latest_automatic()?,
+                            None,
+                            store.list_scopes(0, 6)?,
+                        ))
+                    }
+                }
+                None => Ok((None, None, None, Vec::new())),
             });
-        let (checkpoint, interruption, scopes) = match checkpoints {
-            Ok((None, None, _)) => continue,
-            Ok((checkpoint, interruption, scopes)) => (checkpoint, interruption, scopes),
+        let (checkpoint, interruption, compaction, scopes) = match checkpoints {
+            Ok((None, None, None, _)) => continue,
+            Ok(records) => records,
             Err(error) => {
                 log::error!(
                     "Failed to load checkpoint for {}: {error:#}",
@@ -347,7 +388,17 @@ pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String
                 continue;
             }
         };
-        let Some(checkpoint) = checkpoint.or_else(|| interruption.clone()) else {
+        let checkpoint = checkpoint.filter(|record| {
+            !record.scope.starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX)
+                || !record.changed_files.is_empty()
+                || !record.evidence.is_empty()
+        });
+        let interruption = interruption
+            .filter(|record| !record.changed_files.is_empty() || !record.evidence.is_empty());
+        let Some(checkpoint) = checkpoint
+            .or_else(|| compaction.clone())
+            .or_else(|| interruption.clone())
+        else {
             continue;
         };
         if sections.len() >= 4 {
@@ -398,8 +449,18 @@ pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String
         let bounded_path =
             |path: &Path| path.to_string_lossy().chars().take(180).collect::<String>();
         let path_too_long = |path: &Path| path.to_string_lossy().chars().count() > 180;
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "root": root.path, "scope": checkpoint.scope, "created_at": checkpoint.created_at,
+            "record_kind": if checkpoint.scope.starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX) { "execution_observation" } else if checkpoint.scope.starts_with(COMPACTION_CHECKPOINT_SCOPE_PREFIX) { "context_compaction" } else { "task_handoff" },
+            "evidence_count": checkpoint.evidence.len(),
+            "historical_state": true,
+            "recent_context_compaction": compaction.as_ref().filter(|record| record.id != checkpoint.id).map(|record| serde_json::json!({
+                "scope": record.scope,
+                "created_at": record.created_at,
+                "record_kind": "context_compaction",
+                "summary": bounded(&record.decisions),
+                "summary_may_be_truncated": record.decisions.iter().any(|entry| entry.chars().count() > 180),
+            })),
             "available_scopes": scopes.iter().take(5).collect::<Vec<_>>(),
             "more_scopes_available": scopes.len() > 5,
             "completed": bounded(&checkpoint.completed), "remaining": bounded(&checkpoint.remaining),
@@ -423,6 +484,19 @@ pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String
                 "evidence": interruption.evidence.iter().take(5).map(|entry| serde_json::json!({"description": entry.description.chars().take(180).collect::<String>(), "source": entry.source.chars().take(240).collect::<String>()})).collect::<Vec<_>>(),
             })),
         });
+        if root.git.is_none() {
+            for field in [
+                "current_revision_changed",
+                "current_branch_changed",
+                "new_dirty_files",
+                "new_dirty_files_may_be_truncated",
+                "current_git_scan_id",
+            ] {
+                data.as_object_mut()
+                    .context("Checkpoint context must be an object")?
+                    .remove(field);
+            }
+        }
         sections.push(data);
     }
     if sections.is_empty() {
@@ -490,6 +564,9 @@ impl ProjectCheckpointStore {
         connection.exec(
             "CREATE INDEX IF NOT EXISTS checkpoints_scope_sequence ON checkpoints (scope, sequence DESC)",
         )?()?;
+        connection.exec(
+            "CREATE INDEX IF NOT EXISTS checkpoints_session_sequence ON checkpoints (session_id, sequence DESC)",
+        )?()?;
         Ok(Self { connection })
     }
 
@@ -524,9 +601,48 @@ impl ProjectCheckpointStore {
             .transpose()
     }
 
+    pub fn latest_for_session(&self, session_id: &str) -> Result<Option<ProjectCheckpoint>> {
+        let records = self.connection.select_bound::<String, String>(
+            "SELECT data FROM checkpoints WHERE session_id = ?1 ORDER BY sequence DESC LIMIT 1",
+        )?(session_id.to_string())?;
+        records
+            .into_iter()
+            .next()
+            .map(|data| serde_json::from_str(&data).context("Invalid checkpoint data"))
+            .transpose()
+    }
+
+    pub fn latest_handoff_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ProjectCheckpoint>> {
+        let records = self.connection.select_bound::<String, String>(
+            "SELECT data FROM checkpoints WHERE session_id = ?1 AND scope NOT GLOB '@automatic/*' AND scope NOT GLOB '@compaction/*' ORDER BY sequence DESC LIMIT 1",
+        )?(session_id.to_string())?;
+        records
+            .into_iter()
+            .next()
+            .map(|data| serde_json::from_str(&data).context("Invalid checkpoint data"))
+            .transpose()
+    }
+
+    pub fn latest_observation_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ProjectCheckpoint>> {
+        let records = self.connection.select_bound::<String, String>(
+            "SELECT data FROM checkpoints WHERE session_id = ?1 AND scope GLOB '@automatic/*' ORDER BY sequence DESC LIMIT 1",
+        )?(session_id.to_string())?;
+        records
+            .into_iter()
+            .next()
+            .map(|data| serde_json::from_str(&data).context("Invalid checkpoint data"))
+            .transpose()
+    }
+
     pub fn latest_any(&self) -> Result<Option<ProjectCheckpoint>> {
         let records = self.connection.select_bound::<(), String>(
-            "SELECT data FROM checkpoints WHERE scope NOT GLOB '@automatic/*' ORDER BY sequence DESC LIMIT 1",
+            "SELECT data FROM checkpoints WHERE scope NOT GLOB '@automatic/*' AND scope NOT GLOB '@compaction/*' ORDER BY sequence DESC LIMIT 1",
         )?(())?;
         records
             .into_iter()
@@ -551,9 +667,21 @@ impl ProjectCheckpointStore {
             .collect()
     }
 
+    pub fn list_history(&self, offset: usize, limit: usize) -> Result<Vec<ProjectCheckpoint>> {
+        let offset = i64::try_from(offset).context("Checkpoint offset is too large")?;
+        let limit = i64::try_from(limit).context("Checkpoint limit is too large")?;
+        let records = self.connection.select_bound::<(i64, i64), String>(
+            "SELECT data FROM checkpoints ORDER BY sequence DESC LIMIT ?1 OFFSET ?2",
+        )?((limit, offset))?;
+        records
+            .into_iter()
+            .map(|data| serde_json::from_str(&data).context("Invalid checkpoint data"))
+            .collect()
+    }
+
     pub fn latest_automatic(&self) -> Result<Option<ProjectCheckpoint>> {
         let records = self.connection.select_bound::<(), String>(
-            "SELECT data FROM checkpoints AS interruption WHERE scope GLOB '@automatic/*' AND sequence > COALESCE((SELECT MAX(sequence) FROM checkpoints AS handoff WHERE handoff.scope NOT GLOB '@automatic/*' AND handoff.session_id = interruption.session_id), 0) ORDER BY sequence DESC LIMIT 1",
+            "SELECT data FROM checkpoints AS interruption WHERE scope GLOB '@automatic/*' AND sequence > COALESCE((SELECT MAX(sequence) FROM checkpoints AS handoff WHERE handoff.scope NOT GLOB '@automatic/*' AND handoff.scope NOT GLOB '@compaction/*' AND handoff.session_id = interruption.session_id), 0) ORDER BY sequence DESC LIMIT 1",
         )?(())?;
         records
             .into_iter()
@@ -566,6 +694,32 @@ impl ProjectCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_automatic_checkpoints_do_not_create_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for summary in [None, Some(" \n ".to_owned())] {
+            let checkpoint = AutomaticCheckpoint {
+                root: root.path().to_path_buf(),
+                session_id: "session".into(),
+                files: BTreeMap::new(),
+                git: None,
+                evidence: Vec::new(),
+                interrupted: true,
+            };
+            match summary {
+                Some(summary) => checkpoint.save_compaction(summary)?,
+                None => checkpoint.save()?,
+            }
+        }
+        assert!(
+            !root
+                .path()
+                .join(paths::local_settings_folder_name())
+                .exists()
+        );
+        Ok(())
+    }
 
     #[test]
     fn checkpoints_persist_per_scope_and_reject_duplicate_ids() -> Result<()> {
@@ -599,8 +753,107 @@ mod tests {
         store.save(&checkpoint)?;
         drop(store);
         let reopened = ProjectCheckpointStore::open(root.path())?;
-        assert_eq!(reopened.latest("agent")?, Some(checkpoint));
+        assert_eq!(reopened.latest("agent")?, Some(checkpoint.clone()));
+        assert_eq!(
+            reopened.latest_for_session("session")?,
+            Some(checkpoint.clone())
+        );
+        let session_handoff = checkpoint.clone();
+        checkpoint.id = "unrelated".into();
+        checkpoint.session_id = "another-session".into();
+        checkpoint.remaining = vec!["Unrelated task".into()];
+        reopened.save(&checkpoint)?;
+        let context = load_checkpoint_context_for_session(
+            &[CheckpointRoot {
+                path: root.path().to_path_buf(),
+                git: None,
+            }],
+            Some("session"),
+        )?
+        .context("session handoff")?;
+        assert!(!context.contains("Unrelated task"));
+        assert!(context.contains("Verify"));
+        assert!(
+            load_checkpoint_context_for_session(
+                &[CheckpointRoot {
+                    path: root.path().to_path_buf(),
+                    git: None,
+                }],
+                Some("new-session")
+            )?
+            .is_none()
+        );
         assert_eq!(reopened.latest("other")?, None);
+        AutomaticCheckpoint {
+            root: root.path().to_path_buf(),
+            session_id: "session".into(),
+            files: BTreeMap::new(),
+            git: None,
+            evidence: Vec::new(),
+            interrupted: false,
+        }
+        .save()?;
+        assert!(
+            reopened
+                .latest_observation_for_session("session")?
+                .is_none()
+        );
+        AutomaticCheckpoint {
+            root: root.path().to_path_buf(),
+            session_id: "session".into(),
+            files: BTreeMap::new(),
+            git: None,
+            evidence: Vec::new(),
+            interrupted: false,
+        }
+        .save_compaction("Decision: preserve task state".into())?;
+        assert_eq!(
+            reopened.latest_handoff_for_session("session")?,
+            Some(session_handoff)
+        );
+        assert_eq!(reopened.latest("agent")?, Some(checkpoint.clone()));
+        assert_eq!(
+            reopened.latest_handoff_for_session("another-session")?,
+            Some(checkpoint)
+        );
+        let compaction = reopened
+            .latest("@compaction/session")?
+            .context("compaction summary")?;
+        assert!(
+            compaction
+                .decisions
+                .iter()
+                .any(|entry| entry.contains("Decision: preserve task state"))
+        );
+        assert!(compaction.completed.is_empty());
+        AutomaticCheckpoint {
+            root: root.path().to_path_buf(),
+            session_id: "session".into(),
+            files: BTreeMap::new(),
+            git: None,
+            evidence: vec![CheckpointEvidence {
+                description: "terminal result".into(),
+                source: "session:session/tool:one".into(),
+                observed_at: None,
+                revision: None,
+                digest: None,
+            }],
+            interrupted: true,
+        }
+        .save()?;
+        let combined = load_checkpoint_context_for_session(
+            &[CheckpointRoot {
+                path: root.path().to_path_buf(),
+                git: None,
+            }],
+            Some("session"),
+        )?
+        .context("combined state")?;
+        assert!(combined.contains("Decision: preserve task state"));
+        assert!(combined.contains("Verify"));
+        assert!(combined.contains("recent_context_compaction"));
+        assert!(combined.contains("recent_automatic_checkpoint"));
+        assert!(combined.contains("terminal result"));
         assert!(root.path().join(".lin/checkpoints.sqlite3").exists());
         Ok(())
     }
@@ -859,6 +1112,32 @@ mod tests {
         later_handoff.session_id = "second".into();
         store.save(&later_handoff)?;
         assert!(store.latest_automatic()?.is_none());
+        let session_context = load_checkpoint_context_for_session(
+            &[CheckpointRoot {
+                path: root.path().to_path_buf(),
+                git: None,
+            }],
+            Some("second"),
+        )?
+        .context("session context")?;
+        let session_context: serde_json::Value = serde_json::from_str(&session_context)?;
+
+        assert!(session_context[0].get("current_revision_changed").is_none());
+        assert!(session_context[0].get("new_dirty_files").is_none());
+        assert!(session_context[0].get("current_git_scan_id").is_none());
+        let scopes = session_context[0]["available_scopes"]
+            .as_array()
+            .context("a session that can retrieve on demand must list the readable scopes")?;
+        assert!(
+            !scopes.is_empty(),
+            "available_scopes must carry retrieval hints, otherwise on-demand lookup has no entry point"
+        );
+        assert!(
+            scopes.iter().all(|scope| !scope["scope"]
+                .as_str()
+                .is_some_and(|scope| scope.starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX))),
+            "observation records stay out of the scope index: {scopes:?}"
+        );
         Ok(())
     }
 
