@@ -7,15 +7,26 @@ use language_model::LanguageModelProviderId;
 use serde::{Deserialize, Serialize};
 
 const METRICS_KEY_PREFIX: &str = "agent-metrics/";
+/// Persisted snapshots from before decode-rate tracking used a different
+/// algorithm; filter their implausible values without capping new ones.
+pub const METRICS_VERSION: u32 = 2;
+const LEGACY_MAX_TOKENS_PER_SECOND: f32 = 5_000.0;
+/// A persisted rate above this can only come from corrupt data, not a real
+/// generation speed. This is not a performance cap.
+const MAX_PERSISTED_TOKENS_PER_SECOND: f32 = 1_000_000.0;
 
 /// Metrics for the most recent completion request in one agent session.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentMetricsSnapshot {
+    #[serde(default)]
+    pub version: u32,
     pub running: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
     /// Fraction of input tokens served from the provider's prompt cache.
     pub cache_hit_rate: Option<f32>,
+    /// Output tokens per second after the first token, excluding time to first
+    /// token and including reasoning tokens.
     pub tokens_per_second: Option<f32>,
     pub time_to_first_token_ms: Option<u64>,
     pub context_used_tokens: Option<u64>,
@@ -79,12 +90,14 @@ impl AgentRunMetrics {
                     return;
                 };
                 snapshot.running = false;
-                // Older builds could persist an absurd throughput derived from
-                // character estimates. Drop it rather than showing bad data.
-                if snapshot
-                    .tokens_per_second
-                    .is_some_and(|rate| !rate.is_finite() || rate > 5_000.0)
-                {
+                let has_corrupt_rate = snapshot.tokens_per_second.is_some_and(|rate| {
+                    !rate.is_finite() || rate <= 0.0 || rate > MAX_PERSISTED_TOKENS_PER_SECOND
+                });
+                let has_legacy_rate = snapshot.version < METRICS_VERSION
+                    && snapshot
+                        .tokens_per_second
+                        .is_some_and(|rate| rate > LEGACY_MAX_TOKENS_PER_SECOND);
+                if has_corrupt_rate || has_legacy_rate {
                     snapshot.tokens_per_second = None;
                 }
                 this.update(cx, |this, cx| {

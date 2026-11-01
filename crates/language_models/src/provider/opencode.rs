@@ -13,7 +13,8 @@ use language_model::{
     LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelToolChoiceSupport, ModelRateLimiters, ProviderSettingsView,
-    ReasoningEffort, SubPageProviderSettings, env_var, unavailable_error,
+    ProviderUsage, ProviderUsageWindow, ReasoningEffort, SubPageProviderSettings, env_var,
+    unavailable_error,
 };
 use opencode::catalog::{DiscoveredModel, MODEL_CATALOG_URL as RICH_MODEL_CATALOG_URL};
 use opencode::{ApiProtocol, OPENCODE_API_URL, OpenCodeSubscription};
@@ -533,6 +534,25 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
             .update(cx, |state, cx| state.restart_fetch_models_task(cx));
     }
 
+    fn usage(&self, cx: &mut App) -> Task<Option<ProviderUsage>> {
+        let api_url = Self::api_url(cx);
+        let Some(api_key) = self.state.read(cx).api_key_state.key(&api_url) else {
+            return Task::ready(None);
+        };
+        let http_client = self.http_client.clone();
+        let usage_url = format!("{}/go/v1/usage", api_url.trim_end_matches('/'));
+        cx.background_spawn(async move {
+            match fetch_go_usage(http_client, api_key, &usage_url).await {
+                Ok(usage) => Some(usage),
+                Err(error) => {
+                    // A key without a Go subscription receives 403, which is not an error worth surfacing.
+                    log::debug!("failed to fetch OpenCode Go usage: {error:#}");
+                    None
+                }
+            }
+        })
+    }
+
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.clone();
         Some(ProviderSettingsView::SubPage(
@@ -755,6 +775,82 @@ async fn fetch_catalog_resource(client: &dyn HttpClient, url: &str) -> Result<St
         .read_to_string(&mut body)
         .await?;
     Ok(body)
+}
+
+async fn fetch_go_usage(
+    client: Arc<dyn HttpClient>,
+    api_key: Arc<str>,
+    url: &str,
+) -> Result<ProviderUsage> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Accept", "application/json");
+    let mut response = client
+        .send(request.body(AsyncBody::empty())?)
+        .await
+        .with_context(|| format!("requesting OpenCode Go usage at {url}"))?;
+    let status = response.status();
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    if !status.is_success() {
+        bail!(
+            "OpenCode Go usage request returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        );
+    }
+    parse_go_usage(&body)
+}
+
+fn parse_go_usage(body: &str) -> Result<ProviderUsage> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        usage: Windows,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Windows {
+        rolling: Window,
+        weekly: Window,
+        monthly: Window,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Window {
+        status: String,
+        percent: f32,
+        #[serde(rename = "resetsAt")]
+        resets_at: Option<String>,
+    }
+
+    let response: Response = serde_json::from_str(body)?;
+    let windows = [
+        ("5h", response.usage.rolling),
+        ("Weekly", response.usage.weekly),
+        ("Monthly", response.usage.monthly),
+    ]
+    .into_iter()
+    .map(|(label, window)| ProviderUsageWindow {
+        label: label.to_string(),
+        // A rate-limited window has no useful percentage to show, so pin it to fully used.
+        used_percent: if window.status == "rate-limited" {
+            100.0
+        } else {
+            window.percent.clamp(0.0, 100.0)
+        },
+        resets_at_unix: window
+            .resets_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp()),
+    })
+    .collect();
+
+    Ok(ProviderUsage {
+        balance: None,
+        windows,
+    })
 }
 
 struct ConfigurationView {
@@ -1198,6 +1294,62 @@ mod tests {
         });
 
         store_task.await.unwrap();
+    }
+
+    #[test]
+    fn test_parse_go_usage_windows() {
+        let usage = parse_go_usage(
+            r#"{
+                "usage": {
+                    "rolling": {"status":"ok","percent":12.5,"resetsAt":"2026-11-01T20:09:06.000Z"},
+                    "weekly": {"status":"rate-limited","percent":99,"resetsAt":"2026-11-02T00:00:00.000Z"},
+                    "monthly": {"status":"ok","percent":100,"resetsAt":"2026-12-01T14:36:49.000Z"}
+                }
+            }"#,
+        )
+        .expect("valid usage response");
+
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .map(|window| window.label.as_str())
+                .collect::<Vec<_>>(),
+            ["5h", "Weekly", "Monthly"]
+        );
+        assert_eq!(usage.windows[0].used_percent, 12.5);
+        assert_eq!(usage.windows[1].used_percent, 100.0);
+        assert_eq!(usage.windows[2].used_percent, 100.0);
+        assert_eq!(
+            usage.windows[0].resets_at_unix,
+            chrono::DateTime::parse_from_rfc3339("2026-11-01T20:09:06.000Z")
+                .ok()
+                .map(|value| value.timestamp())
+        );
+    }
+
+    #[test]
+    fn test_fetch_go_usage_sends_bearer_key() {
+        let client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/zen/go/v1/usage");
+            assert_eq!(
+                request.headers().get("authorization"),
+                Some(&http::HeaderValue::from_static("Bearer test-key"))
+            );
+            Ok(Response::builder().status(200).body(AsyncBody::from(
+                r#"{"usage":{"rolling":{"status":"ok","percent":1,"resetsAt":"2026-11-01T20:09:06.000Z"},"weekly":{"status":"ok","percent":0,"resetsAt":"2026-11-02T00:00:00.000Z"},"monthly":{"status":"ok","percent":0,"resetsAt":"2026-12-01T14:36:49.000Z"}}}"#,
+            ))?)
+        });
+
+        let usage = futures::executor::block_on(fetch_go_usage(
+            client,
+            "test-key".into(),
+            "https://opencode.ai/zen/go/v1/usage",
+        ))
+        .expect("usage response");
+
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.windows[0].used_percent, 1.0);
     }
 
     #[test]

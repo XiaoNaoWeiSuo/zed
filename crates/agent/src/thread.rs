@@ -1523,7 +1523,6 @@ pub struct Thread {
     /// the start of each request.
     current_request_token_usage: TokenUsage,
     request_started_at: Option<Instant>,
-    first_token_at: Option<Instant>,
     throughput: TokenThroughput,
     last_metrics_publish: Option<Instant>,
     permission_tier: Rc<PermissionTierState>,
@@ -1567,73 +1566,83 @@ pub struct Thread {
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
 }
 
-/// Tracks provider-reported output tokens over time.
+/// Measures decode throughput from streamed token timestamps and
+/// provider-reported usage.
 ///
-/// Providers may send a single usage snapshot at the end of a request, and
-/// some send none until after the last event. Measuring `tokens / time since
-/// first token` therefore produces impossible rates when the first token and
-/// the usage snapshot arrive together. This tracker measures deltas between
-/// consecutive usage reports, falls back to the whole request duration, and
-/// rejects implausible samples.
+/// Providers report usage at different cadences, often only once at the end,
+/// so token counts alone cannot distinguish time to first token from decode
+/// time. Tracking the first and last streamed token lets the rate exclude time
+/// to first token and use provider-reported output tokens.
 #[derive(Default)]
 struct TokenThroughput {
     started_at: Option<Instant>,
-    last_sample_at: Option<Instant>,
-    last_tokens: u64,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
+    tokens: u64,
     rate: Option<f32>,
 }
 
 impl TokenThroughput {
-    const MAX_PLAUSIBLE_TOKENS_PER_SECOND: f32 = 5_000.0;
+    /// Below this, provider chunks were batched too tightly for the interval to
+    /// measure a decode rate rather than event-loop scheduling noise.
+    const MIN_DECODE_DURATION: Duration = Duration::from_millis(10);
 
     fn start(&mut self, started_at: Instant) {
         self.started_at = Some(started_at);
-        self.last_sample_at = None;
-        self.last_tokens = 0;
+        self.first_token_at = None;
+        self.last_token_at = None;
+        self.tokens = 0;
         self.rate = None;
     }
 
-    fn record(&mut self, tokens: u64, now: Instant) -> Option<f32> {
-        let started_at = self.started_at.unwrap_or(now);
-        if tokens < self.last_tokens {
-            // A new request (or a provider that resets its counter) starts a
-            // fresh measurement window.
-            self.last_tokens = 0;
-            self.last_sample_at = Some(started_at);
+    fn record_token(&mut self, now: Instant) {
+        self.started_at.get_or_insert(now);
+        self.first_token_at.get_or_insert(now);
+        self.last_token_at = Some(now);
+    }
+
+    fn record_usage(&mut self, tokens: u64) -> Option<f32> {
+        if tokens < self.tokens {
+            // A provider reset its counter; treat this as a fresh window.
+            self.first_token_at = None;
+            self.last_token_at = None;
+            self.rate = None;
         }
-        let delta = tokens.saturating_sub(self.last_tokens);
-        self.last_tokens = tokens.max(self.last_tokens);
-        if delta == 0 {
+        self.tokens = tokens;
+
+        let (Some(first_token), Some(last_token)) = (self.first_token_at, self.last_token_at)
+        else {
+            return self.rate;
+        };
+        let elapsed = last_token.saturating_duration_since(first_token);
+        if elapsed < Self::MIN_DECODE_DURATION {
             return self.rate;
         }
 
-        let sample_elapsed = self
-            .last_sample_at
-            .map_or_else(
-                || now.duration_since(started_at),
-                |last| now.duration_since(last),
-            )
-            .as_secs_f32();
-        self.last_sample_at = Some(now);
-
-        let mut sample_rate = delta as f32 / sample_elapsed.max(0.2);
-        if sample_rate > Self::MAX_PLAUSIBLE_TOKENS_PER_SECOND {
-            let total_elapsed = now.duration_since(started_at).as_secs_f32();
-            sample_rate = self.last_tokens as f32 / total_elapsed.max(0.2);
-        }
-        if sample_rate <= 0.0 || sample_rate > Self::MAX_PLAUSIBLE_TOKENS_PER_SECOND {
+        // The first token arrives at the start of the interval; only subsequent
+        // tokens were decoded during it.
+        let decoded_tokens = self.tokens.saturating_sub(1);
+        if decoded_tokens == 0 {
             return self.rate;
         }
-
-        self.rate = Some(match self.rate {
-            Some(previous) => previous * 0.6 + sample_rate * 0.4,
-            None => sample_rate,
-        });
+        let rate = decoded_tokens as f32 / elapsed.as_secs_f32();
+        if rate.is_finite() {
+            self.rate = Some(rate);
+        }
         self.rate
     }
 
     fn rate(&self) -> Option<f32> {
         self.rate
+    }
+
+    fn first_token_at(&self) -> Option<Instant> {
+        self.first_token_at
+    }
+
+    fn time_to_first_token(&self, request_started_at: Option<Instant>) -> Option<Duration> {
+        let started_at = request_started_at.or(self.started_at)?;
+        self.first_token_at?.checked_duration_since(started_at)
     }
 }
 
@@ -1807,7 +1816,6 @@ impl Thread {
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
-            first_token_at: None,
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(Default::default())),
@@ -2236,7 +2244,6 @@ impl Thread {
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
             request_started_at: None,
-            first_token_at: None,
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(db_thread.permission_tier)),
@@ -4258,9 +4265,9 @@ impl Thread {
                 }
                 let request = this.build_completion_request(intent, cx)?;
                 this.current_request_token_usage = TokenUsage::default();
-                this.request_started_at = Some(Instant::now());
-                this.first_token_at = None;
-                this.throughput.start(Instant::now());
+                let request_started_at = Instant::now();
+                this.request_started_at = Some(request_started_at);
+                this.throughput.start(request_started_at);
                 this.last_metrics_publish = None;
                 anyhow::Ok((model, provider, request))
             })??;
@@ -4933,14 +4940,21 @@ impl Thread {
         })
     }
 
-    /// A helper method that's called on every streamed completion event.
-    /// Returns an optional tool result task, which the main agentic loop will
-    /// send back to the model when it resolves.
-    fn note_first_token(&mut self, cx: &mut Context<Self>) {
-        if self.first_token_at.is_none() {
-            self.first_token_at = Some(Instant::now());
+    /// Records that a streamed token arrived and publishes the first one so the
+    /// UI can show time to first token immediately.
+    fn note_token(&mut self, cx: &mut Context<Self>) {
+        let is_first_token = self.throughput.first_token_at().is_none();
+        self.throughput.record_token(Instant::now());
+        if is_first_token {
             self.publish_run_metrics(cx, true);
         }
+    }
+
+    /// Recomputes the decode rate after the final token, so a usage event that
+    /// arrived before the last streamed chunk cannot shorten the interval.
+    fn finalize_throughput(&mut self) {
+        self.throughput
+            .record_usage(self.current_request_token_usage.output_tokens);
     }
 
     /// Publishes metrics often enough to feel live while avoiding a UI
@@ -4961,14 +4975,13 @@ impl Thread {
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
         let tokens_per_second = self.throughput.rate();
-        let time_to_first_token_ms = match (self.request_started_at, self.first_token_at) {
-            (Some(started), Some(first_token)) => {
-                Some(first_token.duration_since(started).as_millis() as u64)
-            }
-            _ => None,
-        };
+        let time_to_first_token_ms = self
+            .throughput
+            .time_to_first_token(self.request_started_at)
+            .map(|duration| duration.as_millis() as u64);
 
         let mut snapshot = crate::run_metrics::AgentMetricsSnapshot {
+            version: crate::run_metrics::METRICS_VERSION,
             running,
             provider: self.model().map(|model| model.provider_id().to_string()),
             model: self.model().map(|model| model.name().0.to_string()),
@@ -5022,12 +5035,12 @@ impl Thread {
                 self.pending_message = Some(AgentMessage::default());
             }
             Text(new_text) => {
-                self.note_first_token(cx);
+                self.note_token(cx);
                 self.note_stream_activity(cx);
                 self.handle_text_event(new_text, event_stream)
             }
             Thinking { text, signature } => {
-                self.note_first_token(cx);
+                self.note_token(cx);
                 self.note_stream_activity(cx);
                 self.handle_thinking_event(text, signature, event_stream)
             }
@@ -5057,7 +5070,7 @@ impl Thread {
                 }
             }
             ToolUse(tool_use) => {
-                self.note_first_token(cx);
+                self.note_token(cx);
                 return Ok(self.handle_tool_use_event(tool_use, event_stream, cancellation_rx, cx));
             }
             ToolUseJsonParseError {
@@ -5096,18 +5109,22 @@ impl Thread {
                     telemetry.emit("succeeded", None, Some(total_input_tokens(usage)));
                 }
                 self.update_token_usage(usage, cx);
-                self.throughput.record(usage.output_tokens, Instant::now());
+                self.throughput
+                    .record_usage(self.current_request_token_usage.output_tokens);
                 self.publish_run_metrics(cx, true);
             }
             Stop(StopReason::Refusal) => {
+                self.finalize_throughput();
                 self.publish_run_metrics(cx, false);
                 return Err(CompletionError::Refusal.into());
             }
             Stop(StopReason::MaxTokens) => {
+                self.finalize_throughput();
                 self.publish_run_metrics(cx, false);
                 return Err(CompletionError::MaxTokens.into());
             }
             Stop(StopReason::ToolUse | StopReason::EndTurn) => {
+                self.finalize_throughput();
                 self.publish_run_metrics(cx, false);
             }
             Started => {
@@ -12040,46 +12057,82 @@ mod throughput_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn computes_rate_from_usage_deltas() {
+    fn computes_decode_rate_after_first_token() {
         let started = Instant::now();
         let mut throughput = TokenThroughput::default();
         throughput.start(started);
+        throughput.record_token(started + Duration::from_secs(2));
+        throughput.record_token(started + Duration::from_secs(3));
 
+        assert_eq!(throughput.record_usage(1_000), Some(999.0));
         assert_eq!(
-            throughput.record(1_000, started + Duration::from_secs(2)),
-            Some(500.0)
-        );
-        assert_eq!(
-            throughput.record(2_000, started + Duration::from_secs(3)),
-            Some(700.0)
-        );
-        assert_eq!(
-            throughput.record(2_000, started + Duration::from_secs(4)),
-            Some(700.0)
+            throughput.time_to_first_token(Some(started)),
+            Some(Duration::from_secs(2))
         );
     }
 
     #[test]
-    fn ignores_implausible_samples() {
+    fn reports_latest_cumulative_rate_without_smoothing() {
         let started = Instant::now();
         let mut throughput = TokenThroughput::default();
         throughput.start(started);
+        throughput.record_token(started + Duration::from_secs(1));
+        throughput.record_token(started + Duration::from_secs(2));
+        throughput.record_token(started + Duration::from_secs(3));
 
-        assert_eq!(
-            throughput.record(100_000, started + Duration::from_millis(100)),
-            None
-        );
+        assert_eq!(throughput.record_usage(1_000), Some(499.5));
+
+        throughput.record_token(started + Duration::from_secs(4));
+        let rate = throughput.record_usage(2_000).expect("decode rate");
+        assert!((rate - 1999.0 / 3.0).abs() < 0.001, "rate was {rate}");
     }
 
     #[test]
-    fn falls_back_to_request_duration_for_a_single_late_sample() {
+    fn high_frequency_usage_updates_are_not_clamped() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+        for millis in (5..=100).step_by(5) {
+            throughput.record_token(started + Duration::from_millis(millis));
+        }
+
+        let rate = throughput.record_usage(1_000).expect("decode rate");
+        assert!(rate > 10_000.0, "rate was {rate}");
+    }
+
+    #[test]
+    fn does_not_report_end_to_end_time_as_decode_rate() {
         let started = Instant::now();
         let mut throughput = TokenThroughput::default();
         throughput.start(started);
 
-        assert_eq!(
-            throughput.record(2_000, started + Duration::from_secs(4)),
-            Some(500.0)
-        );
+        assert_eq!(throughput.record_usage(2_000), None);
+    }
+
+    #[test]
+    fn resets_when_a_provider_restarts_its_counter() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+        throughput.record_token(started + Duration::from_secs(1));
+        throughput.record_token(started + Duration::from_secs(2));
+        assert_eq!(throughput.record_usage(1_000), Some(999.0));
+
+        assert_eq!(throughput.record_usage(10), None);
+
+        throughput.record_token(started + Duration::from_secs(3));
+        throughput.record_token(started + Duration::from_secs(4));
+        assert_eq!(throughput.record_usage(100), Some(99.0));
+    }
+
+    #[test]
+    fn ignores_intervals_shorter_than_the_measurement_floor() {
+        let started = Instant::now();
+        let mut throughput = TokenThroughput::default();
+        throughput.start(started);
+        throughput.record_token(started + Duration::from_secs(1));
+        throughput.record_token(started + Duration::from_secs(1) + Duration::from_millis(5));
+
+        assert_eq!(throughput.record_usage(1_000), None);
     }
 }

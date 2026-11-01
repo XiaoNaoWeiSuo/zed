@@ -5,7 +5,9 @@ use chrono::TimeZone as _;
 use gpui::{
     Context, Entity, PathBuilder, Pixels, Render, Subscription, Task, Window, canvas, point, px,
 };
-use language_model::{LanguageModelProviderId, LanguageModelRegistry, ProviderUsage};
+use language_model::{
+    LanguageModelProviderId, LanguageModelRegistry, ProviderUsage, ProviderUsageWindow,
+};
 use ui::{Tooltip, prelude::*};
 
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -15,10 +17,12 @@ pub struct AgentUsageIndicator {
     metrics: Entity<AgentRunMetrics>,
     usage: Option<ProviderUsage>,
     usage_provider: Option<LanguageModelProviderId>,
+    usage_model: Option<String>,
     last_usage_fetch: Option<Instant>,
     fetch_task: Option<Task<()>>,
     ring_hovered: bool,
     pie_hovered: bool,
+    opencode_hovered: bool,
     _metrics_subscription: Subscription,
     _refresh_task: Task<()>,
 }
@@ -44,32 +48,46 @@ impl AgentUsageIndicator {
             metrics,
             usage: None,
             usage_provider: None,
+            usage_model: None,
             last_usage_fetch: None,
             fetch_task: None,
             ring_hovered: false,
             pie_hovered: false,
+            opencode_hovered: false,
             _metrics_subscription,
             _refresh_task,
         }
     }
 
     fn refresh_usage(&mut self, cx: &mut Context<Self>) {
-        let (running, provider_id) = {
+        let (running, provider_id, model) = {
             let metrics = self.metrics.read(cx);
             metrics
                 .active_snapshot()
-                .map(|snapshot| (snapshot.running, snapshot.provider_id()))
-                .unwrap_or((false, None))
+                .map(|snapshot| {
+                    (
+                        snapshot.running,
+                        snapshot.provider_id(),
+                        snapshot.model.clone(),
+                    )
+                })
+                .unwrap_or((false, None, None))
         };
         let Some(provider_id) = provider_id else {
             return;
         };
 
         let provider_changed = self.usage_provider.as_ref() != Some(&provider_id);
-        if !running && !provider_changed {
+        // OpenCode reports Go and Zen through the same provider id, so the model tells them apart.
+        let model_changed = provider_id.0.as_ref() == "opencode" && self.usage_model != model;
+        // OpenCode's usage endpoint is cheap and its windows move with every request, so keep it
+        // fresh while idle instead of waiting for the next run or a provider switch.
+        let refresh_opencode_idle = provider_id.0.as_ref() == "opencode" && self.usage.is_some();
+        if !running && !provider_changed && !model_changed && !refresh_opencode_idle {
             return;
         }
         let cache_is_fresh = !provider_changed
+            && !model_changed
             && self
                 .last_usage_fetch
                 .is_some_and(|fetched| fetched.elapsed() < USAGE_REFRESH_INTERVAL);
@@ -80,11 +98,12 @@ impl AgentUsageIndicator {
         let Some(provider) = LanguageModelRegistry::read_global(cx).provider(&provider_id) else {
             return;
         };
-        if provider_changed {
+        if provider_changed || model_changed {
             self.usage = None;
         }
         let usage_task = provider.usage(cx);
         self.usage_provider = Some(provider_id);
+        self.usage_model = model;
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let usage = usage_task.await;
             this.update(cx, |this, cx| {
@@ -95,6 +114,7 @@ impl AgentUsageIndicator {
                 } else {
                     // Retry later instead of caching a transient failure.
                     this.usage_provider = None;
+                    this.usage_model = None;
                     this.last_usage_fetch = None;
                 }
                 cx.notify();
@@ -255,6 +275,115 @@ impl AgentUsageIndicator {
         gauge.into_any_element()
     }
 
+    fn render_opencode_gauge(
+        &self,
+        windows: &[ProviderUsageWindow],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let five_hour = windows.iter().find(|window| window.label == "5h");
+        let weekly = windows.iter().find(|window| window.label == "Weekly");
+        let monthly = windows.iter().find(|window| window.label == "Monthly");
+        let five_hour_remaining = Self::remaining_fraction(five_hour);
+        let weekly_remaining = Self::remaining_fraction(weekly);
+        let monthly_remaining = Self::remaining_fraction(monthly);
+
+        let mut tooltip = String::from("OpenCode Go");
+        for (label, window) in [("5h", five_hour), ("Weekly", weekly), ("Monthly", monthly)] {
+            tooltip.push('\n');
+            let Some(window) = window else {
+                tooltip.push_str(&format!("{label} · unavailable"));
+                continue;
+            };
+            tooltip.push_str(&format!(
+                "{label} · {:.1}% remaining",
+                (100.0 - window.used_percent).max(0.0)
+            ));
+            if let Some(reset) = Self::reset_label(window.resets_at_unix) {
+                tooltip.push('\n');
+                tooltip.push_str(&reset);
+            }
+        }
+
+        let hovered = self.opencode_hovered;
+        let monthly_color = Self::limit_color(monthly_remaining);
+        let weekly_color = Self::limit_color(weekly_remaining);
+        let five_hour_color = Self::limit_color(five_hour_remaining);
+
+        let gauge = canvas(
+            move |bounds, _, cx| {
+                let width = f32::from(bounds.size.width);
+                let center = point(
+                    bounds.origin.x + px(width / 2.0),
+                    bounds.origin.y + px(width / 2.0),
+                );
+                let ring_stroke_width = if hovered { 1.9 } else { 1.5 };
+                let outer_radius = (width - 4.0) / 2.0;
+                let middle_radius = (outer_radius - 3.0).max(ring_stroke_width / 2.0);
+                let pie_radius = 3.0;
+                let track_color = cx.theme().colors().border.opacity(0.5);
+                let pie_track_color = cx.theme().colors().border.opacity(0.45);
+
+                let paths = [
+                    arc_path(center, outer_radius, ring_stroke_width, 0.0, 360.0),
+                    arc_path(
+                        center,
+                        outer_radius,
+                        ring_stroke_width,
+                        -90.0,
+                        360.0 * monthly_remaining,
+                    ),
+                    arc_path(center, middle_radius, ring_stroke_width, 0.0, 360.0),
+                    arc_path(
+                        center,
+                        middle_radius,
+                        ring_stroke_width,
+                        -90.0,
+                        360.0 * weekly_remaining,
+                    ),
+                    pie_path(center, pie_radius, 0.0, 360.0),
+                    pie_path(center, pie_radius, -90.0, 360.0 * five_hour_remaining),
+                ];
+                let colors = [
+                    track_color,
+                    monthly_color.color(cx),
+                    track_color,
+                    weekly_color.color(cx),
+                    pie_track_color,
+                    five_hour_color
+                        .color(cx)
+                        .opacity(if hovered { 1.0 } else { 0.75 }),
+                ];
+                (paths, colors)
+            },
+            |_bounds, (paths, colors), window, _| {
+                for (path, color) in paths.into_iter().zip(colors) {
+                    if let Some(path) = path {
+                        window.paint_path(path, color);
+                    }
+                }
+            },
+        )
+        .size(px(20.));
+
+        div()
+            .id("opencode-gauge")
+            .relative()
+            .size(px(20.))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                this.opencode_hovered = *hovered;
+                cx.notify();
+            }))
+            .tooltip(Tooltip::text(tooltip))
+            .child(gauge)
+            .into_any_element()
+    }
+
+    fn remaining_fraction(window: Option<&ProviderUsageWindow>) -> f32 {
+        window
+            .map(|window| (100.0 - window.used_percent).clamp(0.0, 100.0) / 100.0)
+            .unwrap_or(0.0)
+    }
+
     fn limit_color(remaining: f32) -> Color {
         if remaining <= 0.10 {
             Color::Error
@@ -332,8 +461,12 @@ impl Render for AgentUsageIndicator {
         }
         if let Some(tokens_per_second) = tokens_per_second {
             children.push(
-                Label::new(format!("{tokens_per_second:.0} tok/s"))
-                    .size(LabelSize::XSmall)
+                div()
+                    .id("tokens-per-second")
+                    .tooltip(Tooltip::text(
+                        "Output tokens per second for the current or most recent model completion, measured after the first token. Excludes time to first token; includes reasoning tokens.",
+                    ))
+                    .child(Label::new(format!("{tokens_per_second:.0} tok/s")).size(LabelSize::XSmall))
                     .into_any_element(),
             );
         }
@@ -360,7 +493,11 @@ impl Render for AgentUsageIndicator {
                         .into_any_element(),
                 );
             }
-            if snapshot.provider.as_deref() == Some("openai-subscribed")
+            if snapshot.provider.as_deref() == Some("opencode")
+                && usage.windows.iter().any(|window| window.label == "Monthly")
+            {
+                children.push(self.render_opencode_gauge(&usage.windows, cx));
+            } else if snapshot.provider.as_deref() == Some("openai-subscribed")
                 && usage
                     .windows
                     .iter()

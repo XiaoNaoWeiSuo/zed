@@ -921,6 +921,7 @@ pub struct ThreadView {
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
+    external_activity_generation: Option<u64>,
     external_first_chunk_at: Option<Instant>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
@@ -1222,7 +1223,7 @@ impl ThreadView {
                 .remeasure_items(0..this.list_state.item_count());
             cx.notify();
         }));
-        subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
+        subscriptions.push(cx.subscribe(&thread, |this, emitter, event, cx| {
             if matches!(
                 event,
                 AcpThreadEvent::ToolAuthorizationRequested(_)
@@ -1233,10 +1234,15 @@ impl ThreadView {
                     .remeasure_items(0..this.list_state.item_count());
                 cx.notify();
             }
-            if matches!(event, AcpThreadEvent::EntryUpdated(_))
-                && this.external_first_chunk_at.is_none()
-            {
-                this.external_first_chunk_at = Some(Instant::now());
+            if matches!(event, AcpThreadEvent::EntryUpdated(_)) {
+                let generation = emitter.read(cx).activity_generation();
+                if this.external_activity_generation != Some(generation) {
+                    this.external_activity_generation = Some(generation);
+                    this.external_first_chunk_at = None;
+                }
+                if this.external_first_chunk_at.is_none() {
+                    this.external_first_chunk_at = Some(Instant::now());
+                }
             }
             if matches!(
                 event,
@@ -1518,6 +1524,7 @@ impl ThreadView {
             thread_error_markdown: None,
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
+            external_activity_generation: None,
             external_first_chunk_at: None,
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
@@ -14190,6 +14197,11 @@ impl ThreadView {
         if self.as_native_thread(cx).is_some() {
             return;
         }
+        let generation = self.thread.read(cx).activity_generation();
+        if self.external_activity_generation != Some(generation) {
+            self.external_activity_generation = Some(generation);
+            self.external_first_chunk_at = None;
+        }
         let thread = self.thread.read(cx);
         let Some(usage) = thread.token_usage() else {
             return;
@@ -14199,19 +14211,17 @@ impl ThreadView {
             acp_thread::ForegroundActivity::Running
                 | acp_thread::ForegroundActivity::RequiresAction
         );
-        let output_tokens = thread
-            .reported_activity_output_tokens()
-            .unwrap_or(usage.output_tokens);
-        let duration = thread.activity_duration();
-        let tokens_per_second = duration
-            .filter(|duration| duration.as_secs_f32() > 0.0 && output_tokens > 0)
-            .map(|duration| output_tokens as f32 / duration.as_secs_f32());
+        // ACP reports token totals but not token arrival timestamps. Deriving a
+        // rate from activity_duration would include tool execution and approval
+        // waits, so leave the decode-rate metric unset for external agents.
+        let tokens_per_second = None;
         let time_to_first_token_ms = self
             .external_first_chunk_at
             .zip(thread.activity_started_at())
             .map(|(first_chunk, started)| first_chunk.duration_since(started).as_millis() as u64);
 
         let snapshot = agent::run_metrics::AgentMetricsSnapshot {
+            version: agent::run_metrics::METRICS_VERSION,
             running,
             provider: None,
             model: Some(self.agent_display_name.to_string()),

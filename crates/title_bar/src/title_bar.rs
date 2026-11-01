@@ -331,7 +331,7 @@ impl Render for TitleBar {
         children.push(
             h_flex()
                 .pr_1()
-                .gap_2()
+                .gap_1()
                 .child(self.agent_usage.clone())
                 .child(
                     IconButton::new("open-settings", IconName::Settings)
