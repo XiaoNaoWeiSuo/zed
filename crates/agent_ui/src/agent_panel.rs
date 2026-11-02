@@ -28,6 +28,9 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::companion_window::{
+    detached_thread_window, open_companion_window, render_conversation_title,
+};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -63,8 +66,8 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, Subscription, Task, TaskExt, TitlebarOptions, WeakEntity, WindowHandle,
-    prelude::*, pulsating_between,
+    PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
+    pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -85,9 +88,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, OpenMode, PathList,
-    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace,
-    WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
+    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -210,23 +212,6 @@ fn read_global_last_created_entry_kind(kvp: &KeyValueStore) -> Option<AgentPanel
         .flatten()
         .and_then(|json| serde_json::from_str::<LastCreatedEntryKind>(&json).log_err())
         .map(|entry| entry.entry_kind)
-}
-
-fn window_for_workspace(
-    cx: &App,
-    workspace: &Entity<Workspace>,
-) -> Option<WindowHandle<MultiWorkspace>> {
-    cx.windows().into_iter().find_map(|handle| {
-        let handle = handle.downcast::<MultiWorkspace>()?;
-        let contains = handle
-            .read_with(cx, |multi_workspace, _cx| {
-                multi_workspace
-                    .workspaces()
-                    .any(|candidate| candidate == workspace)
-            })
-            .ok()?;
-        contains.then_some(handle)
-    })
 }
 
 fn project_agents_md_path(
@@ -1116,9 +1101,6 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
-    /// When this panel lives in a detached window, the workspace it was split
-    /// from. The toolbar then offers a button to move the thread back.
-    detached_from: Option<WeakEntity<Workspace>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
@@ -1519,7 +1501,6 @@ impl AgentPanel {
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
-            detached_from: None,
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -1670,204 +1651,123 @@ impl AgentPanel {
         }
     }
 
-    pub fn set_detached_from(&mut self, source: WeakEntity<Workspace>, cx: &mut Context<Self>) {
-        self.detached_from = Some(source);
-        cx.notify();
-    }
-
-    /// Opens the active thread in a new window with a native title bar. The
-    /// source panel drops its copy without deleting the thread's metadata, so
-    /// only the detached window owns the live view.
+    /// Moves the active conversation into a companion window that owns it from
+    /// then on. The panel shows a fresh draft afterwards.
     pub fn detach_active_thread(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
-        let Some(conversation_view) = self.active_conversation_view() else {
-            return Task::ready(Err(anyhow!("There is no active thread to detach")));
-        };
-        let Some(source_workspace) = self.workspace.upgrade() else {
-            return Task::ready(Err(anyhow!("Workspace is unavailable")));
-        };
-        let (session_id, title, work_dirs, thread_id, can_detach) = {
-            let conversation = conversation_view.read(cx);
-            let active_thread = conversation.active_thread();
-            let session_id = conversation
-                .root_session_id
-                .clone()
-                .or_else(|| active_thread.map(|thread| thread.read(cx).session_id.clone()));
-            let work_dirs = active_thread
-                .and_then(|thread| thread.read(cx).thread.read(cx).work_dirs().cloned());
-            let can_detach = active_thread.is_none_or(|thread| {
-                thread.read(cx).thread.read(cx).status() != acp_thread::ThreadStatus::Generating
-            });
-            (
-                session_id,
-                conversation.title(cx),
-                work_dirs,
-                conversation.thread_id,
-                can_detach,
-            )
-        };
-        let Some(session_id) = session_id else {
-            return Task::ready(Err(anyhow!("Thread has no session to detach")));
-        };
-        if !can_detach {
-            return Task::ready(Err(anyhow!(
-                "Finish or cancel the current turn before detaching the thread"
-            )));
-        }
+    ) -> anyhow::Result<()> {
+        let conversation_view = self
+            .active_conversation_view()
+            .cloned()
+            .context("There is no active thread to detach")?;
+        self.detach_conversation_view(conversation_view, window, cx)
+    }
 
-        let paths = source_workspace
+    /// Detaches a specific thread, whether or not it is currently displayed.
+    pub fn detach_thread(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let conversation_view = self
+            .active_conversation_view()
+            .filter(|view| view.read(cx).thread_id == thread_id)
+            .cloned()
+            .or_else(|| self.remove_retained_thread(&thread_id))
+            .context("Thread is not open in this panel")?;
+        self.detach_conversation_view(conversation_view, window, cx)
+    }
+
+    fn detach_conversation_view(
+        &mut self,
+        conversation_view: Entity<ConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let thread_id = conversation_view.read(cx).thread_id;
+        let source_workspace = self
+            .workspace
+            .upgrade()
+            .context("Workspace is unavailable")?;
+        let source_project = self.project.clone();
+        let app_state = source_workspace.read(cx).app_state().clone();
+        let root_paths = source_workspace
             .read(cx)
             .root_paths(cx)
             .into_iter()
             .map(|path| path.to_path_buf())
             .collect::<Vec<_>>();
-        let app_state = source_workspace.read(cx).app_state().clone();
-        let mut options = (app_state.build_window_options)(None, cx);
-        options.titlebar = Some(TitlebarOptions {
-            title: Some(title.clone()),
-            appears_transparent: false,
-            traffic_light_position: None,
-        });
-        options.window_decorations = Some(gpui::WindowDecorations::Server);
-        let source_workspace = source_workspace.downgrade();
-        let title_for_window = title.clone();
 
-        cx.spawn_in(window, async move |this, cx| {
-            let open_task = cx.update(|_window, cx| {
-                Workspace::new_local_with_window_options(
-                    paths,
-                    app_state,
-                    None,
-                    None,
-                    None,
-                    OpenMode::NewWindow,
-                    options,
-                    false,
-                    cx,
-                )
-            })?;
-            let open_result = open_task.await?;
-
-            let mut panel = None;
-            for _ in 0..50 {
-                panel = cx
-                    .update(|_window, cx| open_result.workspace.read(cx).panel::<AgentPanel>(cx))?;
-                if panel.is_some() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-            }
-            let Some(panel) = panel else {
-                cx.update(|_window, cx| {
-                    open_result
-                        .window
-                        .update(cx, |_multi_workspace, window, _cx| {
-                            window.remove_window();
-                        })
-                })
-                .ok();
-                return Err(anyhow!(
-                    "The Agent panel did not load in the detached window"
-                ));
-            };
-
-            cx.update(|_window, cx| {
-                open_result
-                    .window
-                    .update(cx, |_multi_workspace, window, cx| {
-                        window.set_window_title(&title_for_window);
-                        panel.update(cx, |panel, cx| {
-                            panel.set_detached_from(source_workspace.clone(), cx);
-                            panel.open_thread(
-                                session_id.clone(),
-                                work_dirs.clone(),
-                                Some(title_for_window.clone()),
-                                window,
-                                cx,
-                            );
-                        });
-                        open_result.workspace.update(cx, |workspace, cx| {
-                            workspace.reveal_panel::<AgentPanel>(window, cx);
-                            workspace.toggle_panel_focus::<AgentPanel>(window, cx);
-                        });
-                    })
-            })??;
-
-            this.update_in(cx, |panel, window, cx| {
-                panel.detach_thread_from_panel(thread_id, window, cx);
-            })?;
-            Ok(())
-        })
-    }
-
-    fn detach_thread_from_panel(
-        &mut self,
-        id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.remove_retained_thread(&id);
-        if self.active_thread_id(cx) == Some(id) {
+        let was_active = self
+            .active_conversation_view()
+            .is_some_and(|view| view.entity_id() == conversation_view.entity_id());
+        self.remove_retained_thread(&thread_id);
+        if was_active {
             self.base_view = BaseView::Uninitialized;
+            self.refresh_base_view_subscriptions(window, cx);
             self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
             self.serialize(cx);
             cx.emit(AgentPanelEvent::ActiveViewChanged);
             cx.notify();
         }
+
+        open_companion_window(
+            conversation_view,
+            thread_id,
+            source_workspace.downgrade(),
+            source_project,
+            app_state,
+            root_paths,
+            cx,
+        )?;
+        Ok(())
     }
 
-    fn return_to_source_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source_workspace) = self
-            .detached_from
-            .as_ref()
-            .and_then(|source| source.upgrade())
-        else {
-            return;
-        };
-        let Some(conversation_view) = self.active_conversation_view() else {
-            return;
-        };
-        let (session_id, title, work_dirs) = {
-            let conversation = conversation_view.read(cx);
-            let active_thread = conversation.active_thread();
-            (
-                conversation
-                    .root_session_id
-                    .clone()
-                    .or_else(|| active_thread.map(|thread| thread.read(cx).session_id.clone())),
-                conversation.title(cx),
-                active_thread
-                    .and_then(|thread| thread.read(cx).thread.read(cx).work_dirs().cloned()),
-            )
-        };
-        let Some(session_id) = session_id else {
-            return;
-        };
-        let Some(source_window) = window_for_workspace(cx, &source_workspace) else {
-            return;
-        };
+    /// Takes ownership of a conversation that a companion window returned.
+    pub fn adopt_conversation_view(
+        &mut self,
+        conversation_view: Entity<ConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = conversation_view.read(cx).thread_id;
+        self.remove_retained_thread(&thread_id);
+        self.set_base_view(
+            BaseView::AgentThread { conversation_view },
+            true,
+            window,
+            cx,
+        );
+        self.serialize(cx);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
 
-        let opened = source_window.update(cx, |multi_workspace, source_window, cx| {
-            multi_workspace.activate(source_workspace.clone(), None, source_window, cx);
-            source_window.activate_window();
-            source_workspace.update(cx, |workspace, cx| {
-                workspace.reveal_panel::<AgentPanel>(source_window, cx);
-                let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
-                    return false;
-                };
-                panel.update(cx, |panel, cx| {
-                    panel.open_thread(session_id, work_dirs, Some(title), source_window, cx);
-                });
-                true
-            })
-        });
-        if opened.is_ok_and(|opened| opened) {
-            window.remove_window();
+    /// Re-creates a detached thread after a restart. The live conversation
+    /// view does not survive the process, so the session is loaded again and
+    /// immediately moved back into a companion window.
+    pub fn restore_detached_thread(
+        &mut self,
+        thread_id: ThreadId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_agent_thread(
+            Agent::NativeAgent,
+            thread_id,
+            None,
+            Some(title),
+            false,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        if let Err(error) = self.detach_thread(thread_id, window, cx) {
+            log::error!("failed to restore detached thread: {error:#}");
         }
     }
 
@@ -2906,7 +2806,10 @@ impl AgentPanel {
             move |this, _, event: &AgentNotificationEvent, window, cx| match event {
                 AgentNotificationEvent::Accepted => {
                     let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
-                        log::error!("root view should be a MultiWorkspace");
+                        // Notifications raised by a companion window land here:
+                        // that window already shows the conversation.
+                        cx.activate(true);
+                        window.activate_window();
                         return;
                     };
                     cx.activate(true);
@@ -4677,6 +4580,15 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A detached thread is displayed by its companion window; bringing this
+        // panel's copy of it back would mean two live views of one session.
+        if let Some(companion_window) = detached_thread_window(&thread_id, cx) {
+            companion_window
+                .update(cx, |_companion, window, _cx| window.activate_window())
+                .log_err();
+            return;
+        }
+
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
@@ -5594,98 +5506,12 @@ impl AgentPanel {
     fn render_title_view(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
         let content = match self.visible_surface() {
             VisibleSurface::AgentThread(conversation_view) => {
-                let server_view_ref = conversation_view.read(cx);
-                let native_thread = server_view_ref.as_native_thread(cx);
-                let is_generating_title = native_thread
-                    .as_ref()
-                    .is_some_and(|thread| thread.read(cx).is_generating_title());
-                let title_generation_error = native_thread
-                    .as_ref()
-                    .and_then(|thread| thread.read(cx).title_generation_error());
-
-                if let Some(title_editor) = server_view_ref
-                    .root_thread_view()
-                    .map(|r| r.read(cx).title_editor.clone())
-                {
-                    if is_generating_title {
-                        Label::new(server_view_ref.title(cx))
-                            .color(Color::Muted)
-                            .truncate()
-                            .with_animation(
-                                "generating_title",
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.4, 0.8)),
-                                |label, delta| label.alpha(delta),
-                            )
-                            .into_any_element()
-                    } else {
-                        let editable_title = div()
-                            .flex_1()
-                            .on_action({
-                                let conversation_view = conversation_view.downgrade();
-                                move |_: &menu::Confirm, window, cx| {
-                                    if let Some(conversation_view) = conversation_view.upgrade() {
-                                        conversation_view
-                                            .read(cx)
-                                            .activation_focus_handle(cx)
-                                            .focus(window, cx);
-                                    }
-                                }
-                            })
-                            .on_action({
-                                let conversation_view = conversation_view.downgrade();
-                                move |_: &editor::actions::Cancel, window, cx| {
-                                    if let Some(conversation_view) = conversation_view.upgrade() {
-                                        conversation_view
-                                            .read(cx)
-                                            .activation_focus_handle(cx)
-                                            .focus(window, cx);
-                                    }
-                                }
-                            })
-                            .child(title_editor);
-
-                        if let Some(title_generation_error) = title_generation_error {
-                            h_flex()
-                                .w_full()
-                                .gap_1()
-                                .child(editable_title)
-                                .child(
-                                    IconButton::new("retry-thread-title", IconName::XCircle)
-                                        .icon_color(Color::Error)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(move |_window, cx| {
-                                            Tooltip::with_meta(
-                                                "Title generation failed. Click to retry.",
-                                                None,
-                                                title_generation_error.clone(),
-                                                cx,
-                                            )
-                                        })
-                                        .on_click({
-                                            let conversation_view = conversation_view.clone();
-                                            let workspace = self.workspace.clone();
-                                            move |_event, _window, cx| {
-                                                Self::handle_regenerate_thread_title(
-                                                    conversation_view.clone(),
-                                                    workspace.clone(),
-                                                    cx,
-                                                );
-                                            }
-                                        }),
-                                )
-                                .into_any_element()
-                        } else {
-                            editable_title.w_full().into_any_element()
-                        }
-                    }
-                } else {
-                    Label::new(conversation_view.read(cx).title(cx))
-                        .color(Color::Muted)
-                        .truncate()
-                        .into_any_element()
-                }
+                return render_conversation_title(
+                    conversation_view,
+                    &self.workspace,
+                    self.should_show_title_edit(window, cx),
+                    cx,
+                );
             }
             VisibleSurface::Terminal(_) => {
                 if let Some((terminal_id, title_editor, title)) =
@@ -5788,7 +5614,7 @@ impl AgentPanel {
         });
     }
 
-    fn handle_regenerate_thread_title(
+    pub(crate) fn handle_regenerate_thread_title(
         conversation_view: Entity<ConversationView>,
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
@@ -5922,37 +5748,32 @@ impl AgentPanel {
                                     let workspace = workspace.clone();
                                     menu = menu.entry("Detach Thread to New Window", None, {
                                         move |window, cx| {
-                                            let workspace = workspace.clone();
-                                            if let Some(panel) = panel_handle.upgrade() {
-                                                let task = panel.update(cx, |panel, cx| {
-                                                    panel.detach_active_thread(window, cx)
+                                            let Some(panel) = panel_handle.upgrade() else {
+                                                return;
+                                            };
+                                            let result = panel.update(cx, |panel, cx| {
+                                                panel.detach_active_thread(window, cx)
+                                            });
+                                            if let Err(error) = result
+                                                && let Some(workspace) = workspace.upgrade()
+                                            {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    let toast = StatusToast::new(
+                                                        format!(
+                                                            "Could not detach thread: {error:#}"
+                                                        ),
+                                                        cx,
+                                                        |this, _cx| {
+                                                            this.icon(
+                                                                Icon::new(IconName::Warning)
+                                                                    .size(IconSize::Small)
+                                                                    .color(Color::Warning),
+                                                            )
+                                                            .dismiss_button(true)
+                                                        },
+                                                    );
+                                                    workspace.toggle_status_toast(toast, cx);
                                                 });
-                                                cx.spawn(async move |cx| {
-                                                    if let Err(error) = task.await {
-                                                        let Some(workspace) = workspace.upgrade()
-                                                        else {
-                                                            return;
-                                                        };
-                                                        workspace.update(cx, |workspace, cx| {
-                                                            let toast = StatusToast::new(
-                                                                format!(
-                                                                    "Could not detach thread: {error:#}"
-                                                                ),
-                                                                cx,
-                                                                |this, _cx| {
-                                                                    this.icon(
-                                                                        Icon::new(IconName::Warning)
-                                                                            .size(IconSize::Small)
-                                                                            .color(Color::Warning),
-                                                                    )
-                                                                    .dismiss_button(true)
-                                                                },
-                                                            );
-                                                            workspace.toggle_status_toast(toast, cx);
-                                                        });
-                                                    }
-                                                })
-                                                .detach();
                                             }
                                         }
                                     });
@@ -6487,16 +6308,6 @@ impl AgentPanel {
                         .children(sandbox_status)
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
-                        .when_some(self.detached_from.clone(), |this, _source| {
-                            this.child(
-                                IconButton::new("return-to-parent-window", IconName::ArrowLeft)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Return to main window"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.return_to_source_window(window, cx);
-                                    })),
-                            )
-                        })
                         .child(self.render_panel_options_menu(window, cx)),
                 )
                 .into_any_element()
@@ -14934,5 +14745,66 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_detaching_thread_moves_the_same_conversation_into_a_companion_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        let (thread_id, conversation_id) = panel.read_with(&cx, |panel, cx| {
+            let conversation = panel.active_conversation_view().expect("active thread");
+            (conversation.read(cx).thread_id, conversation.entity_id())
+        });
+
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.detach_active_thread(window, cx)
+            })
+            .expect("detach should succeed");
+        cx.run_until_parked();
+
+        let companion = cx
+            .update(|_window, cx| detached_thread_window(&thread_id, cx))
+            .expect("companion window should be open");
+        let companion_conversation_id = companion
+            .read_with(&cx, |companion, _| companion.conversation().entity_id())
+            .expect("companion window should still exist");
+        assert_eq!(
+            companion_conversation_id, conversation_id,
+            "detaching must move the existing conversation, not reload it"
+        );
+
+        panel.read_with(&cx, |panel, _| {
+            assert_ne!(
+                panel
+                    .active_conversation_view()
+                    .map(|view| view.entity_id()),
+                Some(conversation_id),
+                "the panel should no longer show the detached conversation"
+            );
+        });
+
+        cx.cx.update(|cx| {
+            companion
+                .update(cx, |companion, _window, cx| {
+                    companion.return_to_source(cx);
+                })
+                .expect("companion window should still exist");
+        });
+        cx.run_until_parked();
+
+        let adopted_id = panel.read_with(&cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .map(|view| view.entity_id())
+        });
+        assert_eq!(
+            adopted_id,
+            Some(conversation_id),
+            "returning must re-adopt the same conversation view"
+        );
     }
 }

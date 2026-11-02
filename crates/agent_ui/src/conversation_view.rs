@@ -3616,7 +3616,10 @@ impl ConversationView {
                         AgentNotificationEvent::Accepted => {
                             let Some(handle) = window.window_handle().downcast::<MultiWorkspace>()
                             else {
-                                log::error!("root view should be a MultiWorkspace");
+                                // The conversation lives in a companion window; it
+                                // is already the window the user needs.
+                                cx.activate(true);
+                                window.activate_window();
                                 return;
                             };
                             cx.activate(true);

@@ -2169,61 +2169,6 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
-        Self::new_local_inner(
-            abs_paths,
-            app_state,
-            requesting_window,
-            env,
-            init,
-            open_mode,
-            None,
-            true,
-            cx,
-        )
-    }
-
-    /// Same as [`Self::new_local`], but uses the supplied window options for a
-    /// newly created window. Detached agent windows use this to request a
-    /// native title bar instead of the app's transparent custom chrome.
-    ///
-    /// `restore_serialized` controls whether the existing saved layout for the
-    /// same roots is reused. Detached conversations pass `false` so they get a
-    /// fresh workspace id and do not overwrite the source window's saved state.
-    pub fn new_local_with_window_options(
-        abs_paths: Vec<PathBuf>,
-        app_state: Arc<AppState>,
-        requesting_window: Option<WindowHandle<MultiWorkspace>>,
-        env: Option<HashMap<String, String>>,
-        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
-        open_mode: OpenMode,
-        window_options: WindowOptions,
-        restore_serialized: bool,
-        cx: &mut App,
-    ) -> Task<anyhow::Result<OpenResult>> {
-        Self::new_local_inner(
-            abs_paths,
-            app_state,
-            requesting_window,
-            env,
-            init,
-            open_mode,
-            Some(window_options),
-            restore_serialized,
-            cx,
-        )
-    }
-
-    fn new_local_inner(
-        abs_paths: Vec<PathBuf>,
-        app_state: Arc<AppState>,
-        requesting_window: Option<WindowHandle<MultiWorkspace>>,
-        env: Option<HashMap<String, String>>,
-        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
-        open_mode: OpenMode,
-        window_options: Option<WindowOptions>,
-        restore_serialized: bool,
-        cx: &mut App,
-    ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -2247,9 +2192,7 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = restore_serialized
-                .then(|| db.workspace_for_roots(paths_to_open.as_slice()))
-                .flatten();
+            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -2383,10 +2326,7 @@ impl Workspace {
                     };
 
                     // Use the serialized workspace to construct the new window
-                    let mut options = match window_options {
-                        Some(options) => options,
-                        None => cx.update(|cx| (app_state.build_window_options)(display, cx)),
-                    };
+                    let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx));
                     options.window_bounds = window_bounds;
                     let centered_layout = serialized_workspace
                         .as_ref()

@@ -893,6 +893,11 @@ async fn initialize_agent_panel(
         }
     })?;
 
+    workspace_handle.update_in(&mut cx, |_workspace, window, cx| {
+        let workspace = cx.entity();
+        agent_ui::restore_detached_threads(&workspace, window, cx);
+    })?;
+
     anyhow::Ok(())
 }
 
