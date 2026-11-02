@@ -935,6 +935,7 @@ pub struct ThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    checkpoint_card_visible: bool,
     checkpoint_expanded: bool,
     checkpoint_evidence_request_id: usize,
     checkpoint_evidence_text: Option<String>,
@@ -1533,6 +1534,7 @@ impl ThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            checkpoint_card_visible: false,
             checkpoint_expanded: false,
             checkpoint_evidence_request_id: 0,
             checkpoint_evidence_text: None,
@@ -1893,34 +1895,72 @@ impl ThreadView {
             })
             .clone();
         let deployed = self.running_tasks_menu_handle.is_deployed();
-        PickerPopoverMenu::new(
-            picker,
-            Button::new(
-                "running-tasks",
-                format!("{terminals} terminals · {subagents} subagents"),
+        let status_color = if deployed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
+        let terminal_chip = h_flex()
+            .id("running-terminals")
+            .gap_0p5()
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Running terminals"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.running_tasks_menu_handle.toggle(window, cx);
+            }))
+            .child(
+                Icon::new(IconName::Terminal)
+                    .size(IconSize::XSmall)
+                    .color(status_color),
             )
-            .label_size(LabelSize::Small)
-            .color(if deployed {
-                Color::Accent
-            } else {
-                Color::Muted
-            })
-            .end_icon(
-                Icon::new(if deployed {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            ),
-            Tooltip::text("Running Terminals and Subagents"),
-            gpui::Anchor::TopRight,
-            cx,
-        )
-        .with_handle(self.running_tasks_menu_handle.clone())
-        .render(window, cx)
-        .into_any_element()
+            .child(
+                Label::new(terminals.to_string())
+                    .size(LabelSize::Small)
+                    .color(status_color),
+            );
+        let subagent_chip = h_flex()
+            .id("running-subagents")
+            .gap_0p5()
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Running subagents"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.running_tasks_menu_handle.toggle(window, cx);
+            }))
+            .child(
+                Icon::new(IconName::Agent)
+                    .size(IconSize::XSmall)
+                    .color(status_color),
+            )
+            .child(
+                Label::new(subagents.to_string())
+                    .size(LabelSize::Small)
+                    .color(status_color),
+            );
+        h_flex()
+            .gap_1()
+            .child(terminal_chip)
+            .child(subagent_chip)
+            .child(
+                PickerPopoverMenu::new(
+                    picker,
+                    IconButton::new(
+                        "running-tasks",
+                        if deployed {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted),
+                    Tooltip::text("Running Terminals and Subagents"),
+                    gpui::Anchor::TopRight,
+                    cx,
+                )
+                .with_handle(self.running_tasks_menu_handle.clone())
+                .render(window, cx),
+            )
+            .into_any_element()
     }
 
     /// Resolves the message editor's contents into content blocks. For profiles
@@ -6198,6 +6238,18 @@ impl ThreadView {
     }
 
     pub(crate) fn toggle_project_checkpoint(&mut self, cx: &mut Context<Self>) {
+        self.checkpoint_card_visible = !self.checkpoint_card_visible;
+        if !self.checkpoint_card_visible {
+            self.checkpoint_expanded = false;
+            self.checkpoint_evidence_request_id =
+                self.checkpoint_evidence_request_id.wrapping_add(1);
+            self.checkpoint_evidence_text = None;
+            self.checkpoint_evidence_next = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_project_checkpoint_details(&mut self, cx: &mut Context<Self>) {
         self.checkpoint_expanded = !self.checkpoint_expanded;
         if !self.checkpoint_expanded {
             self.checkpoint_evidence_request_id =
@@ -6250,8 +6302,8 @@ impl ThreadView {
         ))
     }
 
-    fn render_project_checkpoint(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.checkpoint_expanded {
+    fn render_project_checkpoint(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.checkpoint_card_visible {
             return None;
         }
         let native_thread = self.as_native_thread(cx)?;
@@ -6527,13 +6579,21 @@ impl ThreadView {
             v_flex()
                 .id("project-checkpoint")
                 .debug_selector(|| "project-checkpoint".to_string())
-                .w_full()
+                .w(px(380.))
+                .max_w_full()
+                .max_h(px(280.))
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().editor_background)
+                .shadow_md()
                 .child(
                     h_flex()
                         .id("toggle-project-checkpoint")
                         .w_full()
                         .px_3()
-                        .py_1()
+                        .py_2()
                         .gap_1()
                         .cursor_pointer()
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
@@ -6567,8 +6627,17 @@ impl ThreadView {
                                     ),
                             )
                         })
+                        .child(
+                            IconButton::new("close-project-memory", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_project_checkpoint(cx);
+                                })),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_project_checkpoint(cx);
+                            this.toggle_project_checkpoint_details(cx);
                         })),
                 )
                 .when(expanded, |card| {
@@ -6576,7 +6645,7 @@ impl ThreadView {
                         v_flex()
                             .id("project-checkpoint-details")
                             .debug_selector(|| "project-checkpoint-details".to_string())
-                            .max_h_80()
+                            .max_h(px(220.))
                             .overflow_y_scroll()
                             .gap_3()
                             .border_b_1()
@@ -6673,7 +6742,8 @@ impl ThreadView {
                                 },
                             ),
                     )
-                }),
+                })
+                .into_any_element(),
         )
     }
 
@@ -9108,20 +9178,28 @@ impl ThreadView {
             }
             AgentThreadEntry::Elicitation(elicitation_id) => {
                 let thread = self.thread.read(cx);
-                if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
-                    && should_render_elicitation(elicitation)
-                {
-                    let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
+                if let Some((_, elicitation)) = thread.elicitation(elicitation_id) {
+                    // Pending questions are pinned above the composer instead of
+                    // being buried in the scrollable transcript.
+                    if matches!(elicitation.status, ElicitationStatus::Pending { .. }) {
+                        return Empty.into_any_element();
+                    }
+                    if should_render_elicitation(elicitation) {
+                        let elicitation =
+                            self.render_elicitation(entry_ix, elicitation, window, cx);
 
-                    if let Some(handle) = self
-                        .entry_view_state
-                        .read(cx)
-                        .entry(entry_ix)
-                        .and_then(|entry| entry.focus_handle(cx))
-                    {
-                        elicitation.track_focus(&handle).into_any()
+                        if let Some(handle) = self
+                            .entry_view_state
+                            .read(cx)
+                            .entry(entry_ix)
+                            .and_then(|entry| entry.focus_handle(cx))
+                        {
+                            elicitation.track_focus(&handle).into_any()
+                        } else {
+                            elicitation.into_any()
+                        }
                     } else {
-                        elicitation.into_any()
+                        Empty.into_any()
                     }
                 } else {
                     Empty.into_any()
@@ -9314,6 +9392,57 @@ impl ThreadView {
             self.elicitation_card_handlers(cx),
         )
         .render(cx)
+    }
+
+    /// Pending questions live above the composer so later transcript activity
+    /// cannot scroll them out of view.
+    fn render_pending_elicitations(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let pending = thread
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::Elicitation(elicitation_id) = entry else {
+                    return None;
+                };
+                let (_, elicitation) = thread.elicitation(elicitation_id)?;
+                (matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                    && should_render_elicitation(elicitation))
+                .then_some((entry_ix, elicitation))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return None;
+        }
+        let entry_view_state = self.entry_view_state.read(cx);
+
+        Some(
+            v_flex()
+                .id("pending-elicitations")
+                .w_full()
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .gap_2()
+                .px_2()
+                .pb_2()
+                .children(pending.into_iter().map(|(entry_ix, elicitation)| {
+                    let card = self.render_elicitation(entry_ix, elicitation, window, cx);
+                    if let Some(handle) = entry_view_state
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.focus_handle(cx))
+                    {
+                        card.track_focus(&handle).into_any()
+                    } else {
+                        card.into_any()
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     fn elicitation_card_handlers(&self, cx: &Context<Self>) -> ElicitationCardHandlers {
@@ -15187,7 +15316,10 @@ impl Render for ThreadView {
                 }
             });
 
+        let project_checkpoint = self.render_project_checkpoint(cx);
+
         v_flex()
+            .relative()
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
@@ -15525,9 +15657,19 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
-            .children(self.render_project_checkpoint(cx))
             .children(self.render_goal_status(cx))
+            .children(self.render_pending_elicitations(window, cx))
             .child(self.render_message_editor(window, cx))
+            .when_some(project_checkpoint, |this, card| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(8.))
+                        .occlude()
+                        .child(card),
+                )
+            })
     }
 }
 

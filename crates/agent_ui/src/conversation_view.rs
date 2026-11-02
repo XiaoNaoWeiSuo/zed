@@ -5130,6 +5130,12 @@ pub(crate) mod tests {
             view.toggle_project_checkpoint(cx);
         });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("project-checkpoint").is_some());
+        assert!(cx.debug_bounds("project-checkpoint-details").is_none());
+        thread_view.update(cx, |view, cx| {
+            view.toggle_project_checkpoint_details(cx);
+        });
+        cx.run_until_parked();
         assert!(cx.debug_bounds("project-checkpoint-details").is_some());
         let evidence = cx
             .debug_bounds("checkpoint-evidence-0")

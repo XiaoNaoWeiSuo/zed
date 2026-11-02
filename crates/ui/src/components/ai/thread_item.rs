@@ -273,6 +273,8 @@ impl ThreadItem {
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
+        let question_pending = self.question_pending;
+        let warning_color = Color::Warning.color(cx);
         let raw_bg = self.base_bg.unwrap_or(color.surface_background);
         // The fade gradient paints a solid color over the title to blend it into
         // the row background, but a transparent window has no opaque surface to
@@ -406,7 +408,7 @@ impl RenderOnce for ThreadItem {
         } else if self.title_generating {
             Label::new(title)
                 .color(Color::Muted)
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || question_pending, |label| label.truncate())
                 .with_animation(
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
@@ -418,29 +420,49 @@ impl RenderOnce for ThreadItem {
         } else if highlight_positions.is_empty() {
             Label::new(title)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || question_pending, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || question_pending, |label| label.truncate())
                 .into_any_element()
         };
-        let title_label = if self.question_pending {
+        let title_label = if question_pending {
             div()
                 .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .px_1()
+                .rounded_sm()
                 .child(title_label)
                 .with_animation(
                     "pending-question-title",
-                    Animation::new(Duration::from_secs(2))
+                    Animation::new(Duration::from_millis(1200))
                         .repeat()
-                        .with_easing(pulsating_between(0.45, 1.0)),
-                    |element, delta| element.opacity(delta),
+                        .with_easing(pulsating_between(0.10, 0.30)),
+                    move |element, delta| element.bg(warning_color.opacity(delta)),
                 )
                 .into_any_element()
         } else {
             title_label
         };
+
+        let question_indicator = question_pending.then(|| {
+            div()
+                .flex_none()
+                .size(px(7.))
+                .rounded_full()
+                .bg(warning_color)
+                .with_animation(
+                    "pending-question-indicator",
+                    Animation::new(Duration::from_millis(800))
+                        .repeat()
+                        .with_easing(pulsating_between(0.2, 1.0)),
+                    |dot, delta| dot.opacity(delta),
+                )
+                .into_any_element()
+        });
 
         let has_diff_stats = self.added.is_some() || self.removed.is_some();
         let diff_stat_id = self.id.clone();
@@ -521,6 +543,7 @@ impl RenderOnce for ThreadItem {
                             .flex_1()
                             .gap_1p5()
                             .children(leading_icon)
+                            .children(question_indicator)
                             .child(title_label),
                     )
                     .when(self.is_truncated && opaque_window, |this| {
