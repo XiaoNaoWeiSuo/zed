@@ -6280,15 +6280,20 @@ impl ThreadView {
             .iter()
             .filter_map(|entry| {
                 entry
-                    .get("available_scopes")
-                    .and_then(serde_json::Value::as_array)
+                    .get("available_scope_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| {
+                        entry
+                            .get("available_scopes")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|scopes| scopes.len() as u64)
+                    })
             })
-            .map(Vec::len)
-            .sum::<usize>();
+            .sum::<u64>();
         let detail = if unavailable {
             "Project memory needs review".into()
         } else if scope_count > 0 {
-            format!("Project memory enabled · {scope_count} saved scopes").into()
+            format!("Project memory enabled · {scope_count} other saved scopes").into()
         } else {
             "Project memory enabled · saved session state available".into()
         };
@@ -6568,6 +6573,21 @@ impl ThreadView {
         }
         if summary.is_empty() && completed_count > 0 {
             summary.push(format!("{completed_count} completed"));
+        }
+        if let Some(created_at) = entries
+            .iter()
+            .find_map(|entry| entry.get("created_at").and_then(serde_json::Value::as_str))
+            && let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(created_at)
+        {
+            let age =
+                chrono::Utc::now().signed_duration_since(created_at.with_timezone(&chrono::Utc));
+            summary.push(if age.num_days() > 0 {
+                format!("{}d ago", age.num_days())
+            } else if age.num_hours() > 0 {
+                format!("{}h ago", age.num_hours())
+            } else {
+                format!("{}m ago", age.num_minutes().max(1))
+            });
         }
         let summary = if summary.is_empty() {
             "Saved session state".into()
