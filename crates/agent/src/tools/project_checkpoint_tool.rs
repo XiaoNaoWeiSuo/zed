@@ -32,6 +32,7 @@ pub struct ProjectCheckpointInput {
     #[serde(default)]
     pub detail: CheckpointReadDetail,
     /// Stable work area, such as "agent.async_questions"; omitted for list.
+    /// Lowercase letters, digits, '.', '_', and '-' only, without repeated separators.
     #[serde(default)]
     pub scope: String,
     /// Page offset for list.
@@ -66,6 +67,39 @@ pub enum CheckpointReadDetail {
     Full,
 }
 
+/// Rejects scope names that would fragment the index with case variants,
+/// whitespace, or separator runs. Existing records remain readable and
+/// deletable even when they predate this rule.
+fn validate_scope(scope: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!scope.trim().is_empty(), "A checkpoint scope is required");
+    anyhow::ensure!(
+        scope.chars().count() <= 200,
+        "Checkpoint scopes must be at most 200 characters"
+    );
+    anyhow::ensure!(
+        !scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX),
+        "This checkpoint scope is reserved for automatic interruption records"
+    );
+    let mut characters = scope.chars();
+    anyhow::ensure!(
+        characters
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit()),
+        "Checkpoint scopes must start with a lowercase letter or digit"
+    );
+    anyhow::ensure!(
+        scope.chars().all(|character| character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '.' | '_' | '-')),
+        "Checkpoint scopes may only contain lowercase letters, digits, '.', '_', and '-'"
+    );
+    anyhow::ensure!(
+        !scope.contains("..") && !scope.contains("__") && !scope.contains("--"),
+        "Checkpoint scopes must not contain repeated separators"
+    );
+    Ok(())
+}
+
 fn checkpoint_read_view(
     checkpoint: ProjectCheckpoint,
     detail: CheckpointReadDetail,
@@ -92,7 +126,8 @@ fn checkpoint_read_view(
                     for entry in entries {
                         if let Some(text) = entry.as_str() {
                             truncated |= text.chars().count() > 400;
-                            *entry = serde_json::Value::String(text.chars().take(400).collect());
+                            *entry =
+                                serde_json::Value::String(crate::truncate_with_marker(text, 400));
                         }
                     }
                 }
@@ -109,6 +144,28 @@ fn checkpoint_read_view(
             if total > 5 {
                 entries.truncate(5);
                 fields.insert("evidence_omitted_count".into(), (total - 5).into());
+            }
+        }
+        if let Some(entries) = fields
+            .get_mut("changed_files")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let total = entries.len();
+            if total > 20 {
+                entries.truncate(20);
+                fields.insert("changed_files_omitted_count".into(), (total - 20).into());
+            }
+        }
+        for field in ["completed", "remaining", "decisions", "next_steps"] {
+            if let Some(entries) = fields
+                .get_mut(field)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                let total = entries.len();
+                if total > 20 {
+                    entries.truncate(20);
+                    fields.insert(format!("{field}_omitted_count"), (total - 20).into());
+                }
             }
         }
     }
@@ -192,7 +249,10 @@ impl AgentTool for ProjectCheckpointTool {
             let result = async {
                 let input = input.recv().await?;
                 anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list" | "runtime" | "prune" | "delete"), "Unknown checkpoint action");
-                if matches!(input.action.as_str(), "save" | "read") {
+                if input.action == "save" {
+                    validate_scope(&input.scope)?;
+                }
+                if input.action == "read" {
                     anyhow::ensure!(!input.scope.trim().is_empty(), "A checkpoint scope is required");
                     anyhow::ensure!(!input.scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX), "This checkpoint scope is reserved for automatic interruption records");
                 }
@@ -203,9 +263,6 @@ impl AgentTool for ProjectCheckpointTool {
                     !(input.action == "prune" && !input.scope.trim().is_empty()),
                     "`prune` does not accept `scope`; it applies retention limits to every scope"
                 );
-                if input.action == "save" {
-                    anyhow::ensure!(input.scope.chars().count() <= 200, "Checkpoint scopes must be at most 200 characters");
-                }
                 anyhow::ensure!(
                     !(input.action == "list" && !input.scope.trim().is_empty()),
                     "`list` does not accept `scope`; omit it to list all scopes, or use `read` with that scope"
@@ -384,6 +441,52 @@ impl AgentTool for ProjectCheckpointTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_validation_accepts_stable_names_and_rejects_index_fragments() {
+        for scope in [
+            "agent.async_questions",
+            "harness.abcd_followthrough",
+            "task-1",
+            "a",
+        ] {
+            assert!(validate_scope(scope).is_ok(), "{scope} should be valid");
+        }
+        for scope in [
+            "",
+            " Agent.x",
+            "Agent.x",
+            "agent x",
+            "agent..x",
+            "agent__x",
+            "agent--x",
+            "-agent",
+            "agent/x",
+            "@automatic/x",
+        ] {
+            assert!(validate_scope(scope).is_err(), "{scope} should be rejected");
+        }
+        assert!(validate_scope(&"a".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn full_read_caps_large_collections() -> anyhow::Result<()> {
+        let checkpoint: ProjectCheckpoint = serde_json::from_value(serde_json::json!({
+            "id": "checkpoint", "session_id": "session", "scope": "task",
+            "created_at": "2026-10-29T00:00:00Z", "base_revision": null,
+            "branch": null, "git_scan_id": null,
+            "completed": (0..25).map(|index| format!("done {index}")).collect::<Vec<_>>(),
+            "remaining": [], "decisions": [], "next_steps": [],
+            "changed_files": (0..25).map(|index| serde_json::json!({"path": format!("file-{index}.rs"), "fingerprint": "f"})).collect::<Vec<_>>(),
+            "evidence": [], "interrupted": false
+        }))?;
+        let full = checkpoint_read_view(checkpoint, CheckpointReadDetail::Full)?;
+        assert_eq!(full["changed_files"].as_array().map(Vec::len), Some(20));
+        assert_eq!(full["changed_files_omitted_count"], 5);
+        assert_eq!(full["completed"].as_array().map(Vec::len), Some(20));
+        assert_eq!(full["completed_omitted_count"], 5);
+        Ok(())
+    }
 
     #[test]
     fn checkpoint_read_defaults_to_compact_state_and_preserves_full_record() -> anyhow::Result<()> {

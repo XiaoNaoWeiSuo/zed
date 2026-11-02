@@ -142,6 +142,10 @@ pub struct CheckpointScopeSummary {
     pub created_at: DateTime<Utc>,
     pub remaining_count: usize,
     pub next_step: Option<String>,
+    /// Branch of the newest checkpoint in this scope. Used to rank scopes for
+    /// injection; older records may predate branch tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 impl From<ProjectCheckpoint> for CheckpointScopeSummary {
@@ -153,7 +157,8 @@ impl From<ProjectCheckpoint> for CheckpointScopeSummary {
             next_step: checkpoint
                 .next_steps
                 .first()
-                .map(|step| step.chars().take(180).collect()),
+                .map(|step| truncate_with_marker(step, 180)),
+            branch: checkpoint.branch,
         }
     }
 }
@@ -480,6 +485,60 @@ pub fn checkpoint_git_snapshot(
         })
 }
 
+/// Truncates text for model context, preferring a word boundary, and reports
+/// how many characters were dropped. A bare cut hides the loss and can end the
+/// model's view inside an unrelated sentence.
+pub fn truncate_for_model(text: &str, max_chars: usize) -> (String, Option<usize>) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text.to_owned(), None);
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if let Some((index, _)) = truncated
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        && truncated[..index].chars().count() >= max_chars / 2
+    {
+        truncated.truncate(index);
+    }
+    let kept = truncated.chars().count();
+    (truncated, Some(total - kept))
+}
+
+/// Marks truncated entries inline so a model can tell a complete note from a
+/// cut one without a parallel metadata array per field.
+pub(crate) fn truncate_with_marker(text: &str, max_chars: usize) -> String {
+    match truncate_for_model(text, max_chars) {
+        (text, None) => text,
+        (text, Some(omitted)) => format!("{text} …[+{omitted} chars]"),
+    }
+}
+
+/// Ranks saved scopes for injection: scopes last touched on the current branch
+/// first, then most recent. The primary handoff is excluded because it is
+/// already injected as its own section.
+fn rank_scopes(
+    mut scopes: Vec<CheckpointScopeSummary>,
+    current_branch: Option<&str>,
+    primary_scope: &str,
+) -> Vec<CheckpointScopeSummary> {
+    scopes.retain(|scope| scope.scope != primary_scope);
+    scopes.sort_by(|left, right| {
+        let on_branch = |scope: &CheckpointScopeSummary| {
+            matches!(
+                (current_branch, scope.branch.as_deref()),
+                (Some(current), Some(saved)) if current == saved
+            )
+        };
+        on_branch(right)
+            .cmp(&on_branch(left))
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.scope.cmp(&right.scope))
+    });
+    scopes
+}
+
 pub fn checkpoint_model_context(context: &str) -> String {
     fn compact(value: &mut serde_json::Value) {
         match value {
@@ -537,21 +596,23 @@ pub fn load_checkpoint_context_for_session(
                             store.latest(&format!(
                                 "{COMPACTION_CHECKPOINT_SCOPE_PREFIX}{session_id}"
                             ))?,
-                            store.list_scopes(0, 6)?,
+                            store.list_scopes(0, 20)?,
+                            store.count_scopes()?,
                         ))
                     } else {
                         Ok((
                             store.latest_any()?,
                             store.latest_automatic()?,
                             None,
-                            store.list_scopes(0, 6)?,
+                            store.list_scopes(0, 20)?,
+                            store.count_scopes()?,
                         ))
                     }
                 }
-                None => Ok((None, None, None, Vec::new())),
+                None => Ok((None, None, None, Vec::new(), 0)),
             });
-        let (checkpoint, interruption, compaction, scopes) = match checkpoints {
-            Ok((None, None, None, _)) => continue,
+        let (checkpoint, interruption, compaction, scopes, scope_count) = match checkpoints {
+            Ok((None, None, None, _, _)) => continue,
             Ok(records) => records,
             Err(error) => {
                 log::error!(
@@ -618,12 +679,23 @@ pub fn load_checkpoint_context_for_session(
             entries
                 .iter()
                 .take(5)
-                .map(|entry| entry.chars().take(180).collect::<String>())
+                .map(|entry| truncate_with_marker(entry, 180))
                 .collect::<Vec<_>>()
         };
         let bounded_path =
             |path: &Path| path.to_string_lossy().chars().take(180).collect::<String>();
         let path_too_long = |path: &Path| path.to_string_lossy().chars().count() > 180;
+        let current_branch = root.git.as_ref().and_then(|git| git.branch.as_deref());
+        let primary_is_handoff = !checkpoint
+            .scope
+            .starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX)
+            && !checkpoint
+                .scope
+                .starts_with(COMPACTION_CHECKPOINT_SCOPE_PREFIX);
+        let mut scopes = rank_scopes(scopes, current_branch, &checkpoint.scope);
+        scopes.truncate(3);
+        let available_scope_count = scope_count.saturating_sub(usize::from(primary_is_handoff));
+        let more_scopes_available = available_scope_count > scopes.len();
         let mut data = serde_json::json!({
             "root": root.path, "scope": checkpoint.scope, "created_at": checkpoint.created_at,
             "record_kind": if checkpoint.scope.starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX) { "execution_observation" } else if checkpoint.scope.starts_with(COMPACTION_CHECKPOINT_SCOPE_PREFIX) { "context_compaction" } else { "task_handoff" },
@@ -636,11 +708,12 @@ pub fn load_checkpoint_context_for_session(
                 "summary": bounded(&record.decisions),
                 "summary_may_be_truncated": record.decisions.iter().any(|entry| entry.chars().count() > 180),
             })),
-            "available_scopes": scopes.iter().take(5).collect::<Vec<_>>(),
-            "more_scopes_available": scopes.len() > 5,
+            "available_scopes": scopes,
+            "available_scope_count": available_scope_count,
+            "more_scopes_available": more_scopes_available,
             "completed": bounded(&checkpoint.completed), "remaining": bounded(&checkpoint.remaining),
             "decisions": bounded(&checkpoint.decisions), "next_steps": bounded(&checkpoint.next_steps),
-            "evidence": checkpoint.evidence.iter().take(5).map(|entry| serde_json::json!({"description": entry.description.chars().take(180).collect::<String>(), "source": entry.source.chars().take(240).collect::<String>(), "observed_at": entry.observed_at, "revision": entry.revision})).collect::<Vec<_>>(),
+            "evidence": checkpoint.evidence.iter().take(5).map(|entry| serde_json::json!({"description": truncate_with_marker(&entry.description, 180), "source": truncate_with_marker(&entry.source, 240), "observed_at": entry.observed_at, "revision": entry.revision})).collect::<Vec<_>>(),
             "more_evidence_available": checkpoint.evidence.len() > 5,
             "summary_may_be_truncated": checkpoint.completed.len() > 5 || checkpoint.remaining.len() > 5 || checkpoint.decisions.len() > 5 || checkpoint.next_steps.len() > 5 || checkpoint.completed.iter().chain(&checkpoint.remaining).chain(&checkpoint.decisions).chain(&checkpoint.next_steps).any(|entry| entry.chars().count() > 180),
             "interrupted": checkpoint.interrupted, "changed_files": changed.iter().take(10).map(|path| bounded_path(Path::new(path))).collect::<Vec<_>>(),
@@ -656,7 +729,7 @@ pub fn load_checkpoint_context_for_session(
                 "interrupted": interruption.interrupted,
                 "files": interruption.changed_files.iter().take(10).map(|file| serde_json::json!({"path": bounded_path(&file.path), "unsaved": file.unsaved, "observation_error": file.observation_error.is_some(), "changed_since_checkpoint": match file.has_changed(&root.path) { Ok(changed) => Some(changed), Err(_) => None }})).collect::<Vec<_>>(),
                 "files_may_be_truncated": interruption.changed_files.len() > 10 || interruption.changed_files.iter().any(|file| path_too_long(&file.path)),
-                "evidence": interruption.evidence.iter().take(5).map(|entry| serde_json::json!({"description": entry.description.chars().take(180).collect::<String>(), "source": entry.source.chars().take(240).collect::<String>()})).collect::<Vec<_>>(),
+                "evidence": interruption.evidence.iter().take(5).map(|entry| serde_json::json!({"description": truncate_with_marker(&entry.description, 180), "source": truncate_with_marker(&entry.source, 240)})).collect::<Vec<_>>(),
             })),
         });
         if root.git.is_none() {
@@ -1071,6 +1144,15 @@ impl ProjectCheckpointStore {
         let rows = self
             .connection
             .select_bound::<(), i64>("SELECT COUNT(*) FROM checkpoints")?(())?;
+        Ok(rows.first().copied().unwrap_or(0) as usize)
+    }
+
+    /// Number of readable handoff scopes, excluding internal session scopes.
+    pub fn count_scopes(&self) -> Result<usize> {
+        let rows = self.connection.select_bound::<(), i64>(
+            "SELECT COUNT(DISTINCT scope) FROM checkpoints
+             WHERE scope NOT GLOB '@automatic/*' AND scope NOT GLOB '@compaction/*'",
+        )?(())?;
         Ok(rows.first().copied().unwrap_or(0) as usize)
     }
 
@@ -1827,9 +1909,14 @@ mod tests {
         }])?
         .context("context")?;
         let context: serde_json::Value = serde_json::from_str(&context)?;
-        let expected_scopes = serde_json::to_value(store.list_scopes(0, 20)?)?;
-        assert_eq!(context[0]["available_scopes"], expected_scopes);
-        assert_eq!(context[0]["available_scopes"][1]["scope"], "editor");
+        // The primary handoff is injected as its own section, so the scope list
+        // only carries the other readable scopes.
+        assert_eq!(
+            context[0]["available_scopes"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(context[0]["available_scopes"][0]["scope"], "editor");
+        assert_eq!(context[0]["available_scope_count"], 1);
         assert_eq!(context[0]["more_scopes_available"], false);
         assert!(context[0]["recent_context_compaction"].is_null());
 
@@ -1844,7 +1931,9 @@ mod tests {
         let projected: serde_json::Value =
             serde_json::from_str(&checkpoint_model_context(&session_context))?;
         let entry = projected.get(0).context("root context")?;
-        assert_eq!(entry["available_scopes"], expected_scopes);
+        assert_eq!(entry["available_scopes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(entry["available_scopes"][0]["scope"], "editor");
+        assert_eq!(entry["available_scope_count"], 1);
         assert_eq!(entry["more_scopes_available"], false);
         assert_eq!(entry["historical_state"], true);
         assert_eq!(entry["record_kind"], "task_handoff");
@@ -2087,18 +2176,65 @@ mod tests {
         assert!(session_context[0].get("current_git_scan_id").is_none());
         let scopes = session_context[0]["available_scopes"]
             .as_array()
-            .context("a session that can retrieve on demand must list the readable scopes")?;
-        assert!(
-            !scopes.is_empty(),
-            "available_scopes must carry retrieval hints, otherwise on-demand lookup has no entry point"
-        );
+            .context("available_scopes must stay an array")?;
         assert!(
             scopes.iter().all(|scope| !scope["scope"]
                 .as_str()
                 .is_some_and(|scope| scope.starts_with(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX))),
             "observation records stay out of the scope index: {scopes:?}"
         );
+        // Every readable scope is already injected as the primary handoff, so
+        // there is nothing left to hint at.
+        assert!(scopes.is_empty());
+        assert_eq!(session_context[0]["available_scope_count"], 0);
         Ok(())
+    }
+
+    #[test]
+    fn truncation_prefers_word_boundaries_and_reports_omitted_characters() {
+        let (text, omitted) = truncate_for_model("alpha beta gamma delta", 12);
+        assert_eq!(text, "alpha beta");
+        assert_eq!(omitted, Some(12));
+
+        let (text, omitted) = truncate_for_model("short", 10);
+        assert_eq!(text, "short");
+        assert_eq!(omitted, None);
+
+        let (text, omitted) = truncate_for_model(&"x".repeat(7000), 180);
+        assert_eq!(text.chars().count(), 180);
+        assert_eq!(omitted, Some(6820));
+        assert_eq!(
+            truncate_with_marker("alpha beta gamma delta", 12),
+            "alpha beta …[+12 chars]"
+        );
+    }
+
+    #[test]
+    fn scope_ranking_prefers_the_current_branch_then_recency() {
+        let now = Utc::now();
+        let summary = |scope: &str, branch: Option<&str>, seconds: i64| CheckpointScopeSummary {
+            scope: scope.into(),
+            created_at: now + chrono::Duration::seconds(seconds),
+            remaining_count: 0,
+            next_step: None,
+            branch: branch.map(str::to_owned),
+        };
+        let ranked = rank_scopes(
+            vec![
+                summary("old-main", Some("main"), 0),
+                summary("new-feature", Some("feature"), 10),
+                summary("new-main", Some("main"), 5),
+                summary("unknown", None, 20),
+                summary("primary", Some("main"), 30),
+            ],
+            Some("main"),
+            "primary",
+        );
+        let scopes = ranked
+            .iter()
+            .map(|summary| summary.scope.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(scopes, ["new-main", "old-main", "unknown", "new-feature"]);
     }
 
     #[test]
