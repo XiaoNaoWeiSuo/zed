@@ -1582,9 +1582,10 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                 let group = show_section_headers.then(|| command.group());
 
                                 let icon_path = (command.category
-                                    == Some(acp_thread::CommandCategory::Native)
-                                    && command.name.as_ref() == agent::COMPACT_COMMAND_NAME)
-                                    .then(|| IconName::Compact.path().into());
+                                    == Some(acp_thread::CommandCategory::Native))
+                                .then(|| native_command_icon(&command.name))
+                                .flatten()
+                                .map(|icon| icon.path().into());
 
                                 Completion {
                                     replace_range: source_range.clone(),
@@ -2562,6 +2563,16 @@ pub fn extract_file_name_and_directory(
     )
 }
 
+fn native_command_icon(name: &str) -> Option<IconName> {
+    match name {
+        agent::COMPACT_COMMAND_NAME => Some(IconName::Compact),
+        agent::GOAL_COMMAND_NAME => Some(IconName::ListTodo),
+        agent::HANDOFF_COMMAND_NAME => Some(IconName::Notepad),
+        agent::CHECKPOINT_COMMAND_NAME => Some(IconName::Book),
+        _ => None,
+    }
+}
+
 fn build_slash_command_label(
     command: &AvailableCommand,
     source_highlight_id: Option<HighlightId>,
@@ -2853,6 +2864,27 @@ fn completion_text_for_terminal_selections(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn native_commands_have_icons() {
+        assert_eq!(
+            native_command_icon(agent::COMPACT_COMMAND_NAME),
+            Some(IconName::Compact)
+        );
+        assert_eq!(
+            native_command_icon(agent::GOAL_COMMAND_NAME),
+            Some(IconName::ListTodo)
+        );
+        assert_eq!(
+            native_command_icon(agent::HANDOFF_COMMAND_NAME),
+            Some(IconName::Notepad)
+        );
+        assert_eq!(
+            native_command_icon(agent::CHECKPOINT_COMMAND_NAME),
+            Some(IconName::Book)
+        );
+        assert_eq!(native_command_icon("deploy"), None);
+    }
 
     #[test]
     fn test_prompt_completion_parse() {
