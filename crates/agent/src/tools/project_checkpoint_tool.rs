@@ -20,10 +20,12 @@ use crate::{
 /// Saved history supplies context, not authorization or proof of completion.
 /// The editor records changed buffers and the latest available Git status snapshot.
 /// Git scanning can lag and unsaved buffers require verification. Summaries are
-/// assessments, not proof of completion.
+/// assessments, not proof of completion. Use prune to apply retention limits and
+/// delete to drop every checkpoint in one scope.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectCheckpointInput {
     /// "save", "read", "list", or "runtime" for paginated session-owned task metadata.
+    /// "prune" applies retention limits; "delete" removes every checkpoint in one scope.
     /// Runtime records are historical observations, not proof tasks are still running.
     pub action: String,
     /// Read detail: "summary" (default) or "full" for saved file and evidence records.
@@ -38,7 +40,8 @@ pub struct ProjectCheckpointInput {
     /// Page size for list, up to 20.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Absolute project root, required when the workspace has multiple roots.
+    /// Absolute project root. Defaults to the first open root; runtime task
+    /// metadata always lives in that canonical root to avoid duplicate ledgers.
     #[serde(default)]
     pub root: Option<PathBuf>,
     /// Work completed and its limitations.
@@ -188,11 +191,18 @@ impl AgentTool for ProjectCheckpointTool {
         cx.spawn(async move |cx| {
             let result = async {
                 let input = input.recv().await?;
-                anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list" | "runtime"), "Unknown checkpoint action");
-                if !matches!(input.action.as_str(), "list" | "runtime") {
+                anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list" | "runtime" | "prune" | "delete"), "Unknown checkpoint action");
+                if matches!(input.action.as_str(), "save" | "read") {
                     anyhow::ensure!(!input.scope.trim().is_empty(), "A checkpoint scope is required");
                     anyhow::ensure!(!input.scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX), "This checkpoint scope is reserved for automatic interruption records");
                 }
+                if input.action == "delete" {
+                    anyhow::ensure!(!input.scope.trim().is_empty(), "`delete` requires the scope to remove");
+                }
+                anyhow::ensure!(
+                    !(input.action == "prune" && !input.scope.trim().is_empty()),
+                    "`prune` does not accept `scope`; it applies retention limits to every scope"
+                );
                 if input.action == "save" {
                     anyhow::ensure!(input.scope.chars().count() <= 200, "Checkpoint scopes must be at most 200 characters");
                 }
@@ -204,14 +214,18 @@ impl AgentTool for ProjectCheckpointTool {
                     let project = thread.project().read(cx);
                     anyhow::ensure!(project.is_local(), "Project checkpoints currently require a local project");
                     let roots: Vec<_> = project.visible_worktrees(cx).map(|worktree| worktree.read(cx).abs_path().to_path_buf()).collect();
+                    // Runtime task metadata is session-wide, so it lives in one canonical
+                    // root instead of being copied into every worktree.
+                    let canonical_root = crate::canonical_runtime_task_root(roots.iter().cloned())
+                        .ok_or_else(|| anyhow::anyhow!("No project root"))?;
                     let root = if let Some(root) = &input.root {
                         anyhow::ensure!(roots.contains(root), "The checkpoint root must be an open project root");
                         root.clone()
                     } else {
-                        anyhow::ensure!(roots.len() == 1, "Specify a project root when the workspace does not have exactly one root");
-                        roots.into_iter().next().ok_or_else(|| anyhow::anyhow!("No project root"))?
+                        canonical_root.clone()
                     };
-                    if matches!(input.action.as_str(), "list" | "runtime") {
+                    let root = if input.action == "runtime" { canonical_root } else { root };
+                    if matches!(input.action.as_str(), "list" | "runtime" | "prune" | "delete") {
                         return Ok((root, thread.id().0.to_string(), BTreeMap::new(), None, Vec::new()));
                     }
                     let mut files = thread.action_log().read(cx).changed_buffers(cx).filter_map(|(buffer, _)| {
@@ -257,8 +271,39 @@ impl AgentTool for ProjectCheckpointTool {
                             next_offset: (end < total).then_some(end),
                             checkpoint: Some(serde_json::json!({
                                 "runtime_tasks": entries, "total": total,
+                                "storage": "canonical_root",
                                 "historical_observations_only": true,
                                 "semantic_coverage": "unknown"
+                            })),
+                            changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(),
+                            current_revision_changed: None, current_branch_changed: None,
+                            new_dirty_files: None, new_dirty_files_truncated: false,
+                            runtime_ledger: RuntimeLedgerSnapshot::default(), error: None,
+                        });
+                    }
+                    if input.action == "prune" {
+                        let removed = store.maintain_checkpoints()?;
+                        return Ok(ProjectCheckpointOutput {
+                            saved: None, scopes: Vec::new(), next_offset: None,
+                            checkpoint: Some(serde_json::json!({
+                                "reclaimed_checkpoints": removed,
+                                "retention_per_scope": crate::CHECKPOINT_RETENTION_PER_SCOPE,
+                                "internal_scope_retention": crate::INTERNAL_SCOPE_RETENTION,
+                                "runtime_tasks": "maintained automatically after each turn"
+                            })),
+                            changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(),
+                            current_revision_changed: None, current_branch_changed: None,
+                            new_dirty_files: None, new_dirty_files_truncated: false,
+                            runtime_ledger: RuntimeLedgerSnapshot::default(), error: None,
+                        });
+                    }
+                    if input.action == "delete" {
+                        let removed = store.delete_scope(&input.scope)?;
+                        return Ok(ProjectCheckpointOutput {
+                            saved: None, scopes: Vec::new(), next_offset: None,
+                            checkpoint: Some(serde_json::json!({
+                                "deleted_scope": input.scope,
+                                "reclaimed_checkpoints": removed
                             })),
                             changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(),
                             current_revision_changed: None, current_branch_changed: None,

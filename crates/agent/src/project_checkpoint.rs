@@ -167,7 +167,7 @@ pub struct ProjectCheckpointStore {
 ///
 /// This deliberately contains lifecycle metadata only. Prompt, output, and secrets must remain
 /// in the runtime and are never written to the checkpoint database.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTaskRecord {
     pub owner_session_id: String,
     pub child_session_id: String,
@@ -177,6 +177,50 @@ pub struct RuntimeTaskRecord {
     pub archived: bool,
     #[serde(default)]
     pub parent_goal_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// States accepted by the runtime task ledger. Anything else is rejected on
+/// write so a typo cannot create a state no query knows how to interpret.
+pub const RUNTIME_TASK_STATES: &[&str] = &[
+    "pending",
+    "running",
+    "cancelling",
+    "completed",
+    "failed",
+    "cancelled",
+    "abandoned",
+    "unknown",
+];
+
+/// States that may still have work in flight. These are the only states the
+/// reconciliation pass can convert to `abandoned`.
+pub const NON_TERMINAL_RUNTIME_TASK_STATES: &[&str] = &["pending", "running", "cancelling"];
+
+pub const RUNTIME_TASK_RETENTION: usize = 200;
+pub const CHECKPOINT_RETENTION_PER_SCOPE: usize = 50;
+/// Internal `@automatic/` and `@compaction/` scopes are created once per
+/// session, so bounding per-scope history alone still lets the database grow
+/// with the number of sessions.
+pub const INTERNAL_SCOPE_RETENTION: usize = 20;
+
+/// The single worktree whose database owns session-wide runtime task records.
+///
+/// Checkpoints are per-worktree by design, but a session's subagent ledger is
+/// not: writing it into every visible root duplicated rows and let the copies
+/// drift apart. `visible_worktrees` is ordered by the project's worktree store,
+/// so the first entry stays stable while the workspace is open.
+pub fn canonical_runtime_task_root(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    roots.into_iter().next()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTaskMaintenance {
+    pub abandoned: usize,
+    pub pruned: usize,
 }
 
 /// The lifecycle state shared by goals, checkpoints, and verification receipts.
@@ -636,6 +680,32 @@ pub fn load_checkpoint_context_for_session(
     Ok(Some(serde_json::to_string(&sections)?))
 }
 
+fn parse_timestamp(raw: Option<String>) -> Option<DateTime<Utc>> {
+    raw.and_then(|raw| {
+        DateTime::parse_from_rfc3339(&raw)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+    })
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> Result<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`, and the prepare step fails on a
+    // duplicate column, so inspect the schema first instead of matching error text.
+    let existing = connection.select_bound::<(String, String), i64>(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+    )?((table.to_owned(), column.to_owned()))?;
+    if existing.first().copied().unwrap_or(0) > 0 {
+        return Ok(());
+    }
+    connection.exec(sql)?()?;
+    Ok(())
+}
+
 impl ProjectCheckpointStore {
     pub fn open_existing(root: &Path) -> Result<Option<Self>> {
         let database_path = root
@@ -682,6 +752,11 @@ impl ProjectCheckpointStore {
             "Could not open checkpoint database at {}",
             database_path.display()
         );
+        // `sqlite3_exec` tolerates pragmas that return a row, which is why the
+        // existing statement plumbing can set these directly.
+        connection.exec("PRAGMA busy_timeout = 5000;")?()?;
+        connection.exec("PRAGMA journal_mode = WAL;")?()?;
+        connection.exec("PRAGMA synchronous = NORMAL;")?()?;
         connection.exec(
             "CREATE TABLE IF NOT EXISTS checkpoints (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -707,9 +782,34 @@ impl ProjectCheckpointStore {
                 result_returned_by_tool INTEGER,
                 archived INTEGER NOT NULL,
                 parent_goal_id TEXT,
+                created_at TEXT,
+                updated_at TEXT,
                 PRIMARY KEY (owner_session_id, child_session_id, generation)
             )",
         )?()?;
+        // Older databases predate the lifecycle columns; migrate them in place
+        // instead of assuming a fresh schema.
+        add_column_if_missing(
+            &connection,
+            "runtime_task_records",
+            "created_at",
+            "ALTER TABLE runtime_task_records ADD COLUMN created_at TEXT",
+        )?;
+        add_column_if_missing(
+            &connection,
+            "runtime_task_records",
+            "updated_at",
+            "ALTER TABLE runtime_task_records ADD COLUMN updated_at TEXT",
+        )?;
+        connection.exec(
+            "UPDATE runtime_task_records
+             SET created_at = COALESCE(created_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        )?()?;
+        connection.exec(
+            "UPDATE runtime_task_records
+             SET updated_at = COALESCE(updated_at, created_at)",
+        )?()?;
+        connection.exec("PRAGMA user_version = 1;")?()?;
         connection.exec(
             "CREATE INDEX IF NOT EXISTS runtime_task_records_owner_child
              ON runtime_task_records (owner_session_id, child_session_id)",
@@ -730,9 +830,15 @@ impl ProjectCheckpointStore {
             !record.state.trim().is_empty(),
             "Runtime task state is required"
         );
+        ensure!(
+            RUNTIME_TASK_STATES.contains(&record.state.as_str()),
+            "Unsupported runtime task state: {}",
+            record.state
+        );
         let generation =
             i64::try_from(record.generation).context("Runtime task generation is too large")?;
         let result_returned_by_tool = record.result_returned_by_tool.map(i64::from);
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         self.connection.exec_bound::<(
             String,
             String,
@@ -741,11 +847,12 @@ impl ProjectCheckpointStore {
             Option<i64>,
             i64,
             Option<String>,
+            String,
         )>(
             "INSERT INTO runtime_task_records
                 (owner_session_id, child_session_id, generation, state,
-                 result_returned_by_tool, archived, parent_goal_id)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                 result_returned_by_tool, archived, parent_goal_id, created_at, updated_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8
              WHERE NOT EXISTS (
                  SELECT 1 FROM runtime_task_records
                  WHERE owner_session_id = ?1
@@ -756,7 +863,8 @@ impl ProjectCheckpointStore {
                 state = excluded.state,
                 result_returned_by_tool = excluded.result_returned_by_tool,
                 archived = excluded.archived,
-                parent_goal_id = excluded.parent_goal_id",
+                parent_goal_id = excluded.parent_goal_id,
+                updated_at = excluded.updated_at",
         )?((
             record.owner_session_id.clone(),
             record.child_session_id.clone(),
@@ -765,6 +873,7 @@ impl ProjectCheckpointStore {
             result_returned_by_tool,
             i64::from(record.archived),
             record.parent_goal_id.clone(),
+            now,
         ))?;
         Ok(())
     }
@@ -781,9 +890,12 @@ impl ProjectCheckpointStore {
             Option<i64>,
             i64,
             Option<String>,
+            Option<String>,
+            Option<String>,
         )>(
             "SELECT owner_session_id, child_session_id, generation, state,
-                    result_returned_by_tool, archived, parent_goal_id
+                    result_returned_by_tool, archived, parent_goal_id,
+                    created_at, updated_at
              FROM runtime_task_records
              WHERE owner_session_id = ?1
              ORDER BY child_session_id, generation DESC",
@@ -799,6 +911,8 @@ impl ProjectCheckpointStore {
                     result_returned_by_tool,
                     archived,
                     parent_goal_id,
+                    created_at,
+                    updated_at,
                 )| {
                     Ok(RuntimeTaskRecord {
                         owner_session_id,
@@ -809,10 +923,155 @@ impl ProjectCheckpointStore {
                         result_returned_by_tool: result_returned_by_tool.map(|value| value != 0),
                         archived: archived != 0,
                         parent_goal_id,
+                        created_at: parse_timestamp(created_at),
+                        updated_at: parse_timestamp(updated_at),
                     })
                 },
             )
             .collect()
+    }
+
+    /// Converts non-terminal rows that the owning thread no longer knows about
+    /// into `abandoned`. `live` holds the (child, generation) pairs still held
+    /// in memory, so a crashed turn cannot leave tasks "running" forever.
+    pub fn reconcile_runtime_tasks(
+        &self,
+        owner_session_id: &str,
+        live: &[(String, u64)],
+    ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut abandoned = 0;
+        for record in self.query_runtime_task_records(owner_session_id)? {
+            if !NON_TERMINAL_RUNTIME_TASK_STATES.contains(&record.state.as_str()) {
+                continue;
+            }
+            if live.iter().any(|(child, generation)| {
+                child == &record.child_session_id && *generation == record.generation
+            }) {
+                continue;
+            }
+            let generation =
+                i64::try_from(record.generation).context("Runtime task generation is too large")?;
+            self.connection
+                .exec_bound::<(String, String, String, i64)>(
+                    "UPDATE runtime_task_records
+                 SET state = 'abandoned', updated_at = ?1
+                 WHERE owner_session_id = ?2 AND child_session_id = ?3 AND generation = ?4",
+                )?((
+                now.clone(),
+                owner_session_id.to_owned(),
+                record.child_session_id,
+                generation,
+            ))?;
+            abandoned += 1;
+        }
+        Ok(abandoned)
+    }
+
+    /// Reconciles orphaned rows and prunes old ones in a single call so callers
+    /// cannot run one half of the maintenance and leave the ledger inconsistent.
+    pub fn maintain_runtime_tasks(
+        &self,
+        owner_session_id: &str,
+        live: &[(String, u64)],
+    ) -> Result<RuntimeTaskMaintenance> {
+        let abandoned = self.reconcile_runtime_tasks(owner_session_id, live)?;
+        let pruned = self.prune_runtime_tasks(owner_session_id, RUNTIME_TASK_RETENTION)?;
+        Ok(RuntimeTaskMaintenance { abandoned, pruned })
+    }
+
+    /// Keeps the most recently updated rows for one owner and deletes the rest.
+    pub fn prune_runtime_tasks(&self, owner_session_id: &str, keep: usize) -> Result<usize> {
+        let keep = i64::try_from(keep.max(1)).context("Runtime task retention is too large")?;
+        let before = self.query_runtime_task_records(owner_session_id)?.len();
+        self.connection.exec_bound::<(String, i64)>(
+            "DELETE FROM runtime_task_records
+             WHERE owner_session_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM runtime_task_records
+                 WHERE owner_session_id = ?1
+                 ORDER BY COALESCE(updated_at, '') DESC, generation DESC
+                 LIMIT ?2
+             )",
+        )?((owner_session_id.to_owned(), keep))?;
+        Ok(before.saturating_sub(self.query_runtime_task_records(owner_session_id)?.len()))
+    }
+
+    /// Keeps the newest handoffs per scope and deletes older ones.
+    pub fn prune_checkpoints(&self, keep_per_scope: usize) -> Result<usize> {
+        let keep =
+            i64::try_from(keep_per_scope.max(1)).context("Checkpoint retention is too large")?;
+        let before = self.count_checkpoints()?;
+        self.connection.exec_bound::<i64>(
+            "DELETE FROM checkpoints WHERE rowid NOT IN (
+                 SELECT rowid FROM (
+                     SELECT rowid,
+                            ROW_NUMBER() OVER (PARTITION BY scope ORDER BY sequence DESC) AS rank
+                     FROM checkpoints
+                 ) WHERE rank <= ?1
+             )",
+        )?(keep)?;
+        Ok(before.saturating_sub(self.count_checkpoints()?))
+    }
+
+    /// Applies every retention limit. Callers use this instead of pruning one
+    /// dimension and leaving the database to grow through the others.
+    pub fn maintain_checkpoints(&self) -> Result<usize> {
+        let pruned = self.prune_checkpoints(CHECKPOINT_RETENTION_PER_SCOPE)?;
+        let pruned_internal = self.prune_internal_scopes(INTERNAL_SCOPE_RETENTION)?;
+        Ok(pruned.saturating_add(pruned_internal))
+    }
+
+    /// Drops the oldest internal session scopes, keeping the newest `keep` of
+    /// each kind. User-named handoff scopes are never removed.
+    pub fn prune_internal_scopes(&self, keep: usize) -> Result<usize> {
+        let before = self.count_checkpoints()?;
+        self.prune_scope_prefix(AUTOMATIC_CHECKPOINT_SCOPE_PREFIX, keep)?;
+        self.prune_scope_prefix(COMPACTION_CHECKPOINT_SCOPE_PREFIX, keep)?;
+        Ok(before.saturating_sub(self.count_checkpoints()?))
+    }
+
+    fn prune_scope_prefix(&self, prefix: &str, keep: usize) -> Result<()> {
+        let keep = i64::try_from(keep.max(1)).context("Scope retention is too large")?;
+        let pattern = format!("{prefix}%");
+        self.connection.exec_bound::<(String, i64)>(
+            "DELETE FROM checkpoints
+             WHERE scope LIKE ?1 AND scope NOT IN (
+                 SELECT scope FROM (
+                     SELECT scope, MAX(sequence) AS newest
+                     FROM checkpoints
+                     WHERE scope LIKE ?1
+                     GROUP BY scope
+                     ORDER BY newest DESC
+                     LIMIT ?2
+                 )
+             )",
+        )?((pattern, keep))?;
+        Ok(())
+    }
+
+    /// Deletes every checkpoint in one scope and reports how many were removed.
+    pub fn delete_scope(&self, scope: &str) -> Result<usize> {
+        let before = self.count_scope(scope)?;
+        self.connection
+            .exec_bound::<String>("DELETE FROM checkpoints WHERE scope = ?1")?(
+            scope.to_owned()
+        )?;
+        Ok(before.saturating_sub(self.count_scope(scope)?))
+    }
+
+    pub fn count_scope(&self, scope: &str) -> Result<usize> {
+        let rows =
+            self.connection.select_bound::<String, i64>(
+                "SELECT COUNT(*) FROM checkpoints WHERE scope = ?1",
+            )?(scope.to_owned())?;
+        Ok(rows.first().copied().unwrap_or(0) as usize)
+    }
+
+    pub fn count_checkpoints(&self) -> Result<usize> {
+        let rows = self
+            .connection
+            .select_bound::<(), i64>("SELECT COUNT(*) FROM checkpoints")?(())?;
+        Ok(rows.first().copied().unwrap_or(0) as usize)
     }
 
     pub fn query_runtime_task_record(
@@ -950,6 +1209,25 @@ impl ProjectCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint(id: &str, scope: &str) -> ProjectCheckpoint {
+        ProjectCheckpoint {
+            id: id.into(),
+            session_id: "session".into(),
+            scope: scope.into(),
+            created_at: Utc::now(),
+            base_revision: None,
+            branch: None,
+            git_scan_id: None,
+            completed: Vec::new(),
+            remaining: Vec::new(),
+            decisions: Vec::new(),
+            next_steps: Vec::new(),
+            changed_files: Vec::new(),
+            evidence: Vec::new(),
+            interrupted: false,
+        }
+    }
 
     #[test]
     fn runtime_ledger_preserves_unknown_coverage_and_queries_records() -> Result<()> {
@@ -1220,6 +1498,7 @@ mod tests {
             result_returned_by_tool: Some(false),
             archived: true,
             parent_goal_id: Some("goal-a".into()),
+            ..Default::default()
         })?;
         store.upsert_runtime_task_record(&RuntimeTaskRecord {
             owner_session_id: "owner-b".into(),
@@ -1229,22 +1508,23 @@ mod tests {
             result_returned_by_tool: Some(true),
             archived: false,
             parent_goal_id: None,
+            ..Default::default()
         })?;
         drop(store);
 
         let reopened = ProjectCheckpointStore::open(root.path())?;
-        assert_eq!(
-            reopened.query_runtime_task_records("owner-a")?,
-            vec![RuntimeTaskRecord {
-                owner_session_id: "owner-a".into(),
-                child_session_id: "child".into(),
-                generation: 1,
-                state: "completed".into(),
-                result_returned_by_tool: Some(false),
-                archived: true,
-                parent_goal_id: Some("goal-a".into()),
-            }]
-        );
+        let owner_a = reopened.query_runtime_task_records("owner-a")?;
+        assert_eq!(owner_a.len(), 1);
+        let record = &owner_a[0];
+        assert_eq!(record.owner_session_id, "owner-a");
+        assert_eq!(record.child_session_id, "child");
+        assert_eq!(record.generation, 1);
+        assert_eq!(record.state, "completed");
+        assert_eq!(record.result_returned_by_tool, Some(false));
+        assert!(record.archived);
+        assert_eq!(record.parent_goal_id.as_deref(), Some("goal-a"));
+        assert!(record.created_at.is_some());
+        assert!(record.updated_at.is_some());
         assert_eq!(
             reopened
                 .query_runtime_task_record("owner-b", "child")?
@@ -1272,6 +1552,7 @@ mod tests {
             result_returned_by_tool: Some(false),
             archived: true,
             parent_goal_id: Some("goal".into()),
+            ..Default::default()
         };
         store.upsert_runtime_task_record(&current)?;
         store.upsert_runtime_task_record(&RuntimeTaskRecord {
@@ -1280,16 +1561,14 @@ mod tests {
             result_returned_by_tool: None,
             archived: false,
             parent_goal_id: None,
-            ..current.clone()
+            ..current
         })?;
-        assert_eq!(
-            store.query_runtime_task_records("owner")?,
-            vec![current.clone()]
-        );
-        assert_eq!(
-            store.query_runtime_task_record("owner", "child")?,
-            Some(current.clone())
-        );
+        let stored = store
+            .query_runtime_task_record("owner", "child")?
+            .context("stored runtime task")?;
+        assert_eq!(stored.generation, 2);
+        assert_eq!(stored.state, "completed");
+        assert_eq!(store.query_runtime_task_records("owner")?.len(), 1);
 
         store.upsert_runtime_task_record(&RuntimeTaskRecord {
             generation: 2,
@@ -1307,6 +1586,179 @@ mod tests {
         assert_eq!(updated.generation, 2);
         assert_eq!(updated.result_returned_by_tool, Some(true));
         assert!(updated.archived);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_runtime_task_root_prefers_the_first_visible_root() {
+        assert_eq!(
+            canonical_runtime_task_root([
+                PathBuf::from("/workspace/main"),
+                PathBuf::from("/workspace/linked"),
+            ]),
+            Some(PathBuf::from("/workspace/main"))
+        );
+        assert_eq!(canonical_runtime_task_root(Vec::new()), None);
+    }
+
+    #[test]
+    fn runtime_task_reconciliation_abandons_orphans_but_keeps_live_tasks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        for (child, state) in [
+            ("live", "running"),
+            ("crashed", "running"),
+            ("done", "completed"),
+        ] {
+            store.upsert_runtime_task_record(&RuntimeTaskRecord {
+                owner_session_id: "owner".into(),
+                child_session_id: child.into(),
+                generation: 1,
+                state: state.into(),
+                ..Default::default()
+            })?;
+        }
+
+        let maintenance = store.maintain_runtime_tasks("owner", &[("live".into(), 1)])?;
+        assert_eq!(maintenance.abandoned, 1);
+        assert_eq!(maintenance.pruned, 0);
+
+        let states = store
+            .query_runtime_task_records("owner")?
+            .into_iter()
+            .map(|record| (record.child_session_id, record.state))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states.get("live").map(String::as_str), Some("running"));
+        assert_eq!(states.get("crashed").map(String::as_str), Some("abandoned"));
+        assert_eq!(states.get("done").map(String::as_str), Some("completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_task_retention_keeps_the_most_recent_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        for generation in 1..=5u64 {
+            store.upsert_runtime_task_record(&RuntimeTaskRecord {
+                owner_session_id: "owner".into(),
+                child_session_id: format!("task-{generation}"),
+                generation,
+                state: "completed".into(),
+                ..Default::default()
+            })?;
+        }
+
+        assert_eq!(store.prune_runtime_tasks("owner", 2)?, 3);
+        let remaining = store.query_runtime_task_records("owner")?;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|record| record.generation >= 4));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_task_records_reject_unknown_states() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        let Err(error) = store.upsert_runtime_task_record(&RuntimeTaskRecord {
+            owner_session_id: "owner".into(),
+            child_session_id: "child".into(),
+            generation: 1,
+            state: "exploded".into(),
+            ..Default::default()
+        }) else {
+            anyhow::bail!("an unknown runtime task state must be rejected");
+        };
+        assert!(error.to_string().contains("Unsupported runtime task state"));
+        assert!(store.query_runtime_task_records("owner")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_retention_and_scope_deletion_reclaim_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        for index in 0..4 {
+            store.save(&checkpoint(&format!("task-{index}"), "task"))?;
+        }
+        store.save(&checkpoint("other", "other"))?;
+
+        assert_eq!(store.prune_checkpoints(2)?, 2);
+        assert_eq!(store.count_scope("task")?, 2);
+        assert_eq!(store.count_scope("other")?, 1);
+
+        assert_eq!(store.delete_scope("task")?, 2);
+        assert_eq!(store.count_scope("task")?, 0);
+        assert_eq!(store.count_checkpoints()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn internal_session_scopes_are_bounded_without_touching_handoffs() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        for index in 0..4 {
+            store.save(&checkpoint(
+                &format!("automatic-{index}"),
+                &format!("{AUTOMATIC_CHECKPOINT_SCOPE_PREFIX}session-{index}"),
+            ))?;
+            store.save(&checkpoint(
+                &format!("compaction-{index}"),
+                &format!("{COMPACTION_CHECKPOINT_SCOPE_PREFIX}session-{index}"),
+            ))?;
+        }
+        store.save(&checkpoint("handoff", "design-review"))?;
+
+        assert_eq!(store.prune_internal_scopes(2)?, 4);
+        assert_eq!(store.count_scope("design-review")?, 1);
+        assert_eq!(store.count_checkpoints()?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runtime_task_table_gains_lifecycle_columns() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join(paths::local_settings_folder_name());
+        std::fs::create_dir_all(&directory)?;
+        let database_path = directory.join("checkpoints.sqlite3");
+        {
+            let connection = Connection::open_file(
+                database_path
+                    .to_str()
+                    .context("database path is not valid UTF-8")?,
+            );
+            assert!(connection.persistent());
+            connection.exec(
+                "CREATE TABLE runtime_task_records (
+                    owner_session_id TEXT NOT NULL,
+                    child_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    result_returned_by_tool INTEGER,
+                    archived INTEGER NOT NULL,
+                    parent_goal_id TEXT,
+                    PRIMARY KEY (owner_session_id, child_session_id, generation)
+                )",
+            )?()?;
+            connection.exec(
+                "INSERT INTO runtime_task_records
+                 VALUES ('owner', 'child', 1, 'running', NULL, 0, NULL)",
+            )?()?;
+        }
+
+        let store = ProjectCheckpointStore::open(root.path())?;
+        let records = store.query_runtime_task_records("owner")?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "running");
+        assert!(records[0].created_at.is_some());
+        assert!(records[0].updated_at.is_some());
+
+        let journal_mode = store.connection.select::<String>("PRAGMA journal_mode")?()?;
+        assert_eq!(
+            journal_mode.first().map(|mode| mode.to_ascii_lowercase()),
+            Some("wal".to_owned())
+        );
+        let version = store.connection.select::<i64>("PRAGMA user_version")?()?;
+        assert_eq!(version, vec![1]);
         Ok(())
     }
 
