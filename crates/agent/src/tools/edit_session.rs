@@ -377,6 +377,29 @@ pub(crate) async fn run_session(
                 .ensure_buffer_saved(&session.buffer, cx)
                 .await;
             let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            // Edits are applied in order, so a later failure can leave earlier
+            // edits in the buffer. The buffer is saved before this error is
+            // returned, which means the caller must know they are on disk.
+            let applied = match &session.pipeline {
+                Pipeline::Edit(pipeline) => pipeline
+                    .edit_matches
+                    .iter()
+                    .map(|edit| edit.edit_index)
+                    .collect::<Vec<_>>(),
+                Pipeline::Write(_) => Vec::new(),
+            };
+            let error = if diff.is_empty() || applied.is_empty() {
+                error
+            } else {
+                format!(
+                    "{error}\nEdit(s) {} were applied and saved before this failure. Re-read the file before retrying; do not replay them.",
+                    applied
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let mut structured_error = ToolError::new(category, error.clone(), false);
             structured_error.side_effect = Some(if diff.is_empty() {
                 side_effect

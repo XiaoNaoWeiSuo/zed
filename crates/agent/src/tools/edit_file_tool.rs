@@ -129,7 +129,7 @@ impl EditFileTool {
                                             error: format!("Invalid edit_file input: {error}"),
                                             session,
                                             category: ToolErrorCategory::InvalidInput,
-                                            side_effect: ToolSideEffect::Unknown,
+                                            side_effect: ToolSideEffect::None,
                                         };
                                     }
                                 };
@@ -173,19 +173,19 @@ impl EditFileTool {
                                         error: format!("Edit path changed from {:?} to {:?} during streaming. No further edits were applied; earlier streamed edits may remain. Retry with a consistent path.", current_session.input_path, path),
                                         session,
                                         category: ToolErrorCategory::Conflict,
-                                        side_effect: ToolSideEffect::Unknown,
+                                        side_effect: ToolSideEffect::None,
                                     };
                                 }
 
                                 if let Some(current_session) = &mut session
                                     && let Err(error) = current_session.process_edit(parsed.edits.as_deref(), event_stream, cx)
                                 {
-                                    log::error!("Failed to process edit: {}", error);
+                                    log::warn!("Failed to process edit: {}", error);
                                     return EditSessionResult::Failed {
                                         error,
                                         session,
                                         category: ToolErrorCategory::Conflict,
-                                        side_effect: ToolSideEffect::Unknown,
+                                        side_effect: ToolSideEffect::None,
                                     };
                                 }
                             }
@@ -197,7 +197,7 @@ impl EditFileTool {
                                         error: format!("Edit path changed from {:?} to {:?} during streaming. No further edits were applied; earlier streamed edits may remain. Retry with a consistent path.", current_session.input_path, full_input.path),
                                         session,
                                         category: ToolErrorCategory::Conflict,
-                                        side_effect: ToolSideEffect::Unknown,
+                                        side_effect: ToolSideEffect::None,
                                     };
                                 }
                                 let mut session = if let Some(session) = session {
@@ -229,12 +229,12 @@ impl EditFileTool {
                                 return match session.finalize_edit(full_input.edits, event_stream, cx).await {
                                     Ok(()) => EditSessionResult::Completed(session),
                                     Err(error) => {
-                                        log::error!("Failed to finalize edit: {}", error);
+                                        log::warn!("Failed to finalize edit: {}", error);
                                         EditSessionResult::Failed {
                                             error,
                                             session: Some(session),
                                             category: ToolErrorCategory::Conflict,
-                                            side_effect: ToolSideEffect::Unknown,
+                                            side_effect: ToolSideEffect::None,
                                         }
                                     }
                                 };
@@ -989,7 +989,7 @@ mod tests {
             panic!("expected structured error");
         };
         assert_eq!(structured_error.category, ToolErrorCategory::Conflict);
-        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Unknown));
+        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::None));
         assert_eq!(structured_error.recover_with.len(), 1);
         assert_eq!(structured_error.recover_with[0].tool, "read_file");
         assert_eq!(
@@ -1088,7 +1088,7 @@ mod tests {
         let structured_error: crate::ToolError =
             serde_json::from_str(&content_text).expect("expected structured failure JSON");
         assert_eq!(structured_error.category, ToolErrorCategory::Conflict);
-        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Unknown));
+        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::None));
         assert_eq!(structured_error.recover_with.len(), 1);
         assert_eq!(structured_error.recover_with[0].tool, "read_file");
         assert_eq!(
@@ -1326,6 +1326,52 @@ mod tests {
         assert_eq!(
             buffer.read_with(cx, |buffer, _| buffer.text()),
             "old value\nold value\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_failed_batch_reports_edits_applied_before_the_failure(cx: &mut TestAppContext) {
+        let (edit_tool, project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "alpha\nbeta\n"})).await;
+        let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| edit_tool.clone().run(input, event_stream, cx));
+        sender.send_full(json!({
+            "path": "root/file.txt",
+            "edits": [
+                {"old_text": "alpha", "new_text": "ALPHA"},
+                {"old_text": "gamma", "new_text": "GAMMA"}
+            ]
+        }));
+
+        let EditFileToolOutput::Error {
+            error,
+            diff,
+            structured_error,
+            ..
+        } = task.await.unwrap_err()
+        else {
+            panic!("expected a conflict");
+        };
+        assert!(
+            error.contains("Could not find matching text for edit at index 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Edit(s) 0 were applied and saved before this failure"),
+            "{error}"
+        );
+        assert!(!diff.is_empty());
+        let structured_error = structured_error.expect("structured error");
+        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Present));
+
+        let buffer = project.read_with(cx, |project, cx| {
+            let path = project.find_project_path("root/file.txt", cx).unwrap();
+            project.get_open_buffer(&path, cx).unwrap()
+        });
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "ALPHA\nbeta\n"
         );
     }
 
