@@ -3430,7 +3430,9 @@ impl Thread {
         })
     }
 
-    fn runtime_archive_input(&self, cx: &App) -> Option<(PathBuf, Vec<crate::RuntimeTaskRecord>)> {
+    /// This thread's subagent ledger rows, or `None` when the thread does not
+    /// own a ledger (remote project, subagent, or restricted workspace).
+    fn runtime_task_archive(&self, cx: &App) -> Option<Vec<crate::RuntimeTaskRecord>> {
         let project = self.project.read(cx);
         if !project.is_local()
             || self.is_subagent()
@@ -3438,52 +3440,60 @@ impl Thread {
         {
             return None;
         }
-        let tool = self.subagent_tool.as_ref()?;
-        let records = tool
-            .model_task_states()
-            .into_iter()
-            .filter_map(|state| {
-                Some(crate::RuntimeTaskRecord {
-                    owner_session_id: self.id.0.to_string(),
-                    child_session_id: state.get("session_id")?.as_str()?.to_owned(),
-                    generation: state.get("generation")?.as_u64()?,
-                    state: state.get("state")?.as_str()?.to_owned(),
-                    result_returned_by_tool: state
-                        .get("result_returned_by_tool")
-                        .and_then(serde_json::Value::as_bool),
-                    archived: state
-                        .get("retained_snapshot_only")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && state
+        let Some(tool) = &self.subagent_tool else {
+            return Some(Vec::new());
+        };
+        Some(
+            tool.model_task_states()
+                .into_iter()
+                .filter_map(|state| {
+                    Some(crate::RuntimeTaskRecord {
+                        owner_session_id: self.id.0.to_string(),
+                        child_session_id: state.get("session_id")?.as_str()?.to_owned(),
+                        generation: state.get("generation")?.as_u64()?,
+                        state: state.get("state")?.as_str()?.to_owned(),
+                        result_returned_by_tool: state
                             .get("result_returned_by_tool")
+                            .and_then(serde_json::Value::as_bool),
+                        archived: state
+                            .get("retained_snapshot_only")
                             .and_then(serde_json::Value::as_bool)
-                            == Some(true),
-                    parent_goal_id: state
-                        .get("parent_goal_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    ..Default::default()
+                            == Some(true)
+                            && state
+                                .get("result_returned_by_tool")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true),
+                        parent_goal_id: state
+                            .get("parent_goal_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        ..Default::default()
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        if records.is_empty() {
-            return None;
+                .collect(),
+        )
+    }
+
+    /// Persists the subagent ledger and applies retention to both task rows and
+    /// saved checkpoints. Runs off-thread so disk latency cannot stall a turn,
+    /// and runs even when this thread never spawned a subagent so checkpoint
+    /// garbage collection does not depend on unrelated activity.
+    fn maintain_project_state(&self, cx: &App) {
+        let project = self.project.read(cx);
+        if !project.is_local()
+            || self.is_subagent()
+            || TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx)
+        {
+            return;
         }
-        let root = crate::canonical_runtime_task_root(
+        let Some(root) = crate::canonical_runtime_task_root(
             project
                 .visible_worktrees(cx)
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf()),
-        )?;
-        Some((root, records))
-    }
-
-    /// Writes this session's subagent ledger to its canonical root, then
-    /// reconciles orphaned rows and applies retention. Runs off-thread so disk
-    /// latency cannot stall the turn, and repeats after every `spawn_agent` call
-    /// so a crash does not lose the latest task state.
-    fn persist_runtime_task_ledger(&self, cx: &App) {
-        let Some((root, records)) = self.runtime_archive_input(cx) else {
+        ) else {
+            return;
+        };
+        let Some(records) = self.runtime_task_archive(cx) else {
             return;
         };
         let owner_session_id = self.id.0.to_string();
@@ -3492,17 +3502,27 @@ impl Thread {
             .map(|record| (record.child_session_id.clone(), record.generation))
             .collect::<Vec<_>>();
         cx.background_spawn(async move {
-            let result = (|| -> anyhow::Result<crate::RuntimeTaskMaintenance> {
-                let store = crate::ProjectCheckpointStore::open(&root)?;
-                for record in &records {
-                    store.upsert_runtime_task_record(record)?;
-                }
+            let result = (|| -> anyhow::Result<Option<crate::RuntimeTaskMaintenance>> {
+                let store = if records.is_empty() {
+                    // Opening a database that does not exist would create project
+                    // metadata just to prune nothing.
+                    match crate::ProjectCheckpointStore::open_existing(&root)? {
+                        Some(store) => store,
+                        None => return Ok(None),
+                    }
+                } else {
+                    let store = crate::ProjectCheckpointStore::open(&root)?;
+                    for record in &records {
+                        store.upsert_runtime_task_record(record)?;
+                    }
+                    store
+                };
                 let maintenance = store.maintain_runtime_tasks(&owner_session_id, &live)?;
                 store.maintain_checkpoints()?;
-                Ok(maintenance)
+                Ok(Some(maintenance))
             })();
             match result {
-                Ok(maintenance) if maintenance.abandoned > 0 || maintenance.pruned > 0 => {
+                Ok(Some(maintenance)) if maintenance.abandoned > 0 || maintenance.pruned > 0 => {
                     log::info!(
                         "Runtime task ledger maintained: {} abandoned, {} pruned",
                         maintenance.abandoned,
@@ -3511,7 +3531,7 @@ impl Thread {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!("Failed to persist runtime task metadata: {error:#}")
+                    log::error!("Failed to maintain project checkpoint state: {error:#}")
                 }
             }
         })
@@ -4185,7 +4205,7 @@ impl Thread {
 
                 _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
 
-                this.read_with(cx, |thread, cx| thread.persist_runtime_task_ledger(cx))
+                this.read_with(cx, |thread, cx| thread.maintain_project_state(cx))
                     .log_err();
 
                 let (checkpoints, roots) = this.read_with(cx, |this, cx| {
@@ -4492,7 +4512,7 @@ impl Thread {
                         // cannot lose the task state this result just changed.
                         if tool_result.tool_name.as_ref() == SpawnAgentTool::NAME {
                             this.update(cx, |thread, cx| {
-                                thread.persist_runtime_task_ledger(cx)
+                                thread.maintain_project_state(cx)
                             })
                             .log_err();
                         }
