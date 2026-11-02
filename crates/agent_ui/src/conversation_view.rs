@@ -5099,7 +5099,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_project_checkpoint_card_expands_and_collapses(cx: &mut TestAppContext) {
+    async fn test_project_checkpoint_card_opens_fully_and_closes(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let server = cx.update(|cx| {
@@ -5142,11 +5142,7 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("project-checkpoint").is_some());
-        assert!(cx.debug_bounds("project-checkpoint-details").is_none());
-        thread_view.update(cx, |view, cx| {
-            view.toggle_project_checkpoint_details(cx);
-        });
-        cx.run_until_parked();
+        // The panel opens fully rendered; there is no collapsed intermediate state.
         assert!(cx.debug_bounds("project-checkpoint-details").is_some());
         let evidence = cx
             .debug_bounds("checkpoint-evidence-0")
@@ -5154,14 +5150,11 @@ pub(crate) mod tests {
         cx.simulate_click(evidence.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("checkpoint-evidence-output").is_some());
-        let card = cx
-            .debug_bounds("project-checkpoint")
-            .expect("expanded checkpoint card");
-        cx.simulate_click(
-            point(card.origin.x + px(30.), card.origin.y + px(10.)),
-            gpui::Modifiers::default(),
-        );
+        thread_view.update(cx, |view, cx| {
+            view.toggle_project_checkpoint(cx);
+        });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("project-checkpoint").is_none());
         assert!(cx.debug_bounds("project-checkpoint-details").is_none());
     }
 

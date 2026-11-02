@@ -936,7 +936,6 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     checkpoint_card_visible: bool,
-    checkpoint_expanded: bool,
     checkpoint_evidence_request_id: usize,
     checkpoint_evidence_text: Option<String>,
     checkpoint_evidence_next: Option<(String, String, std::path::PathBuf, usize)>,
@@ -1535,7 +1534,6 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             checkpoint_card_visible: false,
-            checkpoint_expanded: false,
             checkpoint_evidence_request_id: 0,
             checkpoint_evidence_text: None,
             checkpoint_evidence_next: None,
@@ -6240,18 +6238,6 @@ impl ThreadView {
     pub(crate) fn toggle_project_checkpoint(&mut self, cx: &mut Context<Self>) {
         self.checkpoint_card_visible = !self.checkpoint_card_visible;
         if !self.checkpoint_card_visible {
-            self.checkpoint_expanded = false;
-            self.checkpoint_evidence_request_id =
-                self.checkpoint_evidence_request_id.wrapping_add(1);
-            self.checkpoint_evidence_text = None;
-            self.checkpoint_evidence_next = None;
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_project_checkpoint_details(&mut self, cx: &mut Context<Self>) {
-        self.checkpoint_expanded = !self.checkpoint_expanded;
-        if !self.checkpoint_expanded {
             self.checkpoint_evidence_request_id =
                 self.checkpoint_evidence_request_id.wrapping_add(1);
             self.checkpoint_evidence_text = None;
@@ -6652,7 +6638,6 @@ impl ThreadView {
         } else {
             summary.join(" · ")
         };
-        let expanded = self.checkpoint_expanded;
         Some(
             v_flex()
                 .id("project-checkpoint")
@@ -6673,9 +6658,6 @@ impl ThreadView {
                         .px_3()
                         .py_2()
                         .gap_1()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().element_hover))
-                        .child(Disclosure::new("project-checkpoint-disclosure", expanded))
                         .child(
                             Icon::new(IconName::DatabaseZap)
                                 .size(IconSize::XSmall)
@@ -6718,120 +6700,66 @@ impl ThreadView {
                                     cx.stop_propagation();
                                     this.toggle_project_checkpoint(cx);
                                 })),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_project_checkpoint_details(cx);
-                        })),
+                        ),
                 )
-                .when(expanded, |card| {
-                    card.child(
-                        v_flex()
-                            .id("project-checkpoint-details")
-                            .debug_selector(|| "project-checkpoint-details".to_string())
-                            .max_h(px(280.))
-                            .overflow_y_scroll()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(cx.theme().colors().border)
-                            .bg(cx.theme().colors().editor_background)
-                            .px_3()
-                            .py_2()
-                            .children(sections.into_iter().map(|(title, items)| {
-                                if items.is_empty() {
-                                    v_flex()
-                                        .pt_1()
-                                        .child(Label::new(title).size(LabelSize::Small))
-                                } else {
-                                    v_flex()
-                                        .gap_1()
-                                        .child(
-                                            Label::new(title)
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                        .children(items.into_iter().map(|item| {
-                                            h_flex()
-                                                .items_start()
-                                                .gap_2()
-                                                .pl_1()
-                                                .child(
-                                                    Label::new("•")
-                                                        .size(LabelSize::Small)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().colors().text)
-                                                        .child(item),
-                                                )
-                                        }))
-                                }
-                            }))
-                            .when(!evidence_buttons.is_empty(), |body| {
-                                body.child(
-                                    Label::new(format!("Recorded observations · {total_evidence}"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .children(evidence_buttons.into_iter().enumerate().map(
-                                |(index, (description, source, scope, root))| {
-                                    div()
-                                        .id(("checkpoint-evidence-container", index))
-                                        .debug_selector(move || {
-                                            format!("checkpoint-evidence-{index}")
-                                        })
-                                        .child(
-                                            Button::new(
-                                                ("checkpoint-evidence", index),
-                                                description,
+                .child(
+                    v_flex()
+                        .id("project-checkpoint-details")
+                        .debug_selector(|| "project-checkpoint-details".to_string())
+                        .max_h(px(280.))
+                        .overflow_y_scroll()
+                        .gap_3()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .px_3()
+                        .py_2()
+                        .children(sections.into_iter().map(|(title, items)| {
+                            if items.is_empty() {
+                                v_flex()
+                                    .pt_1()
+                                    .child(Label::new(title).size(LabelSize::Small))
+                            } else {
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(title)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(items.into_iter().map(|item| {
+                                        h_flex()
+                                            .items_start()
+                                            .gap_2()
+                                            .pl_1()
+                                            .child(
+                                                Label::new("•")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
                                             )
-                                            .style(ButtonStyle::Subtle)
-                                            .label_size(LabelSize::Small)
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.load_checkpoint_evidence(
-                                                        source.clone(),
-                                                        scope.clone(),
-                                                        root.clone(),
-                                                        0,
-                                                        cx,
-                                                    );
-                                                }),
-                                            ),
-                                        )
-                                },
-                            ))
-                            .when(total_evidence > 3, |body| {
-                                body.child(
-                                    Label::new(format!(
-                                        "+{} more observations in the saved record",
-                                        total_evidence - 3
-                                    ))
-                                    .size(LabelSize::XSmall)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().colors().text)
+                                                    .child(item),
+                                            )
+                                    }))
+                            }
+                        }))
+                        .when(!evidence_buttons.is_empty(), |body| {
+                            body.child(
+                                Label::new(format!("Recorded observations · {total_evidence}"))
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted),
-                                )
-                            })
-                            .when_some(self.checkpoint_evidence_text.clone(), |body, text| {
-                                body.child(
-                                    v_flex()
-                                        .id("checkpoint-evidence-output")
-                                        .debug_selector(|| "checkpoint-evidence-output".to_string())
-                                        .max_h_40()
-                                        .overflow_y_scroll()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().colors().border)
-                                        .p_2()
-                                        .child(Label::new(text).size(LabelSize::Small)),
-                                )
-                            })
-                            .when_some(
-                                self.checkpoint_evidence_next.clone(),
-                                |body, (source, scope, root, offset)| {
-                                    body.child(
-                                        Button::new("checkpoint-evidence-next", "Load more")
+                            )
+                        })
+                        .children(evidence_buttons.into_iter().enumerate().map(
+                            |(index, (description, source, scope, root))| {
+                                div()
+                                    .id(("checkpoint-evidence-container", index))
+                                    .debug_selector(move || format!("checkpoint-evidence-{index}"))
+                                    .child(
+                                        Button::new(("checkpoint-evidence", index), description)
                                             .style(ButtonStyle::Subtle)
                                             .label_size(LabelSize::Small)
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -6839,15 +6767,57 @@ impl ThreadView {
                                                     source.clone(),
                                                     scope.clone(),
                                                     root.clone(),
-                                                    offset,
+                                                    0,
                                                     cx,
                                                 );
                                             })),
                                     )
-                                },
-                            ),
-                    )
-                })
+                            },
+                        ))
+                        .when(total_evidence > 3, |body| {
+                            body.child(
+                                Label::new(format!(
+                                    "+{} more observations in the saved record",
+                                    total_evidence - 3
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        })
+                        .when_some(self.checkpoint_evidence_text.clone(), |body, text| {
+                            body.child(
+                                v_flex()
+                                    .id("checkpoint-evidence-output")
+                                    .debug_selector(|| "checkpoint-evidence-output".to_string())
+                                    .max_h_40()
+                                    .overflow_y_scroll()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .p_2()
+                                    .child(Label::new(text).size(LabelSize::Small)),
+                            )
+                        })
+                        .when_some(
+                            self.checkpoint_evidence_next.clone(),
+                            |body, (source, scope, root, offset)| {
+                                body.child(
+                                    Button::new("checkpoint-evidence-next", "Load more")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.load_checkpoint_evidence(
+                                                source.clone(),
+                                                scope.clone(),
+                                                root.clone(),
+                                                offset,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            },
+                        ),
+                )
                 .into_any_element(),
         )
     }
