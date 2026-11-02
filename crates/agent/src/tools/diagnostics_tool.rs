@@ -234,9 +234,15 @@ impl AgentTool for DiagnosticsTool {
 
                     let freshness = freshness_message(refreshed);
                     if output.is_empty() {
-                        Ok(format!(
-                            "{freshness}\n\nFile doesn't have errors or warnings!"
-                        ))
+                        if refreshed {
+                            Ok(format!(
+                                "{freshness}\n\nFile doesn't have errors or warnings!"
+                            ))
+                        } else {
+                            Ok(format!(
+                                "{freshness}\n\nNo diagnostics are currently known for this file. A refresh did not succeed, so this does not prove the file is clean. Check that a language server is attached and idle before concluding anything."
+                            ))
+                        }
                     } else {
                         Ok(format!("{freshness}\n\n{output}"))
                     }
@@ -272,9 +278,13 @@ impl AgentTool for DiagnosticsTool {
                     let freshness = freshness_message(refreshed);
                     if has_diagnostics {
                         Ok(format!("{freshness}\n\n{output}"))
-                    } else {
+                    } else if refreshed {
                         Ok(format!(
                             "{freshness}\n\nNo errors or warnings found in the project."
+                        ))
+                    } else {
+                        Ok(format!(
+                            "{freshness}\n\nNo diagnostics are currently known. The refresh did not succeed, so this does not prove the project is clean; check that language servers are attached and idle before concluding anything."
                         ))
                     }
                 }

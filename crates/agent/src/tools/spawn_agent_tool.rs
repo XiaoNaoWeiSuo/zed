@@ -409,10 +409,16 @@ impl AgentTool for SpawnAgentTool {
                 }
                 return Ok(SpawnAgentToolOutput::Task { task: snapshot });
             }
-            if input.message.trim().is_empty() || input.wait {
+            if input.message.trim().is_empty() {
                 return Err(error(
                     input.session_id,
-                    "Start requires a nonempty message; wait is only for result".into(),
+                    "Start requires a nonempty message".into(),
+                ));
+            }
+            if input.wait {
+                return Err(error(
+                    input.session_id,
+                    "wait is only supported for the result action, not start".into(),
                 ));
             }
             let SpawnAgentToolInput {

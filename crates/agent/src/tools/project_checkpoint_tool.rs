@@ -97,6 +97,17 @@ fn checkpoint_read_view(
             fields.insert("summary_may_be_truncated".into(), truncated.into());
             fields.insert("detail".into(), "summary".into());
         }
+    } else if let Some(fields) = value.as_object_mut() {
+        if let Some(entries) = fields
+            .get_mut("evidence")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let total = entries.len();
+            if total > 5 {
+                entries.truncate(5);
+                fields.insert("evidence_omitted_count".into(), (total - 5).into());
+            }
+        }
     }
     Ok(value)
 }
@@ -185,6 +196,10 @@ impl AgentTool for ProjectCheckpointTool {
                 if input.action == "save" {
                     anyhow::ensure!(input.scope.chars().count() <= 200, "Checkpoint scopes must be at most 200 characters");
                 }
+                anyhow::ensure!(
+                    !(input.action == "list" && !input.scope.trim().is_empty()),
+                    "`list` does not accept `scope`; omit it to list all scopes, or use `read` with that scope"
+                );
                 let (root, session_id, files, git, evidence) = self.thread.read_with(cx, |thread, cx| -> anyhow::Result<_> {
                     let project = thread.project().read(cx);
                     anyhow::ensure!(project.is_local(), "Project checkpoints currently require a local project");

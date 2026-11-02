@@ -113,10 +113,12 @@ impl AgentTool for RenameTool {
             let transaction = rename_task.await.map_err(|error| {
                 tool_error_json(
                     ToolErrorCategory::Unavailable,
-                    format!("Rename failed: {error}"),
+                    format!("Rename failed before any file was modified: {error}"),
                     false,
                     vec![],
-                    Some(ToolSideEffect::Unknown),
+                    // The language server failed before applying edits, so no
+                    // buffer could have changed.
+                    Some(ToolSideEffect::None),
                 )
             })?;
 

@@ -31,7 +31,7 @@ pub struct InspectToolResultInput {
     /// List offset, or Unicode character offset within a selected result.
     #[serde(default)]
     pub offset: usize,
-    /// Page size: up to 50 calls or 16000 characters. Defaults to 20 calls or 4000 characters.
+    /// Page size: up to 50 calls or 16000 characters. Defaults to 20 calls or 1500 characters.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -136,7 +136,7 @@ impl AgentTool for InspectToolResultTool {
                             let (text, next_offset) = result_page(
                                 &text,
                                 input.offset,
-                                input.limit.unwrap_or(4000).clamp(1, 16000),
+                                input.limit.unwrap_or(1500).clamp(1, 16000),
                             )?;
                             Ok(InspectToolResultOutput {
                                 entries: vec![summary(id.clone(), result)],
@@ -331,7 +331,7 @@ pub fn inspect_checkpoint_evidence(
         let (text, next_offset) = result_page(
             &text,
             input.offset,
-            input.limit.unwrap_or(4000).clamp(1, 16000),
+            input.limit.unwrap_or(1500).clamp(1, 16000),
         )?;
         Ok(InspectToolResultOutput {
             entries: vec![ToolResultSummary {

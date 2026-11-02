@@ -95,18 +95,24 @@ impl AgentTool for GoToDefinitionTool {
                 project.definitions(&resolved.buffer, resolved.position, cx)
             });
 
-            let definitions = definitions_task
-                .await
-                .map_err(|error| {
-                    tool_error_json(
-                        ToolErrorCategory::Unavailable,
-                        format!("Go to definition failed: {error}"),
-                        false,
-                        vec![],
-                        Some(ToolSideEffect::None),
-                    )
-                })?
-                .unwrap_or_default();
+            let definitions = definitions_task.await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::Unavailable,
+                    format!("Go to definition failed: {error}"),
+                    false,
+                    vec![],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
+            let Some(definitions) = definitions else {
+                return Err(tool_error_json(
+                    ToolErrorCategory::Unavailable,
+                    "The language server returned no result; it may still be indexing. Retry once the project finishes loading.",
+                    true,
+                    vec![],
+                    Some(ToolSideEffect::None),
+                ));
+            };
 
             if definitions.is_empty() {
                 return Ok(format!(

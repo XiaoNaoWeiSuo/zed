@@ -21,6 +21,7 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 pub struct ApplyCodeActionToolInput {
     /// The 1-based index of the code action to apply, from the list
     /// returned by get_code_actions.
+    #[schemars(range(min = 1))]
     pub index: u32,
 }
 

@@ -431,7 +431,12 @@ impl AgentTool for GrepTool {
             }
 
             if matches_found == 0 {
-                Ok("No matches found".into())
+                Ok(match input.include_pattern.as_deref() {
+                    Some(pattern) => format!(
+                        "No matches found. `include_pattern` `{pattern}` is matched against full project paths that start with a root directory, so a pattern like `src/*.rs` can match zero files. Zero matches may mean no matching files or no matching content; retry with a root-prefixed glob such as `**/{pattern}` to tell them apart."
+                    ),
+                    None => "No matches found".to_string(),
+                })
             } else if has_more_matches {
                 Ok(format!(
                     "Showing matches {}-{} (there were more matches found; use offset: {} to see next page):\n{output}",

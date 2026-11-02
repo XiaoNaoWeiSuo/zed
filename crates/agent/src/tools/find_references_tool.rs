@@ -95,18 +95,24 @@ impl AgentTool for FindReferencesTool {
                 project.references(&resolved.buffer, resolved.position, cx)
             });
 
-            let references = references_task
-                .await
-                .map_err(|error| {
-                    tool_error_json(
-                        ToolErrorCategory::Unavailable,
-                        format!("Find references failed: {error}"),
-                        false,
-                        vec![],
-                        Some(ToolSideEffect::None),
-                    )
-                })?
-                .unwrap_or_default();
+            let references = references_task.await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::Unavailable,
+                    format!("Find references failed: {error}"),
+                    false,
+                    vec![],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
+            let Some(references) = references else {
+                return Err(tool_error_json(
+                    ToolErrorCategory::Unavailable,
+                    "The language server returned no result; it may still be indexing. Retry once the project finishes loading.",
+                    true,
+                    vec![],
+                    Some(ToolSideEffect::None),
+                ));
+            };
 
             if references.is_empty() {
                 return Ok(format!(

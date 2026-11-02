@@ -401,6 +401,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_code_action_index_schema_starts_at_one() {
+        let tool = built_in_tool("apply_code_action").expect("tool");
+        let schema = tool.schema();
+        let language_model::LanguageModelRequestToolInput::Function { input_schema, .. } =
+            schema.input
+        else {
+            panic!("expected a function schema");
+        };
+        assert_eq!(
+            input_schema["properties"]["index"]["minimum"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
     fn built_in_tool_schemas_are_normalized() {
         let tools = built_in_tools().collect::<Vec<_>>();
 

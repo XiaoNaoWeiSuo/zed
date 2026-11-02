@@ -80,6 +80,7 @@ pub struct TerminalToolInput {
     #[serde(default)]
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
+    /// Defaults to the single project root; required when the workspace has more than one root.
     #[serde(default)]
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
@@ -127,6 +128,7 @@ pub struct SandboxedTerminalToolInput {
     #[serde(default)]
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
+    /// Defaults to the single project root; required when the workspace has more than one root.
     #[serde(default)]
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
@@ -1504,10 +1506,18 @@ async fn run_terminal_tool(
             _ => return sessions.manage(request, &input, &event_stream, cx).await,
         }
     }
-    if input.command.trim().is_empty() || input.cd.trim().is_empty() {
+    if input.command.trim().is_empty() {
         return Err(terminal_error(
             ToolErrorCategory::InvalidInput,
-            "Starting a terminal requires command and cd",
+            "Starting a terminal requires a nonempty command",
+            terminal_input_recovery(),
+            ToolSideEffect::None,
+        ));
+    }
+    if input.cd.trim().is_empty() {
+        return Err(terminal_error(
+            ToolErrorCategory::InvalidInput,
+            "cd is required: pass a project root directory or a subdirectory of one. The working directory is never inferred.",
             terminal_input_recovery(),
             ToolSideEffect::None,
         ));
