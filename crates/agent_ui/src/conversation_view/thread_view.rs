@@ -6307,6 +6307,18 @@ impl ThreadView {
         ))
     }
 
+    fn checkpoint_age_label(created_at: &str) -> Option<String> {
+        let created_at = chrono::DateTime::parse_from_rfc3339(created_at).ok()?;
+        let age = chrono::Utc::now().signed_duration_since(created_at.with_timezone(&chrono::Utc));
+        Some(if age.num_days() > 0 {
+            format!("{}d ago", age.num_days())
+        } else if age.num_hours() > 0 {
+            format!("{}h ago", age.num_hours())
+        } else {
+            format!("{}m ago", age.num_minutes().max(1))
+        })
+    }
+
     fn render_project_checkpoint(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.checkpoint_card_visible {
             return None;
@@ -6324,9 +6336,16 @@ impl ThreadView {
                 .and_then(|value| value.as_bool())
                 == Some(true)
         });
+        let goal_paused = native_thread
+            .read(cx)
+            .goal()
+            .is_some_and(|goal| goal.status == agent::ThreadGoalStatus::Paused);
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-        let mut notes = Vec::new();
-        let mut evidence_buttons = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut evidence_buttons: Vec<(String, String, String, std::path::PathBuf)> = Vec::new();
+        let mut remaining_count = 0usize;
+        let mut next_step_count = 0usize;
+        let mut completed_count = 0usize;
         for entry in &entries {
             if entry
                 .get("additional_roots_omitted")
@@ -6355,26 +6374,55 @@ impl ThreadView {
                 .get("scope")
                 .and_then(|value| value.as_str())
                 .unwrap_or("Project");
-            let scope = if scope.starts_with(agent::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX) {
+            let is_recent_activity = scope.starts_with(agent::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX);
+            let display_scope = if is_recent_activity {
                 "Recent activity"
             } else {
                 scope
             };
-            sections.push((format!("{root} · {scope}"), Vec::new()));
+            let mut heading = format!("{root} · {display_scope}");
+            if let Some(age) = entry
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .and_then(Self::checkpoint_age_label)
+            {
+                heading.push_str(&format!(" · {age}"));
+            }
+            if goal_paused && !is_recent_activity {
+                heading.push_str(" · goal paused");
+            }
+            sections.push((heading, Vec::new()));
             if let Some(scopes) = entry
                 .get("available_scopes")
                 .and_then(|value| value.as_array())
             {
                 let other_scopes = scopes
                     .iter()
-                    .filter_map(|scope| scope.get("scope").and_then(|value| value.as_str()))
-                    .filter(|name| *name != scope)
+                    .filter_map(|scope| {
+                        let name = scope.get("scope").and_then(|value| value.as_str())?;
+                        if name == display_scope {
+                            return None;
+                        }
+                        let remaining = scope
+                            .get("remaining_count")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0);
+                        let age = scope
+                            .get("created_at")
+                            .and_then(|value| value.as_str())
+                            .and_then(Self::checkpoint_age_label);
+                        Some(match (remaining, age) {
+                            (0, Some(age)) => format!("{name} · {age}"),
+                            (0, None) => name.to_string(),
+                            (remaining, Some(age)) => {
+                                format!("{name} · {remaining} remaining · {age}")
+                            }
+                            (remaining, None) => format!("{name} · {remaining} remaining"),
+                        })
+                    })
                     .collect::<Vec<_>>();
                 if !other_scopes.is_empty() {
-                    sections.push((
-                        "Other handoffs".into(),
-                        other_scopes.into_iter().map(str::to_string).collect(),
-                    ));
+                    sections.push(("Other handoffs".into(), other_scopes));
                 }
             }
             if entry
@@ -6396,14 +6444,31 @@ impl ThreadView {
                 ("new_dirty_files", "New Git changes"),
             ] {
                 if let Some(values) = entry.get(key).and_then(|value| value.as_array()) {
-                    let values = values
+                    let mut values = values
                         .iter()
                         .filter_map(|value| value.as_str())
                         .map(str::to_string)
                         .collect::<Vec<_>>();
-                    if !values.is_empty() {
-                        sections.push((title.into(), values));
+                    let total = values.len();
+                    if total == 0 {
+                        continue;
                     }
+                    match key {
+                        "remaining" => remaining_count += total,
+                        "next_steps" => next_step_count += total,
+                        "completed" => completed_count += total,
+                        _ => {}
+                    }
+                    let file_section = matches!(
+                        key,
+                        "changed_files" | "files_not_checked" | "new_dirty_files"
+                    );
+                    let limit = if file_section { 3 } else { 5 };
+                    if total > limit {
+                        values.truncate(limit);
+                        values.push(format!("+{} more", total - limit));
+                    }
+                    sections.push((format!("{title} · {total}"), values));
                 }
             }
             if entry.get("interrupted").and_then(|value| value.as_bool()) == Some(true)
@@ -6479,7 +6544,11 @@ impl ThreadView {
                             item.get("source").and_then(|value| value.as_str()),
                         ) {
                             evidence_buttons.push((
-                                description.to_string(),
+                                description
+                                    .split(" (")
+                                    .next()
+                                    .unwrap_or(description)
+                                    .to_string(),
                                 source.to_string(),
                                 format!("{}{session}", agent::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX),
                                 std::path::PathBuf::from(root),
@@ -6506,7 +6575,11 @@ impl ThreadView {
                             entry.get("scope").and_then(|value| value.as_str()),
                         ) {
                             evidence_buttons.push((
-                                description.to_string(),
+                                description
+                                    .split(" (")
+                                    .next()
+                                    .unwrap_or(description)
+                                    .to_string(),
                                 source.to_string(),
                                 scope.to_string(),
                                 std::path::PathBuf::from(root),
@@ -6546,21 +6619,11 @@ impl ThreadView {
             notes.push("Only recorded files were checked; Git status may be delayed.".into());
         }
         if !notes.is_empty() {
-            sections.push((
-                "Status".into(),
-                notes.into_iter().unique().collect::<Vec<_>>(),
-            ));
+            let notes = notes.into_iter().unique().collect::<Vec<_>>().join(" · ");
+            sections.push(("Status".into(), vec![notes]));
         }
-        let section_item_count = |title: &str| {
-            sections
-                .iter()
-                .filter(|(section_title, _)| section_title == title)
-                .map(|(_, items)| items.len())
-                .sum::<usize>()
-        };
-        let remaining_count = section_item_count("Remaining");
-        let next_step_count = section_item_count("Next steps");
-        let completed_count = section_item_count("Completed");
+        let total_evidence = evidence_buttons.len();
+        evidence_buttons.truncate(3);
         let mut summary = Vec::new();
         if remaining_count > 0 {
             summary.push(format!("{remaining_count} remaining"));
@@ -6574,20 +6637,15 @@ impl ThreadView {
         if summary.is_empty() && completed_count > 0 {
             summary.push(format!("{completed_count} completed"));
         }
+        if goal_paused {
+            summary.push("goal paused".into());
+        }
         if let Some(created_at) = entries
             .iter()
             .find_map(|entry| entry.get("created_at").and_then(serde_json::Value::as_str))
-            && let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(created_at)
+            && let Some(age) = Self::checkpoint_age_label(created_at)
         {
-            let age =
-                chrono::Utc::now().signed_duration_since(created_at.with_timezone(&chrono::Utc));
-            summary.push(if age.num_days() > 0 {
-                format!("{}d ago", age.num_days())
-            } else if age.num_hours() > 0 {
-                format!("{}h ago", age.num_hours())
-            } else {
-                format!("{}m ago", age.num_minutes().max(1))
-            });
+            summary.push(age);
         }
         let summary = if summary.is_empty() {
             "Saved session state".into()
@@ -6601,7 +6659,7 @@ impl ThreadView {
                 .debug_selector(|| "project-checkpoint".to_string())
                 .w(px(380.))
                 .max_w_full()
-                .max_h(px(280.))
+                .max_h(px(320.))
                 .overflow_hidden()
                 .rounded_md()
                 .border_1()
@@ -6618,6 +6676,11 @@ impl ThreadView {
                         .cursor_pointer()
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .child(Disclosure::new("project-checkpoint-disclosure", expanded))
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
                         .child(
                             Label::new("Project memory")
                                 .size(LabelSize::Small)
@@ -6665,7 +6728,7 @@ impl ThreadView {
                         v_flex()
                             .id("project-checkpoint-details")
                             .debug_selector(|| "project-checkpoint-details".to_string())
-                            .max_h(px(220.))
+                            .max_h(px(280.))
                             .overflow_y_scroll()
                             .gap_3()
                             .border_b_1()
@@ -6674,30 +6737,42 @@ impl ThreadView {
                             .px_3()
                             .py_2()
                             .children(sections.into_iter().map(|(title, items)| {
-                                v_flex()
-                                    .gap_1()
-                                    .child(Label::new(title).size(LabelSize::Small))
-                                    .children(items.into_iter().map(|item| {
-                                        h_flex()
-                                            .items_start()
-                                            .gap_2()
-                                            .pl_1()
-                                            .child(
-                                                Label::new("•")
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().colors().text)
-                                                    .child(item),
-                                            )
-                                    }))
+                                if items.is_empty() {
+                                    v_flex()
+                                        .pt_1()
+                                        .child(Label::new(title).size(LabelSize::Small))
+                                } else {
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(title)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .children(items.into_iter().map(|item| {
+                                            h_flex()
+                                                .items_start()
+                                                .gap_2()
+                                                .pl_1()
+                                                .child(
+                                                    Label::new("•")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().colors().text)
+                                                        .child(item),
+                                                )
+                                        }))
+                                }
                             }))
                             .when(!evidence_buttons.is_empty(), |body| {
                                 body.child(
-                                    Label::new("Recorded observations").size(LabelSize::Small),
+                                    Label::new(format!("Recorded observations · {total_evidence}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
                                 )
                             })
                             .children(evidence_buttons.into_iter().enumerate().map(
@@ -6728,6 +6803,16 @@ impl ThreadView {
                                         )
                                 },
                             ))
+                            .when(total_evidence > 3, |body| {
+                                body.child(
+                                    Label::new(format!(
+                                        "+{} more observations in the saved record",
+                                        total_evidence - 3
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                )
+                            })
                             .when_some(self.checkpoint_evidence_text.clone(), |body, text| {
                                 body.child(
                                     v_flex()

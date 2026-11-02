@@ -5114,7 +5114,18 @@ pub(crate) mod tests {
             .read_with(cx, |view, cx| view.as_native_thread(cx))
             .expect("native thread");
         native_thread.update(cx, |thread, cx| thread.set_project_checkpoint_context_for_test(
-            serde_json::json!([{"root":"project", "scope":"agent", "remaining":["Verify recovery"], "evidence":[{"description":"Previous test", "source":"session:missing/tool:missing"}]}]).to_string(), cx
+            serde_json::json!([{
+                "root": "project",
+                "scope": "agent",
+                "created_at": "2026-10-29T00:00:00Z",
+                "remaining": ["Verify recovery"],
+                "evidence": [{
+                    "description": "Previous test (execution result only; relevance and freshness require review)",
+                    "source": "session:missing/tool:missing"
+                }]
+            }])
+            .to_string(),
+            cx,
         ));
         cx.run_until_parked();
         assert!(cx.debug_bounds("project-checkpoint").is_none());
