@@ -5898,6 +5898,34 @@ impl LspStore {
             .collect()
     }
 
+    /// Whether at least one running language server has this buffer open.
+    ///
+    /// LSP requests are only sent to servers recorded in
+    /// `buffers_opened_in_servers`, so callers that open a buffer themselves
+    /// must register it first and wait for this to become true; otherwise an
+    /// empty result means "no server yet", not "symbol absent".
+    pub fn buffer_is_registered_with_running_server(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> bool {
+        let Some(local) = self.as_local() else {
+            return false;
+        };
+        let buffer_id = buffer.read(cx).remote_id();
+        local
+            .buffers_opened_in_servers
+            .get(&buffer_id)
+            .is_some_and(|servers| {
+                servers.iter().any(|server_id| {
+                    matches!(
+                        local.language_servers.get(server_id),
+                        Some(LanguageServerState::Running { .. })
+                    )
+                })
+            })
+    }
+
     fn synced_server_capabilities(&self, server: &LanguageServer) -> SyncedServerCapabilities {
         let (initial_server_capabilities, text_document_registrations) = self
             .as_local()

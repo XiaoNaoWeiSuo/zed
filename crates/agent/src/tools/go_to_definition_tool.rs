@@ -115,6 +115,15 @@ impl AgentTool for GoToDefinitionTool {
             };
 
             if definitions.is_empty() {
+                if !resolved.lsp_ready {
+                    return Err(tool_error_json(
+                        ToolErrorCategory::Unavailable,
+                        "The language server has not finished attaching to this file, so an empty definition result is inconclusive. Retry after the project finishes loading.",
+                        true,
+                        vec![],
+                        Some(ToolSideEffect::None),
+                    ));
+                }
                 return Ok(format!(
                     "No definition found for '{}'.",
                     input.symbol.symbol_name

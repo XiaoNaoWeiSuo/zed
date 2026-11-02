@@ -125,6 +125,15 @@ impl AgentTool for GetCodeActionsTool {
 
             if actions.is_empty() {
                 store.update(cx, |store, _cx| *store = None);
+                if !resolved.lsp_ready {
+                    return Err(tool_error_json(
+                        ToolErrorCategory::Unavailable,
+                        "The language server has not finished attaching to this file, so an empty code-action result is inconclusive. Retry after the project finishes loading.",
+                        true,
+                        vec![],
+                        Some(ToolSideEffect::None),
+                    ));
+                }
                 return Ok(format!(
                     "No code actions available for '{}' at this location.",
                     input.symbol.symbol_name
@@ -145,6 +154,7 @@ impl AgentTool for GetCodeActionsTool {
                 *store = Some(PendingCodeActions {
                     actions,
                     buffer: resolved.buffer,
+                    _lsp_handle: resolved._lsp_handle,
                 });
             });
 

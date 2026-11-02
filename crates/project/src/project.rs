@@ -3405,6 +3405,15 @@ impl Project {
         })
     }
 
+    /// Whether a running language server has this buffer open. Callers that
+    /// open a buffer purely to issue an LSP request must register it and wait
+    /// for this before treating an empty response as "not found".
+    pub fn buffer_has_open_language_server(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        self.lsp_store
+            .read(cx)
+            .buffer_is_registered_with_running_server(buffer, cx)
+    }
+
     pub fn open_unstaged_diff(
         &mut self,
         buffer: Entity<Buffer>,

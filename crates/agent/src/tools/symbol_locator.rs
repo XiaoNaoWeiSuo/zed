@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::Duration;
 
 use gpui::{App, AsyncApp, Entity};
 use language::{Buffer, Location};
-use project::{CodeAction, Project};
+use project::{CodeAction, Project, lsp_store::OpenLspBufferHandle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use text::ToPoint as _;
@@ -27,6 +28,9 @@ pub struct SymbolLocator {
 pub struct PendingCodeActions {
     pub actions: Vec<CodeAction>,
     pub buffer: Entity<Buffer>,
+    /// Keeps the document registered with its language server until the action
+    /// is applied or replaced; dropping it earlier unregisters the buffer.
+    pub(crate) _lsp_handle: OpenLspBufferHandle,
 }
 
 pub type CodeActionStore = Entity<Option<PendingCodeActions>>;
@@ -36,6 +40,39 @@ pub struct ResolvedSymbol {
     pub position: Anchor,
     pub line_text: String,
     pub truncated: bool,
+    /// False when no running language server has attached to the buffer yet.
+    /// An empty LSP response is not conclusive in that state.
+    pub lsp_ready: bool,
+    /// Keeps the buffer registered with language servers until the request
+    /// completes; dropping it early unregisters the buffer and drops didOpen.
+    pub(crate) _lsp_handle: OpenLspBufferHandle,
+}
+
+const LSP_READY_ATTEMPTS: usize = 50;
+const LSP_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Waits until a running language server has this buffer open. Callers that
+/// opened the buffer themselves must register it first; otherwise the LSP
+/// request is silently filtered out and an empty result looks like "absent".
+pub(crate) async fn wait_for_language_server(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    cx: &mut AsyncApp,
+) -> bool {
+    if !project.read_with(cx, |project, _cx| project.is_local()) {
+        return true;
+    }
+    for _ in 0..LSP_READY_ATTEMPTS {
+        if project.read_with(cx, |project, cx| {
+            project.buffer_has_open_language_server(buffer, cx)
+        }) {
+            return true;
+        }
+        cx.background_executor()
+            .timer(LSP_READY_POLL_INTERVAL)
+            .await;
+    }
+    false
 }
 
 pub const MAX_LINE_DISPLAY_LEN: usize = 200;
@@ -165,6 +202,13 @@ impl SymbolLocator {
             .await
             .map_err(|e| format!("Failed to open '{}': {e}", self.file_path))?;
 
+        // `open_buffer` alone does not attach the buffer to a language server;
+        // without this the LSP request is filtered out and returns an empty
+        // result that looks like "symbol not found".
+        let lsp_handle = project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(&buffer, cx)
+        });
+
         let (position, line_text, truncated) = buffer.read_with(cx, |buffer, _cx| {
             let snapshot = buffer.snapshot();
             let row = line.saturating_sub(1);
@@ -208,11 +252,15 @@ impl SymbolLocator {
             Ok((position, display_text, truncated))
         })?;
 
+        let lsp_ready = wait_for_language_server(project, &buffer, cx).await;
+
         Ok(ResolvedSymbol {
             buffer,
             position,
             line_text,
             truncated,
+            lsp_ready,
+            _lsp_handle: lsp_handle,
         })
     }
 }

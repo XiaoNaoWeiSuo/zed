@@ -1,3 +1,4 @@
+use crate::tools::symbol_locator::wait_for_language_server;
 use crate::{
     AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolSideEffect,
 };
@@ -126,6 +127,15 @@ async fn pull_diagnostics(
                 .map_err(|error| {
                     structured_diagnostics_error(ToolErrorCategory::Unavailable, error)
                 })?;
+
+            // Pull diagnostics only from servers that know this buffer. Without
+            // registration an empty pull would be reported as "clean".
+            let _lsp_handle = project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&buffer, cx)
+            });
+            if !wait_for_language_server(project, &buffer, cx).await {
+                return Ok(false);
+            }
 
             let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
             let pull_task = lsp_store.update(cx, |lsp_store, cx| {
