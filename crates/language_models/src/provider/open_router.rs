@@ -469,7 +469,7 @@ pub fn into_open_router(
 
     let mut messages = Vec::new();
     let mut any_message_wants_cache = false;
-    let mut last_cache_message_index: Option<usize> = None;
+    let mut last_cache_boundary: Option<(usize, usize)> = None;
 
     for message in request.messages {
         let mut message_added_content = false;
@@ -569,18 +569,27 @@ pub fn into_open_router(
         }
 
         if message_wants_cache && message_added_content {
-            last_cache_message_index = messages.len().checked_sub(1);
+            // Later messages can merge into this one without extending its cacheable prefix.
+            last_cache_boundary = messages.len().checked_sub(1).and_then(|index| {
+                let content = request_message_content_mut(messages.get_mut(index)?)?;
+                let content_block_count = match content {
+                    open_router::MessageContent::Plain(text) => usize::from(!text.is_empty()),
+                    open_router::MessageContent::Multipart(parts) => parts.len(),
+                };
+                Some((index, content_block_count))
+            });
         }
     }
 
     if is_anthropic_model && any_message_wants_cache {
         // OpenRouter's top-level automatic cache_control restricts routing to
         // Anthropic direct; explicit block breakpoints also work on Bedrock and Vertex.
-        if let Some(content) = last_cache_message_index
-            .and_then(|index| messages.get_mut(index))
-            .and_then(request_message_content_mut)
+        if let Some((message_index, content_block_count)) = last_cache_boundary
+            && let Some(content) = messages
+                .get_mut(message_index)
+                .and_then(request_message_content_mut)
         {
-            set_last_text_cache_control(content, cache_control(None));
+            set_last_text_cache_control(content, cache_control(None), Some(content_block_count));
         }
 
         if let Some(content) = messages.iter_mut().find_map(|message| match message {
@@ -590,6 +599,7 @@ pub fn into_open_router(
             set_last_text_cache_control(
                 content,
                 cache_control(Some(open_router::CacheTtl::OneHour)),
+                None,
             );
         }
     }
@@ -702,7 +712,11 @@ fn request_message_content_mut(
 fn set_last_text_cache_control(
     content: &mut open_router::MessageContent,
     cache_control: open_router::CacheControl,
+    content_block_limit: Option<usize>,
 ) {
+    if content_block_limit == Some(0) {
+        return;
+    }
     match content {
         open_router::MessageContent::Plain(text) => {
             let text = std::mem::take(text);
@@ -713,7 +727,8 @@ fn set_last_text_cache_control(
                 }]);
         }
         open_router::MessageContent::Multipart(parts) => {
-            for part in parts.iter_mut().rev() {
+            let content_block_limit = content_block_limit.unwrap_or(parts.len());
+            for part in parts.iter_mut().take(content_block_limit).rev() {
                 if let open_router::MessagePart::Text {
                     cache_control: target,
                     ..
@@ -973,6 +988,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_anthropic_cache_boundary_survives_merged_messages() -> Result<()> {
+        let model = open_router::Model::new(
+            "anthropic/claude-sonnet-4-5",
+            Some("Claude Sonnet"),
+            Some(200000),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let scenarios: &[&[bool]] = &[
+            &[true, false],
+            &[false, true, false],
+            &[true, false, true, false],
+            &[false, true, true, false],
+            &[false, false, false],
+        ];
+        for role in [Role::User, Role::Assistant] {
+            for text_block_count in [1, 2] {
+                for &cache_flags in scenarios {
+                    let request = LanguageModelRequest {
+                        messages: cache_flags
+                            .iter()
+                            .enumerate()
+                            .map(|(message_index, &cache)| {
+                                language_model::LanguageModelRequestMessage {
+                                    role,
+                                    content: (0..text_block_count)
+                                        .map(|part_index| {
+                                            MessageContent::Text(format!(
+                                                "message-{message_index}-part-{part_index}"
+                                            ))
+                                        })
+                                        .collect(),
+                                    cache,
+                                    reasoning_details: None,
+                                }
+                            })
+                            .collect(),
+                        ..Default::default()
+                    };
+                    let mut result = into_open_router(request, &model, None)?;
+                    assert_eq!(result.messages.len(), 1, "same-role messages still merge");
+                    let Some(open_router::MessageContent::Multipart(parts)) = result
+                        .messages
+                        .last_mut()
+                        .and_then(request_message_content_mut)
+                    else {
+                        anyhow::bail!("Expected merged multipart content");
+                    };
+                    assert_eq!(parts.len(), cache_flags.len() * text_block_count);
+                    let expected_boundary = cache_flags
+                        .iter()
+                        .rposition(|cache| *cache)
+                        .map(|index| (index + 1) * text_block_count - 1);
+                    for (index, part) in parts.iter().enumerate() {
+                        let open_router::MessagePart::Text {
+                            text,
+                            cache_control: actual_cache,
+                        } = part
+                        else {
+                            anyhow::bail!("Expected a text block");
+                        };
+                        assert_eq!(
+                            text,
+                            &format!(
+                                "message-{}-part-{}",
+                                index / text_block_count,
+                                index % text_block_count
+                            )
+                        );
+                        assert_eq!(
+                            *actual_cache,
+                            (Some(index) == expected_boundary).then(|| cache_control(None)),
+                            "role={role:?}, flags={cache_flags:?}, block={index}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[gpui::test]

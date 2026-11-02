@@ -163,6 +163,137 @@ pub struct ProjectCheckpointStore {
     connection: Connection,
 }
 
+/// Persisted metadata for a spawned runtime task.
+///
+/// This deliberately contains lifecycle metadata only. Prompt, output, and secrets must remain
+/// in the runtime and are never written to the checkpoint database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTaskRecord {
+    pub owner_session_id: String,
+    pub child_session_id: String,
+    pub generation: u64,
+    pub state: String,
+    pub result_returned_by_tool: Option<bool>,
+    pub archived: bool,
+    #[serde(default)]
+    pub parent_goal_id: Option<String>,
+}
+
+/// The lifecycle state shared by goals, checkpoints, and verification receipts.
+/// `Unknown` is intentionally retained when the source record cannot establish a
+/// lifecycle state without making a semantic-coverage claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLedgerStatus {
+    Active,
+    Completed,
+    Stale,
+    Blocked,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLedgerEntryKind {
+    Goal,
+    Checkpoint,
+    Receipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLedgerEntry {
+    pub id: String,
+    pub kind: RuntimeLedgerEntryKind,
+    pub status: RuntimeLedgerStatus,
+    /// This field is never inferred from execution success. It is `unknown`
+    /// until an explicit semantic assessment is recorded elsewhere.
+    #[serde(default)]
+    pub semantic_coverage: RuntimeLedgerStatus,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLedgerSnapshot {
+    #[serde(default)]
+    pub entries: Vec<RuntimeLedgerEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLedgerQuery {
+    #[serde(default)]
+    pub kind: Option<RuntimeLedgerEntryKind>,
+    #[serde(default)]
+    pub status: Option<RuntimeLedgerStatus>,
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+impl RuntimeLedgerSnapshot {
+    pub fn from_records(
+        goal: Option<&crate::ThreadGoal>,
+        checkpoint: Option<&ProjectCheckpoint>,
+        receipts: &[crate::GoalVerificationReceipt],
+    ) -> Self {
+        let mut entries = Vec::new();
+        if let Some(goal) = goal {
+            entries.push(RuntimeLedgerEntry {
+                id: goal.id.clone(),
+                kind: RuntimeLedgerEntryKind::Goal,
+                status: match goal.status {
+                    crate::ThreadGoalStatus::Active => RuntimeLedgerStatus::Active,
+                    crate::ThreadGoalStatus::Completed => RuntimeLedgerStatus::Completed,
+                    crate::ThreadGoalStatus::Blocked | crate::ThreadGoalStatus::Paused => {
+                        RuntimeLedgerStatus::Blocked
+                    }
+                },
+                semantic_coverage: RuntimeLedgerStatus::Unknown,
+                scope: None,
+                observed_at: None,
+            });
+        }
+        if let Some(checkpoint) = checkpoint {
+            entries.push(RuntimeLedgerEntry {
+                id: checkpoint.id.clone(),
+                kind: RuntimeLedgerEntryKind::Checkpoint,
+                status: RuntimeLedgerStatus::Completed,
+                semantic_coverage: RuntimeLedgerStatus::Unknown,
+                scope: Some(checkpoint.scope.clone()),
+                observed_at: Some(checkpoint.created_at),
+            });
+        }
+        entries.extend(receipts.iter().map(|receipt| RuntimeLedgerEntry {
+            id: receipt.id.clone(),
+            kind: RuntimeLedgerEntryKind::Receipt,
+            status: if receipt.stale_reason.is_some() {
+                RuntimeLedgerStatus::Stale
+            } else {
+                match receipt.outcome {
+                    crate::GoalVerificationOutcome::Passed => RuntimeLedgerStatus::Completed,
+                    crate::GoalVerificationOutcome::Failed
+                    | crate::GoalVerificationOutcome::Changed => RuntimeLedgerStatus::Unknown,
+                }
+            },
+            semantic_coverage: RuntimeLedgerStatus::Unknown,
+            scope: None,
+            observed_at: Some(receipt.observed_at),
+        }));
+        Self { entries }
+    }
+
+    pub fn query(&self, query: &RuntimeLedgerQuery) -> Vec<&RuntimeLedgerEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| query.kind.map_or(true, |kind| entry.kind == kind))
+            .filter(|entry| query.status.map_or(true, |status| entry.status == status))
+            .filter(|entry| query.id.as_deref().map_or(true, |id| entry.id == id))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckpointRoot {
     pub path: PathBuf,
@@ -567,7 +698,132 @@ impl ProjectCheckpointStore {
         connection.exec(
             "CREATE INDEX IF NOT EXISTS checkpoints_session_sequence ON checkpoints (session_id, sequence DESC)",
         )?()?;
+        connection.exec(
+            "CREATE TABLE IF NOT EXISTS runtime_task_records (
+                owner_session_id TEXT NOT NULL,
+                child_session_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                result_returned_by_tool INTEGER,
+                archived INTEGER NOT NULL,
+                parent_goal_id TEXT,
+                PRIMARY KEY (owner_session_id, child_session_id, generation)
+            )",
+        )?()?;
+        connection.exec(
+            "CREATE INDEX IF NOT EXISTS runtime_task_records_owner_child
+             ON runtime_task_records (owner_session_id, child_session_id)",
+        )?()?;
         Ok(Self { connection })
+    }
+
+    pub fn upsert_runtime_task_record(&self, record: &RuntimeTaskRecord) -> Result<()> {
+        ensure!(
+            !record.owner_session_id.trim().is_empty(),
+            "Runtime task owner session ID is required"
+        );
+        ensure!(
+            !record.child_session_id.trim().is_empty(),
+            "Runtime task child session ID is required"
+        );
+        ensure!(
+            !record.state.trim().is_empty(),
+            "Runtime task state is required"
+        );
+        let generation =
+            i64::try_from(record.generation).context("Runtime task generation is too large")?;
+        let result_returned_by_tool = record.result_returned_by_tool.map(i64::from);
+        self.connection.exec_bound::<(
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            i64,
+            Option<String>,
+        )>(
+            "INSERT INTO runtime_task_records
+                (owner_session_id, child_session_id, generation, state,
+                 result_returned_by_tool, archived, parent_goal_id)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM runtime_task_records
+                 WHERE owner_session_id = ?1
+                   AND child_session_id = ?2
+                   AND generation > ?3
+             )
+             ON CONFLICT (owner_session_id, child_session_id, generation) DO UPDATE SET
+                state = excluded.state,
+                result_returned_by_tool = excluded.result_returned_by_tool,
+                archived = excluded.archived,
+                parent_goal_id = excluded.parent_goal_id",
+        )?((
+            record.owner_session_id.clone(),
+            record.child_session_id.clone(),
+            generation,
+            record.state.clone(),
+            result_returned_by_tool,
+            i64::from(record.archived),
+            record.parent_goal_id.clone(),
+        ))?;
+        Ok(())
+    }
+
+    pub fn query_runtime_task_records(
+        &self,
+        owner_session_id: &str,
+    ) -> Result<Vec<RuntimeTaskRecord>> {
+        let records = self.connection.select_bound::<String, (
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            i64,
+            Option<String>,
+        )>(
+            "SELECT owner_session_id, child_session_id, generation, state,
+                    result_returned_by_tool, archived, parent_goal_id
+             FROM runtime_task_records
+             WHERE owner_session_id = ?1
+             ORDER BY child_session_id, generation DESC",
+        )?(owner_session_id.to_owned())?;
+        records
+            .into_iter()
+            .map(
+                |(
+                    owner_session_id,
+                    child_session_id,
+                    generation,
+                    state,
+                    result_returned_by_tool,
+                    archived,
+                    parent_goal_id,
+                )| {
+                    Ok(RuntimeTaskRecord {
+                        owner_session_id,
+                        child_session_id,
+                        generation: u64::try_from(generation)
+                            .context("Invalid runtime task generation")?,
+                        state,
+                        result_returned_by_tool: result_returned_by_tool.map(|value| value != 0),
+                        archived: archived != 0,
+                        parent_goal_id,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn query_runtime_task_record(
+        &self,
+        owner_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<Option<RuntimeTaskRecord>> {
+        Ok(self
+            .query_runtime_task_records(owner_session_id)?
+            .into_iter()
+            .find(|record| record.child_session_id == child_session_id))
     }
 
     pub fn save(&self, checkpoint: &ProjectCheckpoint) -> Result<()> {
@@ -655,7 +911,7 @@ impl ProjectCheckpointStore {
         let offset = i64::try_from(offset).context("Checkpoint scope offset is too large")?;
         let limit = i64::try_from(limit).context("Checkpoint scope limit is too large")?;
         let records = self.connection.select_bound::<(i64, i64), String>(
-            "SELECT data FROM checkpoints WHERE sequence IN (SELECT MAX(sequence) FROM checkpoints WHERE scope NOT GLOB '@automatic/*' GROUP BY scope) ORDER BY sequence DESC LIMIT ?1 OFFSET ?2",
+            "SELECT data FROM checkpoints WHERE sequence IN (SELECT MAX(sequence) FROM checkpoints WHERE scope NOT GLOB '@automatic/*' AND scope NOT GLOB '@compaction/*' GROUP BY scope) ORDER BY sequence DESC LIMIT ?1 OFFSET ?2",
         )?((limit, offset))?;
         records
             .into_iter()
@@ -694,6 +950,100 @@ impl ProjectCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_ledger_preserves_unknown_coverage_and_queries_records() -> Result<()> {
+        let checkpoint = ProjectCheckpoint {
+            id: "checkpoint".into(),
+            session_id: "session".into(),
+            scope: "task".into(),
+            created_at: Utc::now(),
+            base_revision: None,
+            branch: None,
+            git_scan_id: None,
+            completed: Vec::new(),
+            remaining: vec!["verify".into()],
+            decisions: Vec::new(),
+            next_steps: Vec::new(),
+            changed_files: Vec::new(),
+            evidence: Vec::new(),
+            interrupted: false,
+        };
+        let snapshot = RuntimeLedgerSnapshot::from_records(None, Some(&checkpoint), &[]);
+        assert_eq!(snapshot.entries[0].status, RuntimeLedgerStatus::Completed);
+        assert_eq!(
+            snapshot.entries[0].semantic_coverage,
+            RuntimeLedgerStatus::Unknown
+        );
+        let encoded = serde_json::to_string(&snapshot)?;
+        let decoded: RuntimeLedgerSnapshot = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            snapshot
+                .query(&RuntimeLedgerQuery {
+                    kind: Some(RuntimeLedgerEntryKind::Checkpoint),
+                    ..Default::default()
+                })
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_ledger_maps_lifecycle_states_without_semantic_inference() -> Result<()> {
+        let mut goal = crate::ThreadGoal::new("objective".into(), vec!["criterion".into()])?;
+        goal.status = crate::ThreadGoalStatus::Active;
+        let stale_receipt = crate::GoalVerificationReceipt {
+            id: "stale".into(),
+            tool_call_id: "tool".into(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::Value::Null,
+            observed_at: Utc::now(),
+            dependencies: Vec::new(),
+            outcome: crate::GoalVerificationOutcome::Passed,
+            command_status: None,
+            output_digest: "digest".into(),
+            preview: String::new(),
+            stale_reason: Some("dependency changed".into()),
+            criterion_indices: vec![0],
+        };
+        let snapshot = RuntimeLedgerSnapshot::from_records(Some(&goal), None, &[stale_receipt]);
+        assert_eq!(snapshot.entries[0].status, RuntimeLedgerStatus::Active);
+        assert_eq!(snapshot.entries[1].status, RuntimeLedgerStatus::Stale);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.semantic_coverage == RuntimeLedgerStatus::Unknown)
+        );
+
+        goal.status = crate::ThreadGoalStatus::Blocked;
+        assert_eq!(
+            RuntimeLedgerSnapshot::from_records(Some(&goal), None, &[]).entries[0].status,
+            RuntimeLedgerStatus::Blocked
+        );
+        goal.status = crate::ThreadGoalStatus::Completed;
+        assert_eq!(
+            RuntimeLedgerSnapshot::from_records(Some(&goal), None, &[]).entries[0].status,
+            RuntimeLedgerStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_checkpoint_json_keeps_defaulted_fields_compatible() -> Result<()> {
+        let checkpoint: ProjectCheckpoint = serde_json::from_value(serde_json::json!({
+            "id": "checkpoint", "session_id": "session", "scope": "task",
+            "created_at": "2026-10-29T00:00:00Z", "base_revision": null,
+            "completed": [], "remaining": [], "decisions": [], "next_steps": [],
+            "changed_files": [], "evidence": [], "interrupted": false
+        }))?;
+        assert_eq!(checkpoint.branch, None);
+        assert_eq!(checkpoint.git_scan_id, None);
+        assert!(checkpoint.evidence.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn empty_automatic_checkpoints_do_not_create_metadata() -> Result<()> {
@@ -859,7 +1209,109 @@ mod tests {
     }
 
     #[test]
-    fn scope_index_lists_latest_handoffs_in_pages_without_automatic_records() -> Result<()> {
+    fn runtime_task_records_survive_reopen_and_are_isolated_by_owner_session() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        store.upsert_runtime_task_record(&RuntimeTaskRecord {
+            owner_session_id: "owner-a".into(),
+            child_session_id: "child".into(),
+            generation: 1,
+            state: "completed".into(),
+            result_returned_by_tool: Some(false),
+            archived: true,
+            parent_goal_id: Some("goal-a".into()),
+        })?;
+        store.upsert_runtime_task_record(&RuntimeTaskRecord {
+            owner_session_id: "owner-b".into(),
+            child_session_id: "child".into(),
+            generation: 1,
+            state: "failed".into(),
+            result_returned_by_tool: Some(true),
+            archived: false,
+            parent_goal_id: None,
+        })?;
+        drop(store);
+
+        let reopened = ProjectCheckpointStore::open(root.path())?;
+        assert_eq!(
+            reopened.query_runtime_task_records("owner-a")?,
+            vec![RuntimeTaskRecord {
+                owner_session_id: "owner-a".into(),
+                child_session_id: "child".into(),
+                generation: 1,
+                state: "completed".into(),
+                result_returned_by_tool: Some(false),
+                archived: true,
+                parent_goal_id: Some("goal-a".into()),
+            }]
+        );
+        assert_eq!(
+            reopened
+                .query_runtime_task_record("owner-b", "child")?
+                .map(|record| record.state),
+            Some("failed".into())
+        );
+        assert!(
+            reopened
+                .query_runtime_task_records("missing-owner")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_task_records_reject_stale_generations_without_overwriting_current_state()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = ProjectCheckpointStore::open(root.path())?;
+        let current = RuntimeTaskRecord {
+            owner_session_id: "owner".into(),
+            child_session_id: "child".into(),
+            generation: 2,
+            state: "completed".into(),
+            result_returned_by_tool: Some(false),
+            archived: true,
+            parent_goal_id: Some("goal".into()),
+        };
+        store.upsert_runtime_task_record(&current)?;
+        store.upsert_runtime_task_record(&RuntimeTaskRecord {
+            generation: 1,
+            state: "running".into(),
+            result_returned_by_tool: None,
+            archived: false,
+            parent_goal_id: None,
+            ..current.clone()
+        })?;
+        assert_eq!(
+            store.query_runtime_task_records("owner")?,
+            vec![current.clone()]
+        );
+        assert_eq!(
+            store.query_runtime_task_record("owner", "child")?,
+            Some(current.clone())
+        );
+
+        store.upsert_runtime_task_record(&RuntimeTaskRecord {
+            generation: 2,
+            state: "completed".into(),
+            result_returned_by_tool: Some(true),
+            archived: true,
+            parent_goal_id: Some("goal".into()),
+            ..store
+                .query_runtime_task_record("owner", "child")?
+                .context("current runtime task")?
+        })?;
+        let updated = store
+            .query_runtime_task_record("owner", "child")?
+            .context("updated runtime task")?;
+        assert_eq!(updated.generation, 2);
+        assert_eq!(updated.result_returned_by_tool, Some(true));
+        assert!(updated.archived);
+        Ok(())
+    }
+
+    #[test]
+    fn scope_index_lists_latest_handoffs_in_pages_without_internal_records() -> Result<()> {
         let root = tempfile::tempdir()?;
         let store = ProjectCheckpointStore::open(root.path())?;
         let mut checkpoint = ProjectCheckpoint {
@@ -889,6 +1341,25 @@ mod tests {
         checkpoint.id = "four".into();
         checkpoint.scope = "@automatic/session".into();
         store.save(&checkpoint)?;
+        for index in 0..8 {
+            AutomaticCheckpoint {
+                root: root.path().to_path_buf(),
+                session_id: if index == 0 {
+                    "session".into()
+                } else {
+                    format!("unrelated-{index}")
+                },
+                files: BTreeMap::new(),
+                git: None,
+                evidence: Vec::new(),
+                interrupted: false,
+            }
+            .save_compaction(format!("Compaction summary {index}"))?;
+        }
+        let compaction = store
+            .latest("@compaction/session")?
+            .context("compaction remains readable by scope")?;
+        assert_eq!(store.list_history(0, 20)?.len(), 12);
         let first = store.list_scopes(0, 1)?;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].scope, "agent");
@@ -904,7 +1375,44 @@ mod tests {
         }])?
         .context("context")?;
         let context: serde_json::Value = serde_json::from_str(&context)?;
+        let expected_scopes = serde_json::to_value(store.list_scopes(0, 20)?)?;
+        assert_eq!(context[0]["available_scopes"], expected_scopes);
         assert_eq!(context[0]["available_scopes"][1]["scope"], "editor");
+        assert_eq!(context[0]["more_scopes_available"], false);
+        assert!(context[0]["recent_context_compaction"].is_null());
+
+        let session_context = load_checkpoint_context_for_session(
+            &[CheckpointRoot {
+                path: root.path().to_path_buf(),
+                git: None,
+            }],
+            Some("session"),
+        )?
+        .context("session context")?;
+        let projected: serde_json::Value =
+            serde_json::from_str(&checkpoint_model_context(&session_context))?;
+        let entry = projected.get(0).context("root context")?;
+        assert_eq!(entry["available_scopes"], expected_scopes);
+        assert_eq!(entry["more_scopes_available"], false);
+        assert_eq!(entry["historical_state"], true);
+        assert_eq!(entry["record_kind"], "task_handoff");
+        assert_eq!(
+            entry["recent_context_compaction"]["scope"],
+            compaction.scope
+        );
+        assert_eq!(
+            entry["recent_context_compaction"]["created_at"],
+            serde_json::to_value(compaction.created_at)?
+        );
+        assert_eq!(
+            entry["recent_context_compaction"]["record_kind"],
+            "context_compaction"
+        );
+        assert_eq!(
+            entry["recent_context_compaction"]["summary"],
+            serde_json::to_value(&compaction.decisions)?
+        );
+        assert!(!session_context.contains("unrelated-"));
         Ok(())
     }
 

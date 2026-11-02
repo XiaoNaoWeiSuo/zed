@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 acp_thread.workspace = true
-agent.workspace = true
+agent = { workspace = true, features = ["eval-subagent"] }
 agent-client-protocol.workspace = true
 agent_ui.workspace = true
 anyhow.workspace = true
@@ -51,3 +51,7 @@ theme.workspace = true
 theme_settings.workspace = true
 util.workspace = true
 watch.workspace = true
+zed_env_vars.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

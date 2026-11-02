@@ -9,8 +9,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::goal_verification::capture_goal_dependencies;
 use crate::{
-    AgentTool, GoalVerificationInput, GoalVerificationOutcome, GoalVerificationReceipt, Thread,
-    ThreadGoal, ThreadGoalStatus, ToolCallEventStream, ToolInput,
+    AgentTool, GoalVerificationInput, GoalVerificationOutcome, GoalVerificationReceipt,
+    RuntimeLedgerSnapshot, Thread, ThreadGoal, ThreadGoalStatus, ToolCallEventStream, ToolInput,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -156,6 +156,8 @@ pub struct GoalToolOutput {
     pub verification: Option<GoalVerificationResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<GoalCompletionReport>,
+    #[serde(default)]
+    pub runtime_ledger: RuntimeLedgerSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +182,7 @@ impl GoalToolOutput {
             verification_count: 0,
             verification: None,
             completion: None,
+            runtime_ledger: RuntimeLedgerSnapshot::default(),
         }
     }
 
@@ -215,12 +218,19 @@ impl GoalToolOutput {
                     .collect();
             }
         }
+        let runtime_ledger = RuntimeLedgerSnapshot::from_records(
+            goal.as_ref(),
+            None,
+            goal.as_ref()
+                .map_or(&[][..], |goal| goal.verification_receipts.as_slice()),
+        );
         Self {
             message,
             goal,
             verification_count,
             verification,
             completion: None,
+            runtime_ledger,
         }
     }
 }
@@ -285,6 +295,65 @@ mod completion_tests {
             });
         }
         result
+    }
+
+    #[test]
+    fn audit_skips_failed_and_changed_receipts_and_reuses_identical_dependency_scans() {
+        let calls = std::cell::Cell::new(0);
+        let paths = vec!["root/source".to_string(), "root/manifest".to_string()];
+        let other_paths = vec!["root/other".to_string()];
+        let mut cached = HashMap::new();
+        futures::executor::block_on(async {
+            for outcome in [
+                GoalVerificationOutcome::Failed,
+                GoalVerificationOutcome::Changed,
+            ] {
+                cache_auditable_dependencies(outcome, &paths, &mut cached, || async {
+                    calls.set(calls.get() + 1);
+                    Ok(Vec::new())
+                })
+                .await;
+            }
+            assert_eq!(calls.get(), 0);
+            assert!(cached.is_empty());
+            for _ in 0..2 {
+                cache_auditable_dependencies(
+                    GoalVerificationOutcome::Passed,
+                    &paths,
+                    &mut cached,
+                    || async {
+                        calls.set(calls.get() + 1);
+                        Err("dependency unavailable".to_string())
+                    },
+                )
+                .await;
+            }
+            assert_eq!(
+                calls.get(),
+                1,
+                "identical scans, including errors, are reused within one audit"
+            );
+            assert_eq!(
+                cached.get(&paths),
+                Some(&Err("dependency unavailable".into()))
+            );
+            cache_auditable_dependencies(
+                GoalVerificationOutcome::Passed,
+                &other_paths,
+                &mut cached,
+                || async {
+                    calls.set(calls.get() + 1);
+                    Ok(vec![crate::GoalDependencySnapshot {
+                        path: "root/other".into(),
+                        digest: "digest".into(),
+                        file_count: 1,
+                    }])
+                },
+            )
+            .await;
+            assert_eq!(calls.get(), 2);
+            assert!(cached.get(&other_paths).is_some_and(Result::is_ok));
+        });
     }
 
     #[test]
@@ -385,6 +454,7 @@ mod output_tests {
                 coverage_note: None,
             }),
             completion: None,
+            runtime_ledger: RuntimeLedgerSnapshot::default(),
         };
         let retained = serde_json::to_value(&output).expect("serialize retained result");
         assert_eq!(retained["verification"]["output"], original);
@@ -585,14 +655,12 @@ impl GoalTool {
                 .iter()
                 .map(|dependency| dependency.path.clone())
                 .collect::<Vec<_>>();
-            if !cached.contains_key(&paths) {
-                cached.insert(
-                    paths.clone(),
-                    capture_goal_dependencies(&project, &paths, cx)
-                        .await
-                        .map_err(|error| error.to_string()),
-                );
-            }
+            cache_auditable_dependencies(receipt.outcome, &paths, &mut cached, || async {
+                capture_goal_dependencies(&project, &paths, cx)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await;
             let criterion_indices = effective_criterion_indices(&receipt, criterion_count);
             let (reason, changed_dependencies) = if receipt.outcome
                 != GoalVerificationOutcome::Passed
@@ -652,6 +720,20 @@ impl GoalTool {
             thread.update_goal_verification_audit(&goal_id, statuses, cx)
         })??;
         Ok(audit)
+    }
+}
+
+async fn cache_auditable_dependencies<F, Fut>(
+    outcome: GoalVerificationOutcome,
+    paths: &[String],
+    cached: &mut HashMap<Vec<String>, Result<Vec<crate::GoalDependencySnapshot>, String>>,
+    capture: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<crate::GoalDependencySnapshot>, String>>,
+{
+    if outcome == GoalVerificationOutcome::Passed && !cached.contains_key(paths) {
+        cached.insert(paths.to_vec(), capture().await);
     }
 }
 

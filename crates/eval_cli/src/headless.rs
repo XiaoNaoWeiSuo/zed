@@ -26,7 +26,7 @@ pub struct AgentCliAppState {
     pub node_runtime: NodeRuntime,
 }
 
-pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
+pub fn init(isolated: bool, cx: &mut App) -> Arc<AgentCliAppState> {
     let app_commit_sha = option_env!("ZED_COMMIT_SHA").map(|s| AppCommitSha::new(s.to_owned()));
 
     let app_version = AppVersion::load(
@@ -108,8 +108,12 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
     debug_adapter_extension::init(extension_host_proxy.clone(), cx);
     language_extension::init(LspAccess::Noop, extension_host_proxy, languages.clone());
     language_model::init(cx);
-    RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
-    language_models::init(user_store.clone(), client.clone(), cx);
+    if isolated {
+        language_models::init_openai_subscribed_only(client.clone(), cx);
+    } else {
+        RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
+        language_models::init(user_store.clone(), client.clone(), cx);
+    }
     languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
     prompt_store::init(cx);
     terminal_view::init(cx);

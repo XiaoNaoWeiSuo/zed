@@ -1,6 +1,6 @@
 use action_log::ActionLog;
 use agent_client_protocol::schema::v2 as acp;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
 use indoc::formatdoc;
@@ -14,8 +14,30 @@ use std::path::Path;
 use std::sync::Arc;
 use util::markdown::MarkdownCodeBlock;
 
-fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
-    LanguageModelToolResultContent::from(e.to_string())
+fn structured_read_error(
+    category: ToolErrorCategory,
+    message: impl Into<String>,
+    retryable: bool,
+    recover_with: Vec<ToolRecovery>,
+    side_effect: Option<ToolSideEffect>,
+) -> LanguageModelToolResultContent {
+    let mut error = ToolError::new(category, message, retryable);
+    error.recover_with = recover_with;
+    error.side_effect = side_effect;
+    error.into()
+}
+
+fn structured_read_failure(
+    category: ToolErrorCategory,
+    error: impl std::fmt::Display,
+) -> LanguageModelToolResultContent {
+    structured_read_error(
+        category,
+        error.to_string(),
+        false,
+        Vec::new(),
+        Some(ToolSideEffect::None),
+    )
 }
 
 /// Resolves the optional `start_line` / `end_line` inputs from the tool schema
@@ -106,8 +128,16 @@ async fn read_global_skill_file(
     end_line: Option<u32>,
     requested_path: &str,
     event_stream: &ToolCallEventStream,
-) -> Result<LanguageModelToolResultContent, LanguageModelToolResultContent> {
-    let content = fs.load(canonical_path).await.map_err(tool_content_err)?;
+) -> std::result::Result<LanguageModelToolResultContent, LanguageModelToolResultContent> {
+    let content = fs.load(canonical_path).await.map_err(|error| {
+        structured_read_error(
+            ToolErrorCategory::Unavailable,
+            format!("Failed to open {requested_path}: {error}"),
+            false,
+            Vec::new(),
+            Some(ToolSideEffect::None),
+        )
+    })?;
 
     event_stream.update_fields(|update| {
         update.locations(vec![
@@ -145,7 +175,10 @@ use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
     resolve_global_skill_path, resolve_project_path,
 };
-use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolRecovery,
+    ToolSideEffect, outline,
+};
 
 /// Reads the content of the given file in the project.
 ///
@@ -251,10 +284,9 @@ impl AgentTool for ReadFileTool {
         let project = self.project.clone();
         let action_log = self.action_log.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(tool_content_err)?;
+            let input = input.recv().await.map_err(|error| {
+                structured_read_failure(ToolErrorCategory::InvalidInput, error)
+            })?;
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
 
             // Fast path: if the model passes a path that resolves under the
@@ -288,15 +320,20 @@ impl AgentTool for ReadFileTool {
                             canonical_target,
                         } => (project_path, Some(canonical_target)),
                     })
-                }).map_err(tool_content_err)?;
+                }).map_err(|error| {
+                    structured_read_failure(ToolErrorCategory::InvalidInput, error)
+                })?;
 
             let abs_path = project
                 .read_with(cx, |project, cx| {
                     project.absolute_path(&project_path, cx)
                 })
                 .ok_or_else(|| {
-                    anyhow!("Failed to convert {} to absolute path", input.path)
-                }).map_err(tool_content_err)?;
+                    format!("Failed to convert {} to an absolute path", input.path)
+                })
+                .map_err(|error| {
+                    structured_read_failure(ToolErrorCategory::Unavailable, error)
+                })?;
 
             // Check settings exclusions synchronously
             project.read_with(cx, |_project, cx| {
@@ -331,13 +368,25 @@ impl AgentTool for ReadFileTool {
                 }
 
                 anyhow::Ok(())
-            }).map_err(tool_content_err)?;
+            }).map_err(|error| {
+                structured_read_failure(ToolErrorCategory::PermissionDenied, error)
+            })?;
 
             if fs.is_dir(&abs_path).await {
-                return Err(tool_content_err(format!(
-                    "{} is a directory, not a file. Use the list_directory tool to explore directory contents.",
-                    input.path
-                )));
+                return Err(structured_read_error(
+                    ToolErrorCategory::WrongResourceType,
+                    format!(
+                        "{} is a directory, not a file.",
+                        input.path
+                    ),
+                    false,
+                    vec![ToolRecovery {
+                        tool: "list_directory".into(),
+                        arguments: serde_json::json!({ "path": input.path }),
+                        reason: "Inspect the directory contents and choose a file to read".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                ));
             }
 
             if let Some(canonical_target) = &symlink_canonical_target {
@@ -350,7 +399,9 @@ impl AgentTool for ReadFileTool {
                         cx,
                     )
                 });
-                authorize.await.map_err(tool_content_err)?;
+                authorize.await.map_err(|error| {
+                    structured_read_failure(ToolErrorCategory::PermissionDenied, error)
+                })?;
             }
 
             let file_path = input.path.clone();
@@ -373,7 +424,9 @@ impl AgentTool for ReadFileTool {
                             project.open_image(project_path.clone(), cx)
                         })
                     })
-                    .await.map_err(tool_content_err)?;
+                    .await.map_err(|error| {
+                        structured_read_failure(ToolErrorCategory::Unavailable, error)
+                    })?;
 
                 let image =
                     image_entity.read_with(cx, |image_item, _| Arc::clone(&image_item.image));
@@ -382,7 +435,9 @@ impl AgentTool for ReadFileTool {
                     .update(|cx| LanguageModelImage::from_image(image, cx))
                     .await
                     .context("processing image")
-                    .map_err(tool_content_err)?;
+                    .map_err(|error| {
+                        structured_read_failure(ToolErrorCategory::Unavailable, error)
+                    })?;
 
                 event_stream.update_fields(|update| update.content(vec![
                     acp::ContentBlock::Image(acp::ImageContent::new(
@@ -400,9 +455,14 @@ impl AgentTool for ReadFileTool {
             });
 
             let buffer = futures::select! {
-                result = open_buffer_task.fuse() => result.map_err(tool_content_err)?,
+                result = open_buffer_task.fuse() => result.map_err(|error| {
+                    structured_read_failure(ToolErrorCategory::Unavailable, error)
+                })?,
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return Err(tool_content_err("File read cancelled by user"));
+                    return Err(structured_read_failure(
+                        ToolErrorCategory::Cancelled,
+                        "File read cancelled by user",
+                    ));
                 }
             };
             if buffer.read_with(cx, |buffer, _| {
@@ -411,7 +471,21 @@ impl AgentTool for ReadFileTool {
                     .as_ref()
                     .is_none_or(|file| !file.disk_state().exists())
             }) {
-                return Err(tool_content_err(format!("{file_path} not found")));
+                return Err(structured_read_error(
+                    ToolErrorCategory::NotFound,
+                    format!("{file_path} not found"),
+                    false,
+                    vec![ToolRecovery {
+                        tool: "list_directory".into(),
+                        arguments: serde_json::json!({
+                            "path": std::path::Path::new(&file_path)
+                                .parent()
+                                .map_or_else(|| file_path.clone(), |path| path.to_string_lossy().into_owned())
+                        }),
+                        reason: "Verify the path and inspect its parent directory".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                ));
             }
 
             let mut anchor = None;
@@ -458,7 +532,9 @@ impl AgentTool for ReadFileTool {
                     Some(&abs_path.to_string_lossy()),
                     cx,
                 )
-                .await.map_err(tool_content_err)?;
+                .await.map_err(|error| {
+                    structured_read_failure(ToolErrorCategory::Unavailable, error)
+                })?;
 
                 action_log.update(cx, |log, cx| {
                     log.buffer_read(buffer.clone(), cx);
@@ -521,7 +597,7 @@ impl AgentTool for ReadFileTool {
         output: Self::Output,
         event_stream: ToolCallEventStream,
         _cx: &mut App,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         if let LanguageModelToolResultContent::Text(text) = output {
             let markdown = MarkdownCodeBlock {
                 tag: &input.path,
@@ -576,7 +652,7 @@ mod test {
             .await;
         assert_eq!(
             error_text(result.unwrap_err()),
-            "root/some_dir is a directory, not a file. Use the list_directory tool to explore directory contents."
+            "root/some_dir is a directory, not a file."
         );
     }
 
@@ -601,10 +677,18 @@ mod test {
                 tool.run(ToolInput::resolved(input), event_stream, cx)
             })
             .await;
+        let error = result.unwrap_err();
         assert_eq!(
-            error_text(result.unwrap_err()),
+            error_text(error.clone()),
             "root/nonexistent_file.txt not found"
         );
+        let LanguageModelToolResultContent::Text(text) = error else {
+            panic!("Expected a text error");
+        };
+        let error: ToolError = serde_json::from_str(&text).expect("structured read error");
+        assert_eq!(error.category, ToolErrorCategory::NotFound);
+        assert!(!error.retryable);
+        assert_eq!(error.recover_with[0].tool, "list_directory");
     }
 
     #[gpui::test]
@@ -1001,7 +1085,9 @@ mod test {
 
     fn error_text(content: LanguageModelToolResultContent) -> String {
         match content {
-            LanguageModelToolResultContent::Text(text) => text.to_string(),
+            LanguageModelToolResultContent::Text(text) => serde_json::from_str::<ToolError>(&text)
+                .map(|error| error.message)
+                .unwrap_or_else(|_| text.to_string()),
             other => panic!("Expected text error, got: {other:?}"),
         }
     }

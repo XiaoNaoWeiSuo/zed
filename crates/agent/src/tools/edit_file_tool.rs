@@ -5,7 +5,10 @@ use super::edit_session::{
     EditSession, EditSessionContext, EditSessionMode, EditSessionResult,
     initial_title_from_partial_path, run_session,
 };
-use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolInputPayload};
+use crate::{
+    AgentTool, Thread, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolInputPayload,
+    ToolSideEffect,
+};
 use action_log::ActionLog;
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
@@ -119,46 +122,84 @@ impl EditFileTool {
                     match payload {
                         Ok(payload) => match payload {
                             ToolInputPayload::Partial(partial) => {
-                                if let Ok(parsed) = serde_json::from_value::<EditFileToolPartialInput>(partial) {
-                                    let path_complete = parsed.path.is_some()
-                                        && parsed.path.as_ref() == last_path.as_ref();
+                                let parsed = match serde_json::from_value::<EditFileToolPartialInput>(partial) {
+                                    Ok(parsed) => parsed,
+                                    Err(error) => {
+                                        return EditSessionResult::Failed {
+                                            error: format!("Invalid edit_file input: {error}"),
+                                            session,
+                                            category: ToolErrorCategory::InvalidInput,
+                                            side_effect: ToolSideEffect::Unknown,
+                                        };
+                                    }
+                                };
+                                let path_complete = parsed.path.is_some()
+                                    && parsed.path.as_ref() == last_path.as_ref();
 
-                                    last_path = parsed.path.clone();
+                                last_path = parsed.path.clone();
 
-                                    if session.is_none()
-                                        && path_complete
-                                        && let Some(path) = parsed.path.as_ref()
+                                if session.is_none()
+                                    && path_complete
+                                    && let Some(path) = parsed.path.as_ref()
+                                {
+                                    match EditSession::new(
+                                        PathBuf::from(path),
+                                        EditSessionMode::Edit,
+                                        Self::NAME,
+                                        self.session_context.clone(),
+                                        event_stream,
+                                        cx,
+                                    )
+                                    .await
                                     {
-                                        match EditSession::new(
-                                            PathBuf::from(path),
-                                            EditSessionMode::Edit,
-                                            Self::NAME,
-                                            self.session_context.clone(),
-                                            event_stream,
-                                            cx,
-                                        )
-                                        .await
-                                        {
-                                            Ok(created_session) => session = Some(created_session),
-                                            Err(error) => {
-                                                log::error!("Failed to create edit session: {}", error);
-                                                return EditSessionResult::Failed {
-                                                    error,
-                                                    session: None,
-                                                };
-                                            }
+                                        Ok(created_session) => session = Some(created_session),
+                                        Err(error) => {
+                                            log::error!("Failed to create edit session: {}", error);
+                                            return EditSessionResult::Failed {
+                                                error,
+                                                session: None,
+                                                category: ToolErrorCategory::Unavailable,
+                                                side_effect: ToolSideEffect::None,
+                                            };
                                         }
                                     }
+                                }
 
-                                    if let Some(current_session) = &mut session
-                                        && let Err(error) = current_session.process_edit(parsed.edits.as_deref(), event_stream, cx)
-                                    {
-                                        log::error!("Failed to process edit: {}", error);
-                                        return EditSessionResult::Failed { error, session };
-                                    }
+                                if let Some(current_session) = &session
+                                    && let Some(path) = parsed.path.as_ref()
+                                    && std::path::Path::new(path) != current_session.input_path.as_path()
+                                {
+                                    return EditSessionResult::Failed {
+                                        error: format!("Edit path changed from {:?} to {:?} during streaming. No further edits were applied; earlier streamed edits may remain. Retry with a consistent path.", current_session.input_path, path),
+                                        session,
+                                        category: ToolErrorCategory::Conflict,
+                                        side_effect: ToolSideEffect::Unknown,
+                                    };
+                                }
+
+                                if let Some(current_session) = &mut session
+                                    && let Err(error) = current_session.process_edit(parsed.edits.as_deref(), event_stream, cx)
+                                {
+                                    log::error!("Failed to process edit: {}", error);
+                                    return EditSessionResult::Failed {
+                                        error,
+                                        session,
+                                        category: ToolErrorCategory::Conflict,
+                                        side_effect: ToolSideEffect::Unknown,
+                                    };
                                 }
                             }
                             ToolInputPayload::Full(full_input) => {
+                                if let Some(current_session) = &session
+                                    && full_input.path != current_session.input_path
+                                {
+                                    return EditSessionResult::Failed {
+                                        error: format!("Edit path changed from {:?} to {:?} during streaming. No further edits were applied; earlier streamed edits may remain. Retry with a consistent path.", current_session.input_path, full_input.path),
+                                        session,
+                                        category: ToolErrorCategory::Conflict,
+                                        side_effect: ToolSideEffect::Unknown,
+                                    };
+                                }
                                 let mut session = if let Some(session) = session {
                                     session
                                 } else {
@@ -178,6 +219,8 @@ impl EditFileTool {
                                             return EditSessionResult::Failed {
                                                 error,
                                                 session: None,
+                                                category: ToolErrorCategory::Unavailable,
+                                                side_effect: ToolSideEffect::None,
                                             };
                                         }
                                     }
@@ -190,6 +233,8 @@ impl EditFileTool {
                                         EditSessionResult::Failed {
                                             error,
                                             session: Some(session),
+                                            category: ToolErrorCategory::Conflict,
+                                            side_effect: ToolSideEffect::Unknown,
                                         }
                                     }
                                 };
@@ -199,6 +244,8 @@ impl EditFileTool {
                                 return EditSessionResult::Failed {
                                     error: error_message,
                                     session,
+                                    category: ToolErrorCategory::InvalidInput,
+                                    side_effect: ToolSideEffect::Unknown,
                                 };
                             }
                         },
@@ -206,6 +253,8 @@ impl EditFileTool {
                             return EditSessionResult::Failed {
                                 error: error.to_string(),
                                 session,
+                                category: ToolErrorCategory::InvalidInput,
+                                side_effect: ToolSideEffect::Unknown,
                             };
                         }
                     }
@@ -214,6 +263,8 @@ impl EditFileTool {
                     return EditSessionResult::Failed {
                         error: "Edit cancelled by user".to_string(),
                         session,
+                        category: ToolErrorCategory::Cancelled,
+                        side_effect: ToolSideEffect::Unknown,
                     };
                 }
             }
@@ -323,6 +374,238 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "line 1\nmodified line 2\nline 3\n");
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_match_feedback(cx: &mut TestAppContext) {
+        for (content, old_text, new_text, expected_text, start_line, end_line, is_exact) in [
+            (
+                "value suffix\nvalue\n",
+                "value\n",
+                "updated\n",
+                "value suffix\nupdated\n",
+                2,
+                2,
+                true,
+            ),
+            (
+                "prefix\n    old value\n        nested\nsuffix\n",
+                "old value\n    nested",
+                "new value\n    updated",
+                "prefix\n    new value\n        updated\nsuffix\n",
+                2,
+                3,
+                false,
+            ),
+            (
+                "😀 prefix\n    café();\n",
+                "café();",
+                "été();",
+                "😀 prefix\n    été();\n",
+                2,
+                2,
+                true,
+            ),
+            ("prefix\nremove", "remove", "", "prefix\n", 2, 2, true),
+            (
+                "header\none\ntwo\n\nsuffix",
+                "one\ntwo\n\n",
+                "done\n",
+                "header\ndone\nsuffix",
+                2,
+                3,
+                true,
+            ),
+            ("a\nb", "\n", "X", "aX\nb", 1, 1, true),
+            ("same\n", "same", "same", "same\n", 1, 1, true),
+        ] {
+            let (edit_tool, _project, _action_log, _fs, _thread) =
+                setup_test(cx, json!({"file.txt": content})).await;
+            let output = cx
+                .update(|cx| {
+                    edit_tool.clone().run(
+                        ToolInput::resolved(EditFileToolInput {
+                            path: "root/file.txt".into(),
+                            edits: vec![Edit {
+                                old_text: old_text.into(),
+                                new_text: new_text.into(),
+                            }],
+                        }),
+                        ToolCallEventStream::test().0,
+                        cx,
+                    )
+                })
+                .await
+                .expect("edit should succeed");
+            let serialized = serde_json::to_value(&output).expect("output should serialize");
+            assert_eq!(serialized["new_text"], expected_text);
+            assert_eq!(
+                serialized["edit_matches"],
+                json!([{
+                    "edit_index": 0,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "is_exact": is_exact,
+                }]),
+                "old_text: {old_text:?}"
+            );
+            let match_kind = if is_exact { "exact" } else { "fuzzy" };
+            let location = if start_line == end_line {
+                format!("line {start_line}")
+            } else {
+                format!("lines {start_line}-{end_line}")
+            };
+            let feedback = output.to_string();
+            assert!(feedback.contains("1-based lines in the then-current buffer"));
+            assert!(feedback.contains(&format!("Edit 0: {match_kind} match at {location}.")));
+            if content == expected_text {
+                assert!(feedback.starts_with("No edits were made."));
+            } else {
+                assert!(feedback.starts_with("Edited root/file.txt successfully"));
+            }
+            let replayed: EditFileToolOutput =
+                serde_json::from_value(serialized).expect("output should deserialize");
+            assert_eq!(replayed.to_string(), feedback);
+            let model_content: language_model::LanguageModelToolResultContent = output.into();
+            assert_eq!(
+                model_content,
+                language_model::LanguageModelToolResultContent::from(feedback)
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_match_feedback_tracks_sequential_lines(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "first\nlast\n"})).await;
+        let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+        let task = cx.update(|cx| edit_tool.run(input, ToolCallEventStream::test().0, cx));
+        sender.send_partial(json!({"path": "root/file.txt"}));
+        cx.run_until_parked();
+        let edits = json!([
+            {"old_text": "first", "new_text": "first\ninserted"},
+            {"old_text": "inserted\nlast", "new_text": "done"}
+        ]);
+        let input = json!({"path": "root/file.txt", "edits": edits});
+        sender.send_partial(input.clone());
+        cx.run_until_parked();
+        sender.send_partial(input.clone());
+        cx.run_until_parked();
+        sender.send_full(input);
+        let output = task.await.expect("sequential edits should succeed");
+        let serialized = serde_json::to_value(&output).expect("output should serialize");
+        assert_eq!(serialized["new_text"], "first\ndone\n");
+        assert_eq!(
+            serialized["edit_matches"],
+            json!([
+                {"edit_index": 0, "start_line": 1, "end_line": 1, "is_exact": true},
+                {"edit_index": 1, "start_line": 2, "end_line": 3, "is_exact": true},
+            ])
+        );
+        assert!(
+            output
+                .to_string()
+                .contains("Edit 1: exact match at lines 2-3.")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_empty_feedback(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "unchanged\n"})).await;
+        let output = cx
+            .update(|cx| {
+                edit_tool.run(
+                    ToolInput::resolved(EditFileToolInput {
+                        path: "root/file.txt".into(),
+                        edits: Vec::new(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .expect("empty edits should succeed");
+        assert_eq!(output.to_string(), "No edits were made.");
+        let serialized = serde_json::to_value(output).expect("output should serialize");
+        assert_eq!(serialized["new_text"], "unchanged\n");
+        assert!(serialized.get("edit_matches").is_none());
+    }
+
+    #[test]
+    fn test_edit_match_feedback_bounds_preview_without_hiding_fuzzy_omissions() {
+        let edit_matches = (0..40)
+            .map(|index| {
+                json!({
+                    "edit_index": index, "start_line": index + 1, "end_line": index + 1,
+                    "is_exact": index < 35,
+                })
+            })
+            .collect::<Vec<_>>();
+        let serialized = json!({
+            "input_path": "root/file.txt", "old_text": "old", "new_text": "new",
+            "diff": "diff", "edit_matches": edit_matches,
+        });
+        let output: EditFileToolOutput =
+            serde_json::from_value(serialized.clone()).expect("output");
+        let feedback = output.to_string();
+        assert!(feedback.contains("Edit 31: exact match at line 32."));
+        assert!(!feedback.contains("Edit 32:"));
+        assert!(feedback.contains("8 additional edit matches omitted (5 fuzzy)."));
+        assert_eq!(
+            serde_json::to_value(output).expect("full metadata"),
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_edit_match_feedback_legacy_output() {
+        let serialized = json!({
+            "input_path": "root/file.txt",
+            "old_text": "old\n",
+            "new_text": "new\n",
+            "diff": "@@ -1 +1 @@\n-old\n+new\n",
+        });
+        let output: EditFileToolOutput =
+            serde_json::from_value(serialized.clone()).expect("legacy output should deserialize");
+        assert_eq!(output.to_string(), "Edited root/file.txt successfully");
+        assert_eq!(
+            serde_json::to_value(output).expect("legacy output should serialize"),
+            serialized
+        );
+    }
+
+    #[gpui::test]
+    async fn test_edit_match_feedback_preserves_write_mode(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "old\n"})).await;
+        let event_stream = ToolCallEventStream::test().0;
+        let output = cx
+            .update(|cx| {
+                cx.spawn(async move |cx| {
+                    let mut session = EditSession::new(
+                        "root/file.txt".into(),
+                        EditSessionMode::Write,
+                        "write_file",
+                        edit_tool.session_context.clone(),
+                        &event_stream,
+                        cx,
+                    )
+                    .await
+                    .expect("write session should open");
+                    session
+                        .finalize_write("new\n", cx)
+                        .await
+                        .expect("write should succeed");
+                    run_session(EditSessionResult::Completed(session), &event_stream, cx).await
+                })
+            })
+            .await
+            .expect("write session should succeed");
+        assert_eq!(output.to_string(), "Edited root/file.txt successfully");
+        let serialized = serde_json::to_value(output).expect("output should serialize");
+        assert_eq!(serialized["new_text"], "new\n");
+        assert!(serialized.get("edit_matches").is_none());
     }
 
     #[gpui::test]
@@ -606,6 +889,7 @@ mod tests {
             error,
             diff,
             input_path,
+            ..
         } = result.unwrap_err()
         else {
             panic!("expected error");
@@ -696,9 +980,22 @@ mod tests {
             })
             .await;
 
-        let EditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
-            panic!("expected error");
+        let EditFileToolOutput::Error {
+            error,
+            structured_error: Some(structured_error),
+            ..
+        } = result.unwrap_err()
+        else {
+            panic!("expected structured error");
         };
+        assert_eq!(structured_error.category, ToolErrorCategory::Conflict);
+        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Unknown));
+        assert_eq!(structured_error.recover_with.len(), 1);
+        assert_eq!(structured_error.recover_with[0].tool, "read_file");
+        assert_eq!(
+            structured_error.recover_with[0].arguments["path"],
+            "root/file.txt"
+        );
         assert!(
             error.contains("Could not find matching text"),
             "Expected error containing 'Could not find matching text' but got: {error}"
@@ -787,11 +1084,18 @@ mod tests {
         );
 
         let content_text = find_first_text_content_in_events(&mut receiver).await;
+        let content_text = content_text.expect("expected structured failure content");
+        let structured_error: crate::ToolError =
+            serde_json::from_str(&content_text).expect("expected structured failure JSON");
+        assert_eq!(structured_error.category, ToolErrorCategory::Conflict);
+        assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Unknown));
+        assert_eq!(structured_error.recover_with.len(), 1);
+        assert_eq!(structured_error.recover_with[0].tool, "read_file");
         assert_eq!(
-            content_text.as_deref(),
-            Some(error.as_str()),
-            "expected the failure message to be surfaced as tool call content",
+            structured_error.recover_with[0].arguments["path"],
+            "root/file.txt"
         );
+        assert_eq!(structured_error.message, error);
     }
 
     #[gpui::test]
@@ -922,7 +1226,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_refreshes_match_after_buffer_change(cx: &mut TestAppContext) {
-        for (content, old_text, new_text, range, replacement, expected) in [
+        for (content, old_text, new_text, range, replacement, expected, expected_match) in [
             (
                 "prefix\nold value\nsuffix\n",
                 "old value",
@@ -930,6 +1234,7 @@ mod tests {
                 0..0,
                 "😀\n",
                 "😀\nprefix\nnew value\nsuffix\n",
+                json!({"edit_index": 0, "start_line": 3, "end_line": 3, "is_exact": true}),
             ),
             (
                 "prefix\nold value\nsuffix\n",
@@ -938,6 +1243,7 @@ mod tests {
                 0..7,
                 "",
                 "new value\nsuffix\n",
+                json!({"edit_index": 0, "start_line": 1, "end_line": 1, "is_exact": true}),
             ),
             (
                 "prefix\n    old value\n        nested\nsuffix\n",
@@ -946,6 +1252,7 @@ mod tests {
                 0..7,
                 "😀\n\n",
                 "😀\n\n    new value\n        updated\nsuffix\n",
+                json!({"edit_index": 0, "start_line": 3, "end_line": 4, "is_exact": false}),
             ),
         ] {
             let (edit_tool, project, _action_log, _fs, _thread) =
@@ -972,7 +1279,10 @@ mod tests {
                 "path": "root/file.txt",
                 "edits": [{"old_text": old_text, "new_text": new_text}]
             }));
-            let EditFileToolOutput::Success { new_text, .. } = task.await.unwrap() else {
+            let output = task.await.expect("edit should succeed after buffer change");
+            let serialized = serde_json::to_value(&output).expect("output should serialize");
+            assert_eq!(serialized["edit_matches"], json!([expected_match]));
+            let EditFileToolOutput::Success { new_text, .. } = output else {
                 panic!("expected success");
             };
             assert_eq!(new_text, expected);
@@ -1038,6 +1348,233 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "line 1\nmodified line 2\nline 3\n");
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_rejects_changed_path(cx: &mut TestAppContext) {
+        for changed_in_final in [false, true] {
+            let (edit_tool, project, _action_log, fs, _thread) = setup_test(
+                cx,
+                json!({"first.txt": "first\nsecond\n", "other.txt": "first\nsecond\n"}),
+            )
+            .await;
+            let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+            let task = cx.update(|cx| edit_tool.run(input, ToolCallEventStream::test().0, cx));
+            sender.send_partial(json!({"path": "root/first.txt"}));
+            cx.run_until_parked();
+            let edits = json!([
+                {"old_text": "first", "new_text": "changed"},
+                {"old_text": "second", "new_text": "also changed"}
+            ]);
+            sender.send_partial(json!({"path": "root/first.txt", "edits": edits}));
+            cx.run_until_parked();
+            let buffer = project.update(cx, |project, cx| {
+                let path = project
+                    .find_project_path(&PathBuf::from("root/first.txt"), cx)
+                    .expect("project path");
+                project.get_open_buffer(&path, cx).expect("open buffer")
+            });
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "changed\nsecond\n"
+            );
+
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "user\n")], None, cx));
+            let changed_input = json!({"path": "root/other.txt", "edits": edits});
+            if changed_in_final {
+                sender.send_full(changed_input);
+            } else {
+                sender.send_partial(changed_input);
+                cx.run_until_parked();
+                drop(sender);
+            }
+            let error = task.await.expect_err("changed path must fail");
+            let EditFileToolOutput::Error {
+                error,
+                input_path,
+                diff,
+                ..
+            } = error
+            else {
+                panic!("expected error output");
+            };
+            assert!(error.contains("Edit path changed"), "{error}");
+            assert!(
+                error.contains("earlier streamed edits may remain"),
+                "{error}"
+            );
+            assert_eq!(input_path, Some(PathBuf::from("root/first.txt")));
+            assert!(diff.contains("+changed"));
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "user\nchanged\nsecond\n"
+            );
+            assert_eq!(
+                fs.load(path!("/root/other.txt").as_ref())
+                    .await
+                    .expect("other file"),
+                "first\nsecond\n"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_rejects_rewritten_processed_edits(cx: &mut TestAppContext) {
+        for (changed_in_final, edits, expected_reason) in [
+            (
+                false,
+                json!([{"old_text": "firs", "new_text": "changed"}, {"old_text": "second"}]),
+                "old_text",
+            ),
+            (
+                true,
+                json!([{"old_text": "FIRST", "new_text": "changed"}, {"old_text": "second", "new_text": "done"}]),
+                "old_text",
+            ),
+            (
+                false,
+                json!([{"old_text": "first", "new_text": "change"}, {"old_text": "second"}]),
+                "new_text",
+            ),
+            (
+                true,
+                json!([{"old_text": "first", "new_text": "changed again"}, {"old_text": "second", "new_text": "done"}]),
+                "new_text",
+            ),
+            (false, json!([]), "shortened"),
+            (true, json!([]), "shortened"),
+        ] {
+            let (tool, project, _action_log, _fs, _thread) =
+                setup_test(cx, json!({"file.txt": "first\nsecond\n"})).await;
+            let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+            let task = cx.update(|cx| tool.run(input, ToolCallEventStream::test().0, cx));
+            sender.send_partial(json!({"path": "root/file.txt"}));
+            cx.run_until_parked();
+            sender.send_partial(json!({"path": "root/file.txt", "edits": [
+                {"old_text": "first", "new_text": "changed"}, {"old_text": "second"}
+            ]}));
+            cx.run_until_parked();
+            let buffer = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path("root/file.txt", cx)
+                    .expect("path");
+                project.get_open_buffer(&path, cx).expect("buffer")
+            });
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "changed\nsecond\n"
+            );
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "user\n")], None, cx));
+            let payload = json!({"path": "root/file.txt", "edits": edits});
+            if changed_in_final {
+                sender.send_full(payload);
+            } else {
+                sender.send_partial(payload);
+                cx.run_until_parked();
+                drop(sender);
+            }
+            let error = task.await.expect_err("inconsistent input must fail");
+            let EditFileToolOutput::Error { error, diff, .. } = error else {
+                panic!("expected error output");
+            };
+            assert!(error.contains(expected_reason), "{error}");
+            assert!(
+                error.contains("earlier streamed edits may remain"),
+                "{error}"
+            );
+            assert!(diff.contains("+changed"));
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "user\nchanged\nsecond\n"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_rejects_changed_in_progress_prefix(cx: &mut TestAppContext) {
+        for (change_new_text, changed_in_final) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (tool, project, _action_log, _fs, _thread) =
+                setup_test(cx, json!({"file.txt": "first line\n"})).await;
+            let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+            let task = cx.update(|cx| tool.run(input, ToolCallEventStream::test().0, cx));
+            sender.send_partial(json!({"path": "root/file.txt"}));
+            cx.run_until_parked();
+            sender.send_partial(json!({"path": "root/file.txt", "edits": [{"old_text": "first"}]}));
+            cx.run_until_parked();
+            if change_new_text {
+                sender.send_partial(json!({"path": "root/file.txt", "edits": [{"old_text": "first line", "new_text": "new value"}]}));
+                cx.run_until_parked();
+            }
+            let buffer = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path("root/file.txt", cx)
+                    .expect("path");
+                project.get_open_buffer(&path, cx).expect("buffer")
+            });
+            let before = buffer.read_with(cx, |buffer, _| buffer.text());
+            let edit = if change_new_text {
+                json!({"old_text": "first line", "new_text": "new X"})
+            } else {
+                json!({"old_text": "firé", "new_text": "new value"})
+            };
+            let payload = json!({"path": "root/file.txt", "edits": [edit]});
+            if changed_in_final {
+                sender.send_full(payload);
+            } else {
+                sender.send_partial(payload);
+                cx.run_until_parked();
+                drop(sender);
+            }
+            let error = task
+                .await
+                .expect_err("changed emitted prefix must fail")
+                .to_string();
+            assert!(
+                error.contains(if change_new_text {
+                    "new_text"
+                } else {
+                    "old_text"
+                }),
+                "{error}"
+            );
+            assert!(
+                error.contains("earlier streamed edits may remain"),
+                "{error}"
+            );
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), before);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_allows_missing_partial_fields_and_incremental_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "first\nsecond\n"})).await;
+        let (mut sender, input) = ToolInput::<EditFileToolInput>::test();
+        let task = cx.update(|cx| tool.run(input, ToolCallEventStream::test().0, cx));
+        sender.send_partial(json!({"path": "root/file.txt"}));
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/file.txt", "edits": [{"old_text": "fir"}]}));
+        cx.run_until_parked();
+        let partial = json!({"path": "root/file.txt", "edits": [{"old_text": "first", "new_text": "changed"}, {"old_text": "sec"}]});
+        sender.send_partial(partial.clone());
+        cx.run_until_parked();
+        sender.send_partial(partial);
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/file.txt", "edits": [{}, {"new_text": "done"}]}));
+        cx.run_until_parked();
+        sender.send_full(json!({"path": "root/file.txt", "edits": [
+            {"old_text": "first", "new_text": "changed"},
+            {"old_text": "second", "new_text": "done"}
+        ]}));
+        let result = task.await.expect("append-only input should succeed");
+        let EditFileToolOutput::Success { new_text, .. } = result else {
+            panic!("expected success");
+        };
+        assert_eq!(new_text, "changed\ndone\n");
     }
 
     #[gpui::test]
@@ -1301,6 +1838,7 @@ mod tests {
             error,
             diff,
             input_path,
+            ..
         } = result.unwrap_err()
         else {
             panic!("expected error");
@@ -2501,6 +3039,7 @@ mod tests {
             error,
             diff,
             input_path,
+            ..
         } = result.unwrap_err()
         else {
             panic!("expected error");
@@ -3206,6 +3745,41 @@ mod tests {
         // When the model uses incorrect field names, the error should
         // tell it what to fix.
         assert_eq!(err.to_string(), "missing field `old_text`");
+    }
+
+    #[gpui::test]
+    async fn test_missing_or_null_edit_input_is_structured(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "unchanged\n"})).await;
+        for value in [
+            json!({"path": "root/file.txt"}),
+            json!({"path": "root/file.txt", "edits": null}),
+        ] {
+            let result = cx
+                .update(|cx| {
+                    edit_tool.clone().run(
+                        ToolInput::ready(value),
+                        ToolCallEventStream::test().0,
+                        cx,
+                    )
+                })
+                .await
+                .expect_err("invalid final input should fail");
+            let EditFileToolOutput::Error {
+                error,
+                structured_error: Some(structured_error),
+                ..
+            } = result
+            else {
+                panic!("expected structured edit error");
+            };
+            assert!(!error.is_empty());
+            assert_eq!(structured_error.category, ToolErrorCategory::InvalidInput);
+            assert_eq!(structured_error.side_effect, Some(ToolSideEffect::Unknown));
+            let json = serde_json::to_string(&structured_error).expect("error should serialize");
+            let parsed: crate::ToolError = serde_json::from_str(&json).expect("error should parse");
+            assert_eq!(parsed.category, ToolErrorCategory::InvalidInput);
+        }
     }
 
     async fn setup_test_with_fs(

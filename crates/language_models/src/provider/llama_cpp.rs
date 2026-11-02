@@ -356,7 +356,9 @@ impl State {
                 cx.notify();
             })
             .ok();
-            result.log_err();
+            if let Err(error) = result {
+                log::debug!("llama.cpp model discovery unavailable: {error:#}");
+            }
         });
         self.fetch_model_task.replace(task);
     }

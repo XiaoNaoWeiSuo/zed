@@ -120,7 +120,7 @@ macos() {
         app_id="local.lin.Lin-Preview"
         ;;
       dev)
-        app="Lin Dev.app"
+        app="Lin.app"
         db_suffix="dev"
         app_id="local.lin.Lin-Dev"
         ;;

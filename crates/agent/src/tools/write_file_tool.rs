@@ -2,7 +2,10 @@ use super::edit_session::{
     EditSession, EditSessionContext, EditSessionMode, EditSessionOutput, EditSessionResult,
     initial_title_from_partial_path, run_session,
 };
-use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolInputPayload};
+use crate::{
+    AgentTool, Thread, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolInputPayload,
+    ToolSideEffect,
+};
 use action_log::ActionLog;
 use agent_client_protocol::schema::v2 as acp;
 use futures::FutureExt as _;
@@ -123,6 +126,8 @@ impl WriteFileTool {
                                                 return EditSessionResult::Failed {
                                                     error,
                                                     session: None,
+                                                    category: ToolErrorCategory::Unavailable,
+                                                    side_effect: ToolSideEffect::None,
                                                 };
                                             }
                                         }
@@ -132,7 +137,12 @@ impl WriteFileTool {
                                         && let Err(error) = current_session.process_write(parsed.content.as_deref(), cx)
                                     {
                                         log::error!("Failed to process write: {}", error);
-                                        return EditSessionResult::Failed { error, session };
+                                        return EditSessionResult::Failed {
+                                            error,
+                                            session,
+                                            category: ToolErrorCategory::Conflict,
+                                            side_effect: ToolSideEffect::Unknown,
+                                        };
                                     }
                                 }
                             }
@@ -156,6 +166,8 @@ impl WriteFileTool {
                                             return EditSessionResult::Failed {
                                                 error,
                                                 session: None,
+                                                category: ToolErrorCategory::Unavailable,
+                                                side_effect: ToolSideEffect::None,
                                             };
                                         }
                                     }
@@ -168,6 +180,8 @@ impl WriteFileTool {
                                         EditSessionResult::Failed {
                                             error,
                                             session: Some(session),
+                                            category: ToolErrorCategory::Conflict,
+                                            side_effect: ToolSideEffect::Unknown,
                                         }
                                     }
                                 };
@@ -177,6 +191,8 @@ impl WriteFileTool {
                                 return EditSessionResult::Failed {
                                     error: error_message,
                                     session,
+                                    category: ToolErrorCategory::InvalidInput,
+                                    side_effect: ToolSideEffect::Unknown,
                                 };
                             }
                         },
@@ -184,6 +200,8 @@ impl WriteFileTool {
                             return EditSessionResult::Failed {
                                 error: error.to_string(),
                                 session,
+                                category: ToolErrorCategory::InvalidInput,
+                                side_effect: ToolSideEffect::Unknown,
                             };
                         }
                     }
@@ -192,6 +210,8 @@ impl WriteFileTool {
                     return EditSessionResult::Failed {
                         error: "Write cancelled by user".to_string(),
                         session,
+                        category: ToolErrorCategory::Cancelled,
+                        side_effect: ToolSideEffect::Unknown,
                     };
                 }
             }

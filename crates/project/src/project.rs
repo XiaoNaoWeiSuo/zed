@@ -1293,6 +1293,23 @@ impl Project {
         flags: LocalProjectFlags,
         cx: &mut App,
     ) -> Entity<Self> {
+        Self::local_with_context_servers(
+            client, node, user_store, languages, fs, env, flags, true, cx,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn local_with_context_servers(
+        client: Arc<Client>,
+        node: NodeRuntime,
+        user_store: Entity<UserStore>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        env: Option<HashMap<String, String>>,
+        flags: LocalProjectFlags,
+        maintain_context_servers: bool,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx: &mut Context<Self>| {
             let (tx, rx) = mpsc::unbounded();
             cx.spawn(async move |this, cx| Self::send_buffer_ordered_messages(this, rx, cx).await)
@@ -1314,10 +1331,11 @@ impl Project {
 
             let weak_self = cx.weak_entity();
             let context_server_store = cx.new(|cx| {
-                ContextServerStore::local(
+                ContextServerStore::local_with_server_loop(
                     worktree_store.clone(),
                     Some(weak_self.clone()),
                     false,
+                    maintain_context_servers,
                     cx,
                 )
             });

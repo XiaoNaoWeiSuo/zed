@@ -2,7 +2,10 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use super::symbol_locator::{LocationDisplay, SymbolLocator};
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolRecovery, ToolSideEffect,
+    tool_error_json,
+};
 use agent_client_protocol::schema::v2 as acp;
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;
@@ -60,12 +63,33 @@ impl AgentTool for FindReferencesTool {
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+            let input = input.recv().await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::InvalidInput,
+                    format!("Failed to receive tool input: {error}"),
+                    false,
+                    vec![ToolRecovery {
+                        tool: "help".into(),
+                        arguments: serde_json::json!({ "query": Self::NAME }),
+                        reason: "Check this tool's required input fields".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input.symbol.resolve(&project, cx).await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::NotFound,
+                    error,
+                    false,
+                    vec![ToolRecovery {
+                        tool: "read_file".into(),
+                        arguments: serde_json::json!({ "path": input.symbol.file_path }),
+                        reason: "Re-read the file to confirm the symbol name and line".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
             let references_task = project.update(cx, |project, cx| {
                 project.references(&resolved.buffer, resolved.position, cx)
@@ -73,7 +97,15 @@ impl AgentTool for FindReferencesTool {
 
             let references = references_task
                 .await
-                .map_err(|e| format!("Find references failed: {e}"))?
+                .map_err(|error| {
+                    tool_error_json(
+                        ToolErrorCategory::Unavailable,
+                        format!("Find references failed: {error}"),
+                        false,
+                        vec![],
+                        Some(ToolSideEffect::None),
+                    )
+                })?
                 .unwrap_or_default();
 
             if references.is_empty() {

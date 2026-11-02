@@ -29,7 +29,6 @@ use ui::{
     ButtonLike, ButtonLink, ConfiguredApiCard, Divider, List, ListBulletItem, Tooltip, prelude::*,
 };
 use ui_input::InputField;
-use util::ResultExt;
 
 use crate::AllLanguageModelSettings;
 
@@ -197,7 +196,9 @@ impl State {
                     result.as_ref().err().map(|error| format!("{error:#}"));
             })
             .ok();
-            result.log_err();
+            if let Err(error) = result {
+                log::debug!("Ollama model discovery unavailable: {error:#}");
+            }
         });
         self.fetch_model_task.replace(task);
     }

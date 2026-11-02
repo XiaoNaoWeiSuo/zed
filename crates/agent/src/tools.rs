@@ -18,6 +18,7 @@ mod go_to_definition_tool;
 mod goal_tool;
 mod goal_verification;
 mod grep_tool;
+mod help_tool;
 mod inspect_tool_result_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
@@ -29,6 +30,7 @@ mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
 mod terminal_tool;
+mod tool_error;
 mod tool_permissions;
 mod web_search_tool;
 mod write_file_tool;
@@ -89,6 +91,7 @@ pub use go_to_definition_tool::*;
 pub use goal_tool::*;
 pub use goal_verification::*;
 pub use grep_tool::*;
+pub use help_tool::*;
 pub use inspect_tool_result_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
@@ -99,6 +102,8 @@ pub use rename_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
+
+pub use tool_error::*;
 
 pub use terminal_tool::{
     SandboxedTerminalTool, SandboxedTerminalToolInput, TerminalSessionMetadata,
@@ -257,6 +262,7 @@ tools! {
     GoalTool => General,
     InspectToolResultTool => General,
     GrepTool => General,
+    HelpTool => General,
     ListAgentsAndModelsTool => General,
     ListDirectoryTool => General,
     MovePathTool => General,

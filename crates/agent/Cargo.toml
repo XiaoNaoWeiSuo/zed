@@ -12,6 +12,7 @@ doctest = false
 [features]
 test-support = ["db/test-support"]
 unit-eval = []
+eval-subagent = []
 e2e = []
 
 [lints]

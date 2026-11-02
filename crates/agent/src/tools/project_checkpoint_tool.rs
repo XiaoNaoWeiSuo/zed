@@ -9,7 +9,7 @@ use util::ResultExt as _;
 
 use crate::{
     AgentTool, CheckpointEvidence, CheckpointFile, ProjectCheckpoint, ProjectCheckpointStore,
-    Thread, ToolCallEventStream, ToolInput,
+    RuntimeLedgerSnapshot, Thread, ToolCallEventStream, ToolInput,
 };
 
 /// Save a concise handoff at a meaningful work boundary, retrieve one by scope,
@@ -23,7 +23,8 @@ use crate::{
 /// assessments, not proof of completion.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectCheckpointInput {
-    /// Either "save", "read", or "list".
+    /// "save", "read", "list", or "runtime" for paginated session-owned task metadata.
+    /// Runtime records are historical observations, not proof tasks are still running.
     pub action: String,
     /// Read detail: "summary" (default) or "full" for saved file and evidence records.
     #[serde(default)]
@@ -123,6 +124,8 @@ pub struct ProjectCheckpointOutput {
     pub current_branch_changed: Option<bool>,
     pub new_dirty_files: Option<Vec<PathBuf>>,
     pub new_dirty_files_truncated: bool,
+    #[serde(default)]
+    pub runtime_ledger: RuntimeLedgerSnapshot,
     pub error: Option<String>,
 }
 
@@ -174,8 +177,8 @@ impl AgentTool for ProjectCheckpointTool {
         cx.spawn(async move |cx| {
             let result = async {
                 let input = input.recv().await?;
-                anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list"), "Unknown checkpoint action");
-                if input.action != "list" {
+                anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list" | "runtime"), "Unknown checkpoint action");
+                if !matches!(input.action.as_str(), "list" | "runtime") {
                     anyhow::ensure!(!input.scope.trim().is_empty(), "A checkpoint scope is required");
                     anyhow::ensure!(!input.scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX), "This checkpoint scope is reserved for automatic interruption records");
                 }
@@ -193,7 +196,7 @@ impl AgentTool for ProjectCheckpointTool {
                         anyhow::ensure!(roots.len() == 1, "Specify a project root when the workspace does not have exactly one root");
                         roots.into_iter().next().ok_or_else(|| anyhow::anyhow!("No project root"))?
                     };
-                    if input.action == "list" {
+                    if matches!(input.action.as_str(), "list" | "runtime") {
                         return Ok((root, thread.id().0.to_string(), BTreeMap::new(), None, Vec::new()));
                     }
                     let mut files = thread.action_log().read(cx).changed_buffers(cx).filter_map(|(buffer, _)| {
@@ -226,8 +229,28 @@ impl AgentTool for ProjectCheckpointTool {
                         ProjectCheckpointStore::open_existing(&root)?
                     };
                     let Some(store) = store else {
-                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger: RuntimeLedgerSnapshot::default(), error: None });
                     };
+                    if input.action == "runtime" {
+                        let records = store.query_runtime_task_records(&session_id)?;
+                        let limit = input.limit.unwrap_or(10).clamp(1, 20);
+                        let total = records.len();
+                        let entries = records.into_iter().skip(input.offset).take(limit).collect::<Vec<_>>();
+                        let end = input.offset.saturating_add(entries.len());
+                        return Ok(ProjectCheckpointOutput {
+                            saved: None, scopes: Vec::new(),
+                            next_offset: (end < total).then_some(end),
+                            checkpoint: Some(serde_json::json!({
+                                "runtime_tasks": entries, "total": total,
+                                "historical_observations_only": true,
+                                "semantic_coverage": "unknown"
+                            })),
+                            changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(),
+                            current_revision_changed: None, current_branch_changed: None,
+                            new_dirty_files: None, new_dirty_files_truncated: false,
+                            runtime_ledger: RuntimeLedgerSnapshot::default(), error: None,
+                        });
+                    }
                     if input.action == "list" {
                         let limit = input.limit.unwrap_or(10).clamp(1, 20);
                         let mut scopes = store.list_scopes(input.offset, limit + 1)?;
@@ -235,7 +258,7 @@ impl AgentTool for ProjectCheckpointTool {
                             scopes.truncate(limit);
                             Some(input.offset.saturating_add(scopes.len()))
                         } else { None };
-                        return Ok(ProjectCheckpointOutput { saved: None, scopes, next_offset, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes, next_offset, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger: RuntimeLedgerSnapshot::default(), error: None });
                     }
                     if input.action == "read" {
                         let checkpoint = store.latest(&input.scope)?;
@@ -256,8 +279,13 @@ impl AgentTool for ProjectCheckpointTool {
                         let mut new_dirty_files = checkpoint.as_ref().and_then(|checkpoint| git.as_ref().map(|git| git.dirty_files.iter().filter(|path| !checkpoint.changed_files.iter().any(|file| &file.path == *path)).cloned().collect::<Vec<_>>()));
                         let new_dirty_files_truncated = new_dirty_files.as_ref().is_some_and(|files| files.len() > 50);
                         if let Some(files) = &mut new_dirty_files { files.truncate(50); }
+                        let runtime_ledger = RuntimeLedgerSnapshot::from_records(
+                            None,
+                            checkpoint.as_ref(),
+                            &[],
+                        );
                         let checkpoint = checkpoint.map(|checkpoint| checkpoint_read_view(checkpoint, input.detail)).transpose()?;
-                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint, changed_since_checkpoint: changed, files_not_checked: unknown, current_revision_changed: revision_changed, current_branch_changed: branch_changed, new_dirty_files, new_dirty_files_truncated, error: None });
+                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint, changed_since_checkpoint: changed, files_not_checked: unknown, current_revision_changed: revision_changed, current_branch_changed: branch_changed, new_dirty_files, new_dirty_files_truncated, runtime_ledger, error: None });
                     }
                     let mut changed_files = Vec::new();
                     for (path, unsaved) in files {
@@ -276,6 +304,7 @@ impl AgentTool for ProjectCheckpointTool {
                         next_steps: input.next_steps, changed_files, evidence, interrupted: false,
                     };
                     store.save(&checkpoint)?;
+                    let runtime_ledger = RuntimeLedgerSnapshot::from_records(None, Some(&checkpoint), &[]);
                     let saved = CheckpointSaveReceipt {
                         id: checkpoint.id,
                         scope: checkpoint.scope,
@@ -284,10 +313,10 @@ impl AgentTool for ProjectCheckpointTool {
                         files_requiring_review: checkpoint.changed_files.iter().filter(|file| file.unsaved || file.observation_error.is_some()).count(),
                         evidence_count: checkpoint.evidence.len(),
                     };
-                    Ok(ProjectCheckpointOutput { saved: Some(saved), scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: None })
+                    Ok(ProjectCheckpointOutput { saved: Some(saved), scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger, error: None })
                 }).await
             }.await;
-            result.map_err(|error: anyhow::Error| ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, error: Some(format!("{error:#}")) })
+            result.map_err(|error: anyhow::Error| ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger: RuntimeLedgerSnapshot::default(), error: Some(format!("{error:#}")) })
         })
     }
 }

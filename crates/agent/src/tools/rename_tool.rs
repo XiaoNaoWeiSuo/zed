@@ -9,7 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::symbol_locator::SymbolLocator;
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolRecovery, ToolSideEffect,
+    tool_error_json,
+};
 
 /// Renames a symbol across the project using the language server.
 ///
@@ -69,12 +72,33 @@ impl AgentTool for RenameTool {
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+            let input = input.recv().await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::InvalidInput,
+                    format!("Failed to receive tool input: {error}"),
+                    false,
+                    vec![ToolRecovery {
+                        tool: "help".into(),
+                        arguments: serde_json::json!({ "query": Self::NAME }),
+                        reason: "Check this tool's required input fields".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input.symbol.resolve(&project, cx).await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::NotFound,
+                    error,
+                    false,
+                    vec![ToolRecovery {
+                        tool: "read_file".into(),
+                        arguments: serde_json::json!({ "path": input.symbol.file_path }),
+                        reason: "Re-read the file to confirm the symbol name and line".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
             let rename_task = project.update(cx, |project, cx| {
                 project.perform_rename(
@@ -86,9 +110,15 @@ impl AgentTool for RenameTool {
                 )
             });
 
-            let transaction = rename_task
-                .await
-                .map_err(|e| format!("Rename failed: {e}"))?;
+            let transaction = rename_task.await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::Unavailable,
+                    format!("Rename failed: {error}"),
+                    false,
+                    vec![],
+                    Some(ToolSideEffect::Unknown),
+                )
+            })?;
 
             if transaction.0.is_empty() {
                 return Ok(format!(
@@ -101,7 +131,23 @@ impl AgentTool for RenameTool {
             project
                 .update(cx, |project, cx| project.save_buffers(buffers, cx))
                 .await
-                .map_err(|e| format!("Rename succeeded, but failed to save renamed files: {e}"))?;
+                .map_err(|error| {
+                    tool_error_json(
+                        ToolErrorCategory::Conflict,
+                        format!(
+                            "Rename succeeded, but failed to save renamed files: {error}"
+                        ),
+                        false,
+                        vec![ToolRecovery {
+                            tool: "read_file".into(),
+                            arguments: serde_json::json!({
+                                "path": input.symbol.file_path
+                            }),
+                            reason: "Inspect the renamed file; changes are in the editor buffer but were not saved".into(),
+                        }],
+                        Some(ToolSideEffect::Present),
+                    )
+                })?;
 
             let mut output = format!(
                 "Renamed `{}` to `{}` in {} file(s):\n",

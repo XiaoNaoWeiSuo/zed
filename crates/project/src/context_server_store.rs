@@ -334,8 +334,19 @@ impl ContextServerStore {
         headless: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::local_with_server_loop(worktree_store, weak_project, headless, !headless, cx)
+    }
+
+    /// Creates a local store with explicit control over automatic server maintenance.
+    pub fn local_with_server_loop(
+        worktree_store: Entity<WorktreeStore>,
+        weak_project: Option<WeakEntity<Project>>,
+        headless: bool,
+        maintain_server_loop: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::new_internal(
-            !headless,
+            maintain_server_loop,
             None,
             ContextServerDescriptorRegistry::default_global(cx),
             worktree_store,

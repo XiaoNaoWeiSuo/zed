@@ -19,6 +19,63 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use util::path;
 
 #[gpui::test]
+async fn test_local_store_without_server_loop_does_not_start_configured_server(
+    cx: &mut TestAppContext,
+) {
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let store = cx.new(|cx| {
+        ContextServerStore::local_with_server_loop(
+            project.read(cx).worktree_store(),
+            Some(project.downgrade()),
+            false,
+            false,
+            cx,
+        )
+    });
+    let normal_store = project.read_with(cx, |project, _| project.context_server_store());
+    let executor = cx.executor();
+    normal_store.update(cx, |store, _| {
+        store.set_context_server_factory(Box::new(move |id, _| {
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+    let executor = cx.executor();
+    store.update(cx, |store, _| {
+        store.set_context_server_factory(Box::new(move |id, _| {
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+    let server_id = ContextServerId("isolated-test".into());
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "somebinary".into(),
+                    args: vec![],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        )],
+        cx,
+    );
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(store.read(cx).configured_server_ids().contains(&server_id));
+        assert_eq!(store.read(cx).status_for_server(&server_id), None);
+    });
+}
+
+#[gpui::test]
 async fn test_context_server_status(cx: &mut TestAppContext) {
     const SERVER_1_ID: &str = "mcp-1";
     const SERVER_2_ID: &str = "mcp-2";

@@ -1,4 +1,6 @@
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolSideEffect,
+};
 use acp_thread::MentionUri;
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Result, anyhow};
@@ -49,7 +51,20 @@ pub enum FindPathToolOutput {
     },
     Error {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_error: Option<ToolError>,
     },
+}
+
+impl FindPathToolOutput {
+    fn error(category: ToolErrorCategory, message: impl std::fmt::Display) -> Self {
+        let mut structured_error = ToolError::new(category, message.to_string(), false);
+        structured_error.side_effect = Some(ToolSideEffect::None);
+        Self::Error {
+            error: message.to_string(),
+            structured_error: Some(structured_error),
+        }
+    }
 }
 
 impl From<FindPathToolOutput> for LanguageModelToolResultContent {
@@ -81,7 +96,7 @@ impl From<FindPathToolOutput> for LanguageModelToolResultContent {
                     llm_output.into()
                 }
             }
-            FindPathToolOutput::Error { error } => error.into(),
+            FindPathToolOutput::Error { error, .. } => error.into(),
         }
     }
 }
@@ -128,23 +143,28 @@ impl AgentTool for FindPathTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
-            let input = input.recv().await.map_err(|e| FindPathToolOutput::Error {
-                error: e.to_string(),
+            let input = input.recv().await.map_err(|error| {
+                FindPathToolOutput::error(ToolErrorCategory::InvalidInput, error)
             })?;
 
             let search_paths_task = cx.update(|cx| search_paths(&input.glob, project, cx));
 
             let matches = futures::select! {
-                result = search_paths_task.fuse() => result.map_err(|e| FindPathToolOutput::Error { error: e.to_string() })?,
+                result = search_paths_task.fuse() => result.map_err(|error| {
+                    FindPathToolOutput::error(ToolErrorCategory::InvalidInput, error)
+                })?,
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return Err(FindPathToolOutput::Error { error: "Path search cancelled by user".to_string() });
+                    return Err(FindPathToolOutput::error(
+                        ToolErrorCategory::Cancelled,
+                        "Path search cancelled by user",
+                    ));
                 }
             };
             let paginated_matches: &[PathBuf] = &matches[cmp::min(input.offset, matches.len())
                 ..cmp::min(input.offset + RESULTS_PER_PAGE, matches.len())];
 
-            event_stream.update_fields(
-                |update| update
+            event_stream.update_fields(|update| {
+                update
                     .title(if paginated_matches.is_empty() {
                         "No matches".to_string()
                     } else if paginated_matches.len() == 1 {
@@ -159,16 +179,16 @@ impl AgentTool for FindPathTool {
                                 let uri = MentionUri::File {
                                     abs_path: path.clone(),
                                 };
-                                acp::ToolCallContent::from(
-                                    acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                                acp::ToolCallContent::from(acp::ContentBlock::ResourceLink(
+                                    acp::ResourceLink::new(
                                         path.to_string_lossy(),
                                         uri.to_uri().to_string(),
-                                    )),
-                                )
+                                    ),
+                                ))
                             })
                             .collect::<Vec<_>>(),
-                    ),
-            );
+                    )
+            });
 
             Ok(FindPathToolOutput::Success {
                 offset: input.offset,

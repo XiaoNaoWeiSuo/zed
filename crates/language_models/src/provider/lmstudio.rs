@@ -23,7 +23,6 @@ use std::sync::LazyLock;
 use std::{collections::BTreeMap, sync::Arc};
 use ui::{ButtonLike, ConfiguredApiCard, Divider, List, ListBulletItem, Tooltip, prelude::*};
 use ui_input::InputField;
-use util::ResultExt;
 
 use crate::AllLanguageModelSettings;
 use language_model::chat_completion::ChatCompletionEventMapper;
@@ -132,7 +131,11 @@ impl State {
                     result.as_ref().err().map(|error| format!("{error:#}"));
             })
             .ok();
-            result.log_err();
+            if let Err(error) = result {
+                // A local service being down is expected startup noise; the
+                // error is already surfaced through `last_fetch_models_error`.
+                log::debug!("LM Studio model discovery unavailable: {error:#}");
+            }
         });
         self.fetch_model_task.replace(task);
     }

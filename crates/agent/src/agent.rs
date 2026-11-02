@@ -951,11 +951,12 @@ impl NativeAgent {
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
                     acp_thread: acp_thread.downgrade(),
-                    thread: weak_thread,
+                    thread: weak_thread.clone(),
                     agent: weak.clone(),
                 }) as _,
                 cx,
             );
+
             // The resolver closure reads `state.skills` at invocation
             // time, so skills added or removed by the SKILL.md watcher
             // after the thread is constructed are still visible to the
@@ -2502,6 +2503,31 @@ impl NativeAgent {
 pub struct NativeAgentConnection(pub Entity<NativeAgent>);
 
 impl NativeAgentConnection {
+    #[cfg(feature = "eval-subagent")]
+    pub fn create_eval_subagent(
+        &self,
+        parent: &Entity<AcpThread>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let session_id = parent.read(cx).session_id();
+        let session = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .context("parent session not found")?;
+        anyhow::ensure!(
+            session.acp_thread.upgrade().as_ref() == Some(parent),
+            "parent session does not belong to this connection"
+        );
+        let environment = NativeThreadEnvironment {
+            agent: self.0.downgrade(),
+            thread: session.thread.downgrade(),
+            acp_thread: parent.downgrade(),
+        };
+        environment.create_subagent_thread("Evaluation subagent".to_string(), None, cx)
+    }
+
     pub fn thread(&self, session_id: &acp_v2::SessionId, cx: &App) -> Option<Entity<Thread>> {
         self.0
             .read(cx)
@@ -4249,15 +4275,24 @@ impl SubagentHandle for NativeSubagentHandle {
             let response = futures::select_biased! {
                 response = task => response,
                 _ = token_limit_rx.fuse() => {
-                    if thread.read_with(cx, |thread, _| thread.is_turn_complete())? {
-                        task.await
-                    } else {
-                        thread.update(cx, |thread, cx| thread.request_cancel(cx))?.await;
-                        Err(anyhow!(
-                            "The agent is nearing the end of its context window and has been \
-                             stopped. You can prompt the thread again to have the agent wrap up \
-                             or hand off its work."
-                        ))
+                    let mut grace_period = cx
+                        .background_executor()
+                        .timer(Duration::from_millis(10))
+                        .fuse();
+                    futures::select_biased! {
+                        response = task => response,
+                        _ = grace_period => {
+                            thread.update(cx, |thread, cx| thread.request_cancel(cx))?.await;
+                            match task.await {
+                                Ok(acp_v2::StopReason::Cancelled) => Err(anyhow!(
+                                    "The agent is nearing the end of its context window and has been \
+                                     stopped. You can prompt the thread again to have the agent wrap up \
+                                     or hand off its work."
+                                )),
+                                Ok(reason) => Ok(reason),
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
                 }
             };
@@ -4653,6 +4688,38 @@ mod internal_tests {
             });
 
             assert!(available_native_agent(cx).models.is_empty());
+        });
+    }
+
+    #[cfg(feature = "eval-subagent")]
+    #[gpui::test]
+    async fn test_eval_subagent_registers_with_parent(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent));
+        let parent = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[Path::new("/test")]), cx)
+            })
+            .await
+            .expect("create parent session");
+        let handle = cx
+            .update(|cx| connection.create_eval_subagent(&parent, cx))
+            .expect("create subagent");
+        cx.update(|cx| {
+            let child = connection.thread(&handle.id(), cx).expect("child thread");
+            assert!(child.read(cx).is_subagent());
+            assert_eq!(
+                child.read(cx).parent_thread_id(),
+                Some(parent.read(cx).session_id().clone())
+            );
+            assert!(parent.read(cx).subagent(&handle.id()).is_some());
         });
     }
 

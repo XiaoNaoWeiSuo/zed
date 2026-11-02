@@ -53,6 +53,28 @@ eval-cli \
 `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. It writes `result.json`, `thread.md`,
 and `thread.json` to the output directory.
 
+### Isolated read-only evaluation
+
+`--isolated` is an opt-in path for `openai-subscribed/gpt-6.1-terra`. Set
+`ZED_STATELESS=1` in the environment before starting the process. Supply a
+separate fixture directory containing only regular copies of `permission_tier.rs`
+and/or `sandboxing.rs` (no hidden entries or symlinks), and an existing output
+directory outside the fixture. The isolated profile exposes only `read_file`, does not
+start project context servers, and does not add the output directory as a
+worktree. Normal eval behavior is unchanged.
+
+This is **not** an OS sandbox or a network egress policy. The fixture check is
+not race-resistant, `read_file` also supports the global skills directory, and
+the process can access its ambient environment and filesystem. The subscribed
+provider reads its stored credentials and may refresh tokens and fetch its model
+catalog. The application also constructs other services and an HTTP client;
+proxy environment variables can affect traffic. Artifacts contain conversation
+content. Before any real run, use a separately controlled fixture and process
+identity/environment, restrict filesystem access and outbound destinations at
+the OS or network layer, and verify those restrictions without revealing tokens.
+Do not run online if those restrictions cannot be established. Preserve only
+the target provider credentials needed for the run, and protect the output.
+
 ### Exit codes
 
 | Code | Meaning |

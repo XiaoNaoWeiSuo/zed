@@ -1305,6 +1305,7 @@
         "name": "Write",
         "enable_all_context_servers": true,
         "tools": {
+          "help": true,
           "apply_code_action": true,
           "ask_user": true,
           "copy_path": true,
@@ -1339,6 +1340,7 @@
         // We don't know which of the context server tools are safe for the "Ask" profile, so we don't enable them by default.
         // "enable_all_context_servers": true,
         "tools": {
+          "help": true,
           "ask_user": true,
           "create_thread": true,
           "diagnostics": true,
@@ -2922,7 +2924,7 @@
   "stable": {
     // "theme": "Andromeda"
   },
-  // Settings overrides to use when using Lin Dev.
+  // Settings overrides to use when using Lin.
   // Mostly useful for developers who are managing multiple instances of Lin.
   "dev": {
     // "theme": "Andromeda"

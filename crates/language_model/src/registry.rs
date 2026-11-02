@@ -621,7 +621,7 @@ impl LanguageModelRegistry {
                                     "copilot_chat" => {
                                         // Copilot Chat returns an error if Copilot is not enabled, so we don't log those errors.
                                     }
-                                    _ => log::error!(
+                                    _ => log::warn!(
                                         "Failed to authenticate provider: {}: {error:#}",
                                         provider.name().0
                                     ),

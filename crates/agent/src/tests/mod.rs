@@ -1479,10 +1479,11 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
         system_message
     );
     assert!(
-        system_prompt.contains("Rerun checks when relevant changes"),
+        system_prompt.contains("directly inspect, change, and check"),
         "unexpected system message: {:?}",
         system_message
     );
+    assert!(!system_prompt.contains("Use the `help` tool"));
 }
 
 #[gpui::test]
@@ -8378,7 +8379,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
+async fn test_lsp_tools_general_rollout_respects_profile(cx: &mut TestAppContext) {
     let fake = init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -8429,10 +8430,7 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         );
     });
 
-    // Without the `lsp-tool` flag, sending a message should produce a
-    // completion request whose tool list excludes the LSP tools.
-    // The rename tool is on its own `rename-tool` flag with
-    // `enabled_for_staff`, so it is already visible in debug builds.
+    // LSP tools have general rollout; legacy flag values must not hide them.
     thread
         .update(cx, |thread, cx| {
             thread.send(ClientUserMessageId::new(), ["hello"], cx)
@@ -8444,9 +8442,8 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     let tool_names = tool_names_for_completion(&completion);
     for name in &lsp_tool_names {
         assert!(
-            !tool_names.iter().any(|t| t == name),
-            "expected LSP tool {name} to be hidden without the lsp-tool flag, \
-             but completion tools were: {tool_names:?}"
+            tool_names.iter().any(|t| t == name),
+            "expected generally available LSP tool {name}, got: {tool_names:?}"
         );
     }
     assert!(
@@ -8462,8 +8459,7 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     fake.end_last(&model);
     cx.run_until_parked();
 
-    // Enable the `lsp-tool` flag and send another message; the LSP tools
-    // should now appear in the completion request.
+    // Legacy flags also do not replace the profile's tool selection.
     cx.update(|cx| {
         cx.update_flags(false, vec!["lsp-tool".to_string()]);
     });
@@ -8480,8 +8476,7 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     for name in &lsp_tool_names {
         assert!(
             tool_names.iter().any(|t| t == name),
-            "expected LSP tool {name} to be exposed when lsp-tool flag is on, \
-             but completion tools were: {tool_names:?}"
+            "expected LSP tool {name} to remain exposed, got: {tool_names:?}"
         );
     }
     assert!(
@@ -8489,6 +8484,44 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         "expected rename tool to still be exposed, \
          but completion tools were: {tool_names:?}"
     );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let profile_id = thread.read_with(cx, |thread, _| thread.profile().clone());
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        let profile = settings
+            .profiles
+            .get_mut(&profile_id)
+            .expect("active profile");
+        for name in lsp_tool_names {
+            profile.tools.insert(Arc::from(name), false);
+        }
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(
+                ClientUserMessageId::new(),
+                ["check profile restrictions"],
+                cx,
+            )
+        })
+        .expect("send");
+    cx.run_until_parked();
+    let completion = fake
+        .pending_completions()
+        .pop()
+        .expect("profile completion");
+    let tool_names = tool_names_for_completion(&completion);
+    for name in lsp_tool_names {
+        assert!(
+            !tool_names.iter().any(|tool| tool == name),
+            "disabled tool {name} must stay hidden"
+        );
+    }
+    assert!(tool_names.iter().any(|tool| tool == ReadFileTool::NAME));
+    fake.end_last(&model);
+    cx.run_until_parked();
 }
 
 #[gpui::test]

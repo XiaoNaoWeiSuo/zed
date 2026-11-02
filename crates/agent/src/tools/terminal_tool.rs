@@ -22,9 +22,31 @@ use crate::sandboxing::{
     NetworkRequest, sandbox_git_dirs, sandbox_worktree_writable_paths,
     sandboxing_enabled_for_project,
 };
-use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ThreadEnvironment, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolRecovery,
+    ToolSideEffect, tool_error_json,
+};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
+
+/// Model-facing terminal failures carry a category and recovery hint instead of
+/// only prose. Nothing here retries a command or grants permission.
+fn terminal_error(
+    category: ToolErrorCategory,
+    message: impl std::fmt::Display,
+    recover_with: Vec<ToolRecovery>,
+    side_effect: ToolSideEffect,
+) -> String {
+    tool_error_json(category, message, false, recover_with, Some(side_effect))
+}
+
+fn terminal_input_recovery() -> Vec<ToolRecovery> {
+    vec![ToolRecovery {
+        tool: "help".into(),
+        arguments: serde_json::json!({ "query": "terminal" }),
+        reason: "Check the active terminal variant's schema and session actions".into(),
+    }]
+}
 
 /// Executes a shell one-liner and returns the combined output.
 ///
@@ -383,6 +405,7 @@ struct TerminalSession {
     command: String,
     sandbox_note: Option<String>,
     stop_requested: bool,
+    returned_state: Option<serde_json::Value>,
     _monitor: Task<()>,
 }
 
@@ -397,6 +420,7 @@ struct TerminalSessions {
 struct ShellRegistry {
     entries: RefCell<BTreeMap<String, Arc<crate::persistent_shell::PersistentShell>>>,
     generation: std::cell::Cell<u64>,
+    returned_states: RefCell<BTreeMap<String, serde_json::Value>>,
 }
 
 impl Drop for ShellRegistry {
@@ -421,7 +445,69 @@ fn bound_session_output(mut output: ProcessOutput) -> ProcessOutput {
     output
 }
 
+fn terminal_tracked_state(state: &TerminalSessionState, stop_requested: bool) -> serde_json::Value {
+    match state {
+        TerminalSessionState::Running => {
+            serde_json::json!({"state": "running", "stop_requested": stop_requested})
+        }
+        TerminalSessionState::Exited { status, timed_out } => {
+            serde_json::json!({"state": "exited", "stop_requested": stop_requested, "exit_code": status.exit_code, "timed_out": timed_out})
+        }
+        TerminalSessionState::Failed { .. } => {
+            serde_json::json!({"state": "failed", "stop_requested": stop_requested})
+        }
+    }
+}
+
 impl TerminalSessions {
+    fn model_session_states(&self) -> Vec<serde_json::Value> {
+        let entries = self.entries.borrow();
+        let shells = self.shells.entries.borrow();
+        let mut states: Vec<_> = entries
+            .iter()
+            .map(|(terminal_id, session)| {
+                let state = session.state.borrow();
+                let mut value = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "kind": "background_terminal",
+                    "state": match &*state {
+                        TerminalSessionState::Running => "running",
+                        TerminalSessionState::Exited { .. } => "exited",
+                        TerminalSessionState::Failed { .. } => "failed",
+                    },
+                    "stop_requested": session.stop_requested,
+                });
+                value["tracked_state_returned_by_tool"] = (session.returned_state.as_ref()
+                    == Some(&terminal_tracked_state(&state, session.stop_requested)))
+                .into();
+                value["output_returned_by_tool"] = "unknown".into();
+                if let TerminalSessionState::Exited { status, timed_out } = &*state {
+                    value["exit_code"] = serde_json::json!(status.exit_code);
+                    value["timed_out"] = serde_json::json!(timed_out);
+                }
+                (terminal_id, value)
+            })
+            .chain(shells.iter().map(|(terminal_id, shell)| {
+                let state = shell.model_state();
+                let returned =
+                    self.shells.returned_states.borrow().get(terminal_id) == Some(&state);
+                (
+                    terminal_id,
+                    serde_json::json!({
+                        "terminal_id": terminal_id,
+                        "kind": "persistent_shell",
+                        "state": state["state"],
+                        "command": state["command"],
+                        "tracked_state_returned_by_tool": returned,
+                        "output_returned_by_tool": "unknown",
+                    }),
+                )
+            }))
+            .collect();
+        states.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        states.into_iter().map(|(_, value)| value).collect()
+    }
+
     fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
         self.entries
             .borrow()
@@ -473,13 +559,15 @@ impl Drop for TerminalSessions {
 
 struct ShellRunCleanup {
     shell: Option<Arc<crate::persistent_shell::PersistentShell>>,
+    command_id: u64,
 }
 
 impl Drop for ShellRunCleanup {
     fn drop(&mut self) {
         if let Some(shell) = self.shell.take() {
+            let command_id = self.command_id;
             std::thread::spawn(move || {
-                if let Err(error) = shell.close() {
+                if let Err(error) = shell.close_running_command(command_id) {
                     log::error!("Failed to close cancelled persistent shell: {error:#}");
                 }
             });
@@ -502,11 +590,28 @@ async fn confirm_shell_action(
         )
     });
     futures::select! {
-        result = authorization.fuse() => result.map_err(|error| error.to_string())?,
-        _ = event_stream.cancelled_by_user().fuse() => return Err("Persistent shell action cancelled".into()),
+        result = authorization.fuse() => result.map_err(|error| {
+            terminal_error(
+                ToolErrorCategory::PermissionDenied,
+                format!("Persistent shell authorization failed: {error}"),
+                vec![],
+                ToolSideEffect::None,
+            )
+        })?,
+        _ = event_stream.cancelled_by_user().fuse() => return Err(terminal_error(
+            ToolErrorCategory::Cancelled,
+            "Persistent shell action cancelled",
+            vec![],
+            ToolSideEffect::None,
+        )),
     }
     if event_stream.was_cancelled_by_user() {
-        return Err("Persistent shell action cancelled".into());
+        return Err(terminal_error(
+            ToolErrorCategory::Cancelled,
+            "Persistent shell action cancelled",
+            vec![],
+            ToolSideEffect::None,
+        ));
     }
     if !needs_stateful_shell_confirmation(event_stream, &permission_input, cx) {
         return Ok(());
@@ -531,11 +636,28 @@ async fn confirm_shell_action(
         )
     });
     let decision = futures::select! {
-        result = decision.fuse() => result.map_err(|error| error.to_string())?,
-        _ = event_stream.cancelled_by_user().fuse() => return Err("Persistent shell action cancelled".into()),
+        result = decision.fuse() => result.map_err(|error| {
+            terminal_error(
+                ToolErrorCategory::PermissionDenied,
+                format!("Persistent shell decision failed: {error}"),
+                vec![],
+                ToolSideEffect::None,
+            )
+        })?,
+        _ = event_stream.cancelled_by_user().fuse() => return Err(terminal_error(
+            ToolErrorCategory::Cancelled,
+            "Persistent shell action cancelled",
+            vec![],
+            ToolSideEffect::None,
+        )),
     };
     if decision.0.as_ref() != "allow" || event_stream.was_cancelled_by_user() {
-        return Err("Persistent shell action denied or cancelled".into());
+        return Err(terminal_error(
+            ToolErrorCategory::PermissionDenied,
+            "Persistent shell action denied or cancelled",
+            vec![],
+            ToolSideEffect::None,
+        ));
     }
     Ok(())
 }
@@ -598,6 +720,7 @@ impl TerminalSessions {
             .generation
             .set(self.shells.generation.get().wrapping_add(1));
         let shells = std::mem::take(&mut *self.shells.entries.borrow_mut());
+        self.shells.returned_states.borrow_mut().clear();
         if !shells.is_empty() {
             cx.background_executor()
                 .spawn(async move {
@@ -611,6 +734,26 @@ impl TerminalSessions {
         }
     }
 
+    fn mark_shell_state_returned(
+        &self,
+        identifier: &str,
+        shell: &Arc<crate::persistent_shell::PersistentShell>,
+        snapshot: &crate::persistent_shell::ShellSnapshot,
+    ) {
+        if self
+            .shells
+            .entries
+            .borrow()
+            .get(identifier)
+            .is_some_and(|entry| Arc::ptr_eq(entry, shell))
+        {
+            self.shells.returned_states.borrow_mut().insert(
+                identifier.to_owned(),
+                crate::persistent_shell::model_state_from_snapshot(snapshot),
+            );
+        }
+    }
+
     async fn manage_shell(
         &self,
         request: &TerminalSessionRequest,
@@ -620,7 +763,12 @@ impl TerminalSessions {
         cx: &mut AsyncApp,
     ) -> Result<String, String> {
         if !input.command.is_empty() {
-            return Err("Use session.command for shell_run; outer command must be empty".into());
+            return Err(terminal_error(
+                ToolErrorCategory::InvalidInput,
+                "Use session.command for shell_run; outer command must be empty",
+                terminal_input_recovery(),
+                ToolSideEffect::None,
+            ));
         }
         if let Some(sandbox) = &input.sandbox
             && (!sandbox.allow_hosts.is_empty()
@@ -630,34 +778,69 @@ impl TerminalSessions {
                 || sandbox.unsandboxed.is_some()
                 || sandbox.reason.is_some())
         {
-            return Err("Persistent shell actions do not accept sandbox permissions".into());
+            return Err(terminal_error(
+                ToolErrorCategory::InvalidInput,
+                "Persistent shell actions do not accept sandbox permissions",
+                terminal_input_recovery(),
+                ToolSideEffect::None,
+            ));
         }
         if !matches!(request, TerminalSessionRequest::ShellOpen) && !input.cd.is_empty() {
-            return Err(
-                "Only shell_open accepts cd; change directory inside the shell thereafter".into(),
-            );
+            return Err(terminal_error(
+                ToolErrorCategory::InvalidInput,
+                "Only shell_open accepts cd; change directory inside the shell thereafter",
+                terminal_input_recovery(),
+                ToolSideEffect::None,
+            ));
         }
         if !matches!(request, TerminalSessionRequest::ShellRun { .. }) && input.timeout_ms.is_some()
         {
-            return Err("Only shell_run accepts timeout_ms".into());
+            return Err(terminal_error(
+                ToolErrorCategory::InvalidInput,
+                "Only shell_run accepts timeout_ms",
+                terminal_input_recovery(),
+                ToolSideEffect::None,
+            ));
         }
         match request {
             TerminalSessionRequest::ShellOpen => {
                 if !cfg!(target_os = "macos") {
-                    return Err("Persistent shells are supported only on local macOS".into());
+                    return Err(terminal_error(
+                        ToolErrorCategory::Unavailable,
+                        "Persistent shells are supported only on local macOS",
+                        vec![],
+                        ToolSideEffect::None,
+                    ));
                 }
                 let cwd = cx.update(|cx| {
                     if !project.read(cx).is_local() {
-                        return Err("Persistent shells require a local project".to_string());
+                        return Err(terminal_error(
+                            ToolErrorCategory::Unavailable,
+                            "Persistent shells require a local project",
+                            vec![],
+                            ToolSideEffect::None,
+                        ));
                     }
                     if sandboxing_enabled_for_project(project.read(cx), cx) {
-                        return Err(
-                            "Persistent shells are unavailable while OS sandboxing is enabled"
-                                .to_string(),
-                        );
+                        return Err(terminal_error(
+                            ToolErrorCategory::Unavailable,
+                            "Persistent shells are unavailable while OS sandboxing is enabled",
+                            vec![],
+                            ToolSideEffect::None,
+                        ));
                     }
-                    working_dir(&input.cd, project, cx)
-                        .map_err(|error| error.to_string())?
+                    working_dir(&input.cd, project, cx).map_err(|error| {
+                        terminal_error(
+                            ToolErrorCategory::NotFound,
+                            format!("Working directory is not available: {error}"),
+                            vec![ToolRecovery {
+                                tool: "terminal".into(),
+                                arguments: serde_json::json!({ "action": "list" }),
+                                reason: "Inspect existing terminals, then choose an existing project directory".into(),
+                            }],
+                            ToolSideEffect::None,
+                        )
+                    })?
                         .ok_or_else(|| {
                             "Persistent shells require a project working directory".to_string()
                         })
@@ -665,9 +848,12 @@ impl TerminalSessions {
                 if self.entries.borrow().len() + self.shells.entries.borrow().len()
                     >= MAX_TERMINAL_SESSIONS
                 {
-                    return Err(
-                        "Terminal session limit reached; clear an existing session first".into(),
-                    );
+                    return Err(terminal_error(
+                        ToolErrorCategory::Unavailable,
+                        "Terminal session limit reached; clear an existing session first",
+                        vec![],
+                        ToolSideEffect::None,
+                    ));
                 }
                 let generation = self.shells.generation.get();
                 confirm_shell_action(
@@ -684,9 +870,12 @@ impl TerminalSessions {
                 if self.shells.generation.get() != generation
                     || cx.update(|cx| sandboxing_enabled_for_project(project.read(cx), cx))
                 {
-                    return Err(
-                        "Persistent shell open cancelled or OS sandboxing was enabled".into(),
-                    );
+                    return Err(terminal_error(
+                        ToolErrorCategory::Cancelled,
+                        "Persistent shell open cancelled or OS sandboxing was enabled",
+                        vec![],
+                        ToolSideEffect::None,
+                    ));
                 }
                 let shell = cx
                     .background_executor()
@@ -708,7 +897,12 @@ impl TerminalSessions {
                             }
                         })
                         .detach();
-                    return Err("Persistent shell open cancelled or session limit reached".into());
+                    return Err(terminal_error(
+                        ToolErrorCategory::Cancelled,
+                        "Persistent shell open cancelled or session limit reached",
+                        vec![],
+                        ToolSideEffect::None,
+                    ));
                 }
                 let identifier = format!("shell-{}", uuid::Uuid::new_v4());
                 self.shells
@@ -729,7 +923,12 @@ impl TerminalSessions {
                     return Err("Persistent shells are unavailable while OS sandboxing is enabled; close this session".into());
                 }
                 if command.trim().is_empty() {
-                    return Err("Persistent shell command must not be empty".into());
+                    return Err(terminal_error(
+                        ToolErrorCategory::InvalidInput,
+                        "Persistent shell command must not be empty",
+                        terminal_input_recovery(),
+                        ToolSideEffect::None,
+                    ));
                 }
                 let shell = self
                     .shells
@@ -737,7 +936,14 @@ impl TerminalSessions {
                     .borrow()
                     .get(terminal_id)
                     .cloned()
-                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
+                    .ok_or_else(|| {
+                        terminal_error(
+                            ToolErrorCategory::NotFound,
+                            format!("Unknown persistent shell: {terminal_id}"),
+                            vec![],
+                            ToolSideEffect::None,
+                        )
+                    })?;
                 confirm_shell_action(
                     format!("Run command in persistent shell {terminal_id}"),
                     format!("Unsandboxed persistent shell command:\n{command}"),
@@ -756,7 +962,12 @@ impl TerminalSessions {
                     .get(terminal_id)
                     .is_some_and(|entry| Arc::ptr_eq(entry, &shell))
                 {
-                    return Err("Persistent shell was closed".into());
+                    return Err(terminal_error(
+                        ToolErrorCategory::Conflict,
+                        "Persistent shell was closed",
+                        vec![],
+                        ToolSideEffect::None,
+                    ));
                 }
                 let command_id = shell
                     .submit(
@@ -765,21 +976,30 @@ impl TerminalSessions {
                     )
                     .map_err(|error| format!("{error:#}"))?;
                 if *background {
-                    return Ok(serde_json::json!({
+                    let snapshot = shell.snapshot();
+                    let result = serde_json::json!({
                         "terminal_id": terminal_id,
                         "command_id": command_id,
-                        "snapshot": shell.snapshot(),
+                        "snapshot": snapshot,
                     })
-                    .to_string());
+                    .to_string();
+                    self.mark_shell_state_returned(terminal_id, &shell, &snapshot);
+                    return Ok(result);
                 }
                 let mut cleanup = ShellRunCleanup {
                     shell: Some(shell.clone()),
+                    command_id,
                 };
                 loop {
                     let snapshot = shell.snapshot();
                     if let Some(command) = &snapshot.command {
                         if command.id != command_id {
-                            return Err("Persistent shell command was replaced".into());
+                            return Err(terminal_error(
+                                ToolErrorCategory::Conflict,
+                                "Persistent shell command was replaced",
+                                vec![],
+                                ToolSideEffect::Unknown,
+                            ));
                         }
                         if !matches!(
                             command.status,
@@ -787,12 +1007,14 @@ impl TerminalSessions {
                         ) {
                             cleanup.shell = None;
                             event_stream.set_command_status(shell_goal_status(&command.status));
-                            return Ok(serde_json::json!({
+                            let result = serde_json::json!({
                                 "terminal_id": terminal_id,
                                 "command_id": command_id,
                                 "snapshot": snapshot,
                             })
-                            .to_string());
+                            .to_string();
+                            self.mark_shell_state_returned(terminal_id, &shell, &snapshot);
+                            return Ok(result);
                         }
                     }
                     futures::select! {
@@ -803,7 +1025,12 @@ impl TerminalSessions {
                                 timed_out: false,
                                 user_stopped: true,
                             });
-                            return Err("Persistent shell command cancelled; shell closed".into());
+                            return Err(terminal_error(
+                                ToolErrorCategory::Cancelled,
+                                "Persistent shell command cancelled; cleanup requested if still running",
+                                vec![],
+                                ToolSideEffect::Unknown,
+                            ));
                         },
                     }
                 }
@@ -815,8 +1042,18 @@ impl TerminalSessions {
                     .borrow()
                     .get(terminal_id)
                     .cloned()
-                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
-                serde_json::to_string(&shell.snapshot()).map_err(|error| error.to_string())
+                    .ok_or_else(|| {
+                        terminal_error(
+                            ToolErrorCategory::NotFound,
+                            format!("Unknown persistent shell: {terminal_id}"),
+                            vec![],
+                            ToolSideEffect::None,
+                        )
+                    })?;
+                let snapshot = shell.snapshot();
+                let result = serde_json::to_string(&snapshot).map_err(|error| error.to_string())?;
+                self.mark_shell_state_returned(terminal_id, &shell, &snapshot);
+                Ok(result)
             }
             TerminalSessionRequest::ShellClose { terminal_id } => {
                 let shell = self
@@ -824,7 +1061,15 @@ impl TerminalSessions {
                     .entries
                     .borrow_mut()
                     .remove(terminal_id)
-                    .ok_or_else(|| format!("Unknown persistent shell: {terminal_id}"))?;
+                    .ok_or_else(|| {
+                        terminal_error(
+                            ToolErrorCategory::NotFound,
+                            format!("Unknown persistent shell: {terminal_id}"),
+                            vec![],
+                            ToolSideEffect::None,
+                        )
+                    })?;
+                self.shells.returned_states.borrow_mut().remove(terminal_id);
                 let (sender, receiver) = futures::channel::oneshot::channel();
                 cx.background_executor()
                     .spawn(async move {
@@ -846,12 +1091,21 @@ impl TerminalSessions {
         }
     }
 
-    fn snapshot(&self, identifier: &str, cx: &AsyncApp) -> Result<TerminalSessionSnapshot> {
+    fn snapshot(
+        &self,
+        identifier: &str,
+        include_output: bool,
+        cx: &AsyncApp,
+    ) -> Result<TerminalSessionSnapshot> {
         let entries = self.entries.borrow();
         let entry = entries
             .get(identifier)
             .ok_or_else(|| anyhow::anyhow!("Unknown terminal session: {identifier}"))?;
-        let output = bound_session_output(entry.terminal.current_output_tail(cx)?);
+        let output = if include_output {
+            bound_session_output(entry.terminal.current_output_tail(cx)?)
+        } else {
+            ProcessOutput::new(String::new(), false)
+        };
         Ok(TerminalSessionSnapshot {
             terminal_id: identifier.to_owned(),
             command: entry.command.clone(),
@@ -958,7 +1212,11 @@ impl TerminalSessions {
             entry.stop_requested = true;
         }
         let mut snapshot = self
-            .snapshot(identifier, cx)
+            .snapshot(
+                identifier,
+                !matches!(request, TerminalSessionRequest::Status { .. }),
+                cx,
+            )
             .map_err(|error| error.to_string())?;
         if matches!(request, TerminalSessionRequest::Status { .. }) {
             snapshot.output.clear();
@@ -968,7 +1226,14 @@ impl TerminalSessions {
             snapshot.output = bounded.output;
             snapshot.truncated = bounded.truncated;
         }
-        serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+        let result = serde_json::to_string(&snapshot).map_err(|error| error.to_string())?;
+        if let Some(entry) = self.entries.borrow_mut().get_mut(identifier) {
+            entry.returned_state = Some(terminal_tracked_state(
+                &snapshot.state,
+                snapshot.stop_requested,
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -980,6 +1245,10 @@ pub struct TerminalTool {
 }
 
 impl TerminalTool {
+    pub(crate) fn model_session_states(&self) -> Vec<serde_json::Value> {
+        self.sessions.model_session_states()
+    }
+
     pub fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
         self.sessions.session_metadata()
     }
@@ -995,7 +1264,7 @@ impl TerminalTool {
             .collect::<Vec<_>>();
         identifiers
             .iter()
-            .map(|identifier| self.sessions.snapshot(identifier, cx))
+            .map(|identifier| self.sessions.snapshot(identifier, true, cx))
             .collect()
     }
 
@@ -1036,6 +1305,10 @@ pub struct SandboxedTerminalTool {
 }
 
 impl SandboxedTerminalTool {
+    pub(crate) fn model_session_states(&self) -> Vec<serde_json::Value> {
+        self.sessions.model_session_states()
+    }
+
     pub fn session_metadata(&self) -> Vec<TerminalSessionMetadata> {
         self.sessions.session_metadata()
     }
@@ -1051,7 +1324,7 @@ impl SandboxedTerminalTool {
             .collect::<Vec<_>>();
         identifiers
             .iter()
-            .map(|identifier| self.sessions.snapshot(identifier, cx))
+            .map(|identifier| self.sessions.snapshot(identifier, true, cx))
             .collect()
     }
 
@@ -1232,22 +1505,38 @@ async fn run_terminal_tool(
         }
     }
     if input.command.trim().is_empty() || input.cd.trim().is_empty() {
-        return Err("Starting a terminal requires command and cd".into());
+        return Err(terminal_error(
+            ToolErrorCategory::InvalidInput,
+            "Starting a terminal requires command and cd",
+            terminal_input_recovery(),
+            ToolSideEffect::None,
+        ));
     }
     let background = input.session.is_some();
     if background
         && sessions.entries.borrow().len() + sessions.shells.entries.borrow().len()
             >= MAX_TERMINAL_SESSIONS
     {
-        return Err("Terminal session limit reached; clear an existing session first".into());
+        return Err(terminal_error(
+            ToolErrorCategory::Unavailable,
+            "Terminal session limit reached; clear an existing session first",
+            vec![],
+            ToolSideEffect::None,
+        ));
     }
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
         cx.update(|cx| {
-            let working_dir =
-                working_dir(&input.cd, &project, cx).map_err(|err| err.to_string())?;
+            let working_dir = working_dir(&input.cd, &project, cx).map_err(|err| {
+                terminal_error(
+                    ToolErrorCategory::NotFound,
+                    format!("Working directory is not available: {err}"),
+                    vec![],
+                    ToolSideEffect::None,
+                )
+            })?;
             let context =
                 crate::ToolPermissionContext::new(TerminalTool::NAME, vec![input.command.clone()]);
             let authorize =
@@ -1840,16 +2129,31 @@ async fn run_terminal_tool(
     if background {
         *sessions.cleanup_context.borrow_mut() = Some(cx.clone());
         if event_stream.was_cancelled_by_user() {
-            return Err("Background terminal start cancelled".into());
+            return Err(terminal_error(
+                ToolErrorCategory::Cancelled,
+                "Background terminal start cancelled",
+                vec![],
+                ToolSideEffect::Unknown,
+            ));
         }
         if sessions.entries.borrow().len() + sessions.shells.entries.borrow().len()
             >= MAX_TERMINAL_SESSIONS
         {
-            return Err("Terminal session limit reached; clear an existing session first".into());
+            return Err(terminal_error(
+                ToolErrorCategory::Unavailable,
+                "Terminal session limit reached; clear an existing session first",
+                vec![],
+                ToolSideEffect::None,
+            ));
         }
         let identifier = terminal_id.to_string();
         if sessions.entries.borrow().contains_key(&identifier) {
-            return Err("Terminal environment reused an active session ID".into());
+            return Err(terminal_error(
+                ToolErrorCategory::Conflict,
+                "Terminal environment reused an active session ID",
+                vec![],
+                ToolSideEffect::Unknown,
+            ));
         }
         let snapshot = Rc::new(RefCell::new(TerminalSessionState::Running));
         let state = Rc::downgrade(&snapshot);
@@ -1889,6 +2193,7 @@ async fn run_terminal_tool(
                 command: input.command,
                 sandbox_note: sandbox_note.clone(),
                 stop_requested: false,
+                returned_state: None,
                 _monitor: monitor,
             },
         );
@@ -2196,24 +2501,38 @@ fn process_content(
     };
 
     let content = if user_stopped {
+        let marker = terminal_error(
+            ToolErrorCategory::Cancelled,
+            format!("Command \"{command}\" was stopped by the user"),
+            vec![],
+            ToolSideEffect::Unknown,
+        );
         if is_empty {
-            "The user stopped this command. No output was captured before stopping.\n\n\
-            Since the user intentionally interrupted this command, ask them what they would like to do next \
-            rather than automatically retrying or assuming something went wrong.".to_string()
+            format!(
+                "The user stopped this command. No output was captured before stopping.\n\n\
+                Since the user intentionally interrupted this command, ask them what they would like to do next \
+                rather than automatically retrying or assuming something went wrong.\n\n{marker}"
+            )
         } else {
             format!(
                 "The user stopped this command. Output captured before stopping:\n\n{}\n\n\
                 Since the user intentionally interrupted this command, ask them what they would like to do next \
-                rather than automatically retrying or assuming something went wrong.",
+                rather than automatically retrying or assuming something went wrong.\n\n{marker}",
                 content
             )
         }
     } else if timed_out {
+        let marker = terminal_error(
+            ToolErrorCategory::Timeout,
+            format!("Command \"{command}\" timed out"),
+            vec![],
+            ToolSideEffect::Unknown,
+        );
         if is_empty {
-            format!("Command \"{command}\" timed out. No output was captured.")
+            format!("Command \"{command}\" timed out. No output was captured.\n\n{marker}")
         } else {
             format!(
-                "Command \"{command}\" timed out. Output captured before timeout:\n\n{}",
+                "Command \"{command}\" timed out. Output captured before timeout:\n\n{}\n\n{marker}",
                 content
             )
         }
@@ -2478,6 +2797,13 @@ mod tests {
             .get(&identifier)
             .cloned()
             .expect("registered shell");
+        assert_eq!(
+            tool.model_session_states(),
+            vec![serde_json::json!({
+                "terminal_id": identifier, "kind": "persistent_shell", "state": "idle",
+                "command": null, "tracked_state_returned_by_tool": false, "output_returned_by_tool": "unknown",
+            })]
+        );
         let (stream, mut receiver) = crate::ToolCallEventStream::test();
         let input = TerminalToolInput {
             session: Some(TerminalSessionRequest::ShellRun {
@@ -2503,6 +2829,14 @@ mod tests {
         let successful: serde_json::Value =
             serde_json::from_str(&task.await.expect("successful command")).expect("run JSON");
         assert_eq!(successful["snapshot"]["command"]["status"]["exit_code"], 0);
+        assert_eq!(
+            tool.model_session_states(),
+            vec![serde_json::json!({
+                "terminal_id": identifier, "kind": "persistent_shell", "state": "idle",
+                "command": {"id": successful["command_id"], "state": "completed", "exit_code": 0},
+                "tracked_state_returned_by_tool": true, "output_returned_by_tool": "unknown",
+            })]
+        );
         assert!(
             successful["snapshot"]["command"]["output"]
                 .as_str()
@@ -2744,6 +3078,14 @@ mod tests {
         let command_status = stream.command_status().expect("timeout status");
         assert!(command_status.timed_out);
         assert_eq!(command_status.exit_code, None);
+        assert_eq!(
+            tool.model_session_states(),
+            vec![serde_json::json!({
+                "terminal_id": identifier, "kind": "persistent_shell", "state": "failed",
+                "command": {"id": timed_out["command_id"], "state": "timed_out", "exit_code": null},
+                "tracked_state_returned_by_tool": true, "output_returned_by_tool": "unknown",
+            })]
+        );
         let (stream, _) = crate::ToolCallEventStream::test();
         cx.update(|cx| {
             tool.clone().run(
@@ -2767,6 +3109,7 @@ mod tests {
                 .borrow()
                 .contains_key(&identifier)
         );
+        assert!(tool.model_session_states().is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -2933,6 +3276,122 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn model_session_states_are_sorted_and_exclude_payloads(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = Rc::new(crate::tests::FakeThreadEnvironment::default());
+        let tool = TerminalTool::new(project.clone(), environment.clone());
+        let mut sandboxed_tool = SandboxedTerminalTool::new(project, environment);
+        sandboxed_tool.sessions = tool.sessions.clone();
+        assert!(tool.model_session_states().is_empty());
+        assert!(sandboxed_tool.model_session_states().is_empty());
+        let payload = "private command/output/error".repeat(4096);
+        let terminal = Rc::new(cx.update(|cx| {
+            crate::tests::FakeTerminalHandle::new_never_exits(cx)
+                .with_output(ProcessOutput::new(payload.clone(), true))
+        }));
+        for (identifier, state, stop_requested) in [
+            ("terminal-z", TerminalSessionState::Running, true),
+            (
+                "terminal-c",
+                TerminalSessionState::Failed {
+                    error: payload.clone(),
+                },
+                false,
+            ),
+            (
+                "terminal-a",
+                TerminalSessionState::Exited {
+                    status: acp_v2::TerminalExitStatus::new().exit_code(7),
+                    timed_out: true,
+                },
+                false,
+            ),
+            (
+                "terminal-d",
+                TerminalSessionState::Exited {
+                    status: acp_v2::TerminalExitStatus::new(),
+                    timed_out: false,
+                },
+                false,
+            ),
+        ] {
+            tool.sessions.entries.borrow_mut().insert(
+                identifier.into(),
+                TerminalSession {
+                    terminal: terminal.clone(),
+                    state: Rc::new(RefCell::new(state)),
+                    command: payload.clone(),
+                    sandbox_note: Some(payload.clone()),
+                    stop_requested,
+                    returned_state: None,
+                    _monitor: Task::ready(()),
+                },
+            );
+        }
+        let expected = vec![
+            serde_json::json!({
+                "terminal_id":"terminal-a", "kind":"background_terminal", "state":"exited",
+                "stop_requested":false, "exit_code":7, "timed_out":true,
+                "tracked_state_returned_by_tool":false, "output_returned_by_tool":"unknown",
+            }),
+            serde_json::json!({
+                "terminal_id":"terminal-c", "kind":"background_terminal", "state":"failed",
+                "stop_requested":false, "tracked_state_returned_by_tool":false, "output_returned_by_tool":"unknown",
+            }),
+            serde_json::json!({
+                "terminal_id":"terminal-d", "kind":"background_terminal", "state":"exited",
+                "stop_requested":false, "exit_code":null, "timed_out":false,
+                "tracked_state_returned_by_tool":false, "output_returned_by_tool":"unknown",
+            }),
+            serde_json::json!({
+                "terminal_id":"terminal-z", "kind":"background_terminal", "state":"running",
+                "stop_requested":true, "tracked_state_returned_by_tool":false, "output_returned_by_tool":"unknown",
+            }),
+        ];
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let mut expected = expected;
+            let directory = tempfile::TempDir::new().expect("shell directory");
+            let shell = Arc::new(
+                crate::persistent_shell::PersistentShell::spawn(directory.path().into())
+                    .expect("shell"),
+            );
+            tool.sessions
+                .shells
+                .entries
+                .borrow_mut()
+                .insert("terminal-b".into(), shell.clone());
+            expected.insert(
+                1,
+                serde_json::json!({
+                    "terminal_id":"terminal-b", "kind":"persistent_shell", "state":"idle",
+                    "command":null, "tracked_state_returned_by_tool":false, "output_returned_by_tool":"unknown",
+                }),
+            );
+            assert_eq!(tool.model_session_states(), expected);
+            assert_eq!(sandboxed_tool.model_session_states(), expected);
+            shell.close().expect("close shell");
+            expected[1]["state"] = serde_json::json!("closed");
+            expected
+        };
+        assert_eq!(tool.model_session_states(), expected);
+        assert_eq!(sandboxed_tool.model_session_states(), expected);
+        assert!(!terminal.was_killed());
+        assert!(terminal.stdin_bytes().is_empty());
+        assert!(tool.sessions.entries.borrow().values().all(|session| {
+            session.command == payload && session.sandbox_note.as_ref() == Some(&payload)
+        }));
+        tool.clear_sessions(&cx.to_async()).expect("clear sessions");
+        assert!(terminal.was_killed());
+        assert!(tool.model_session_states().is_empty());
+        assert!(sandboxed_tool.model_session_states().is_empty());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn test_background_session_survives_start_and_clear_kills(cx: &mut gpui::TestAppContext) {
         use super::*;
         crate::tests::init_test(cx);
@@ -2976,16 +3435,95 @@ mod tests {
         let metadata = cx.update(|_cx| tool.session_metadata());
         assert_eq!(metadata.len(), 1);
         assert!(matches!(metadata[0].state, TerminalSessionState::Running));
+        assert_eq!(
+            tool.model_session_states(),
+            vec![serde_json::json!({
+                "terminal_id": metadata[0].terminal_id,
+                "kind": "background_terminal",
+                "state": "running",
+                "stop_requested": false,
+                "tracked_state_returned_by_tool": false,
+                "output_returned_by_tool": "unknown",
+            })]
+        );
         let snapshots = tool.session_snapshots(&cx.to_async()).expect("snapshots");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(metadata[0].terminal_id, snapshots[0].terminal_id);
         assert!(matches!(snapshots[0].state, TerminalSessionState::Running));
+        let input = TerminalToolInput::default().into();
+        let (event_stream, _receiver) = crate::ToolCallEventStream::test();
+        tool.sessions
+            .manage(
+                &TerminalSessionRequest::Status {
+                    terminal_id: metadata[0].terminal_id.clone(),
+                },
+                &input,
+                &event_stream,
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("status");
+        assert_eq!(
+            tool.model_session_states()[0]["tracked_state_returned_by_tool"],
+            true
+        );
+        assert_eq!(
+            tool.model_session_states()[0]["output_returned_by_tool"],
+            "unknown"
+        );
+        tool.sessions
+            .manage(
+                &TerminalSessionRequest::Output {
+                    terminal_id: metadata[0].terminal_id.clone(),
+                },
+                &input,
+                &event_stream,
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("output");
+        assert_eq!(
+            tool.model_session_states()[0]["tracked_state_returned_by_tool"],
+            true
+        );
+        assert_eq!(
+            tool.model_session_states()[0]["output_returned_by_tool"],
+            "unknown"
+        );
         let cloned_tool = tool.as_ref().clone();
         assert!(Rc::ptr_eq(
             &tool.sessions.entries,
             &cloned_tool.sessions.entries
         ));
+        let input = TerminalToolInput::default().into();
+        let (event_stream, _receiver) = crate::ToolCallEventStream::test();
+        tool.sessions
+            .manage(
+                &TerminalSessionRequest::Stop {
+                    terminal_id: metadata[0].terminal_id.clone(),
+                },
+                &input,
+                &event_stream,
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("stop");
+        cx.run_until_parked();
+        assert_eq!(
+            cloned_tool.model_session_states(),
+            vec![serde_json::json!({
+                "terminal_id": metadata[0].terminal_id,
+                "kind": "background_terminal",
+                "state": "exited",
+                "stop_requested": true,
+                "exit_code": null,
+                "timed_out": false,
+                "tracked_state_returned_by_tool": false,
+                "output_returned_by_tool": "unknown",
+            })]
+        );
         cloned_tool.clear_sessions(&cx.to_async()).expect("clear");
+        assert!(tool.model_session_states().is_empty());
         assert!(
             tool.session_snapshots(&cx.to_async())
                 .expect("snapshots")
@@ -3542,6 +4080,11 @@ mod tests {
         assert!(
             result.contains("build output here"),
             "Expected output to be included, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\"category\":\"timeout\""),
+            "Expected structured timeout metadata, got: {}",
             result
         );
     }

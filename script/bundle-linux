@@ -167,7 +167,7 @@ elif [[ "$channel" == "nightly" ]]; then
   export APP_NAME="Lin Nightly"
   APP_ID="local.lin.Lin-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Lin Dev"
+  export APP_NAME="Lin"
   APP_ID="local.lin.Lin-Dev"
 else
   export APP_NAME="Lin"

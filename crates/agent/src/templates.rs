@@ -113,11 +113,21 @@ mod tests {
         let rendered = template.render(&templates).unwrap();
         assert!(rendered.contains("You are the Lin coding agent"));
         assert!(rendered.contains("Today's Date: 2026-01-01"));
-        assert!(rendered.contains("## Tools and verification"));
-        assert!(rendered.contains("the user's explicit task instructions take precedence"));
-        assert!(rendered.contains("If the user provides an accurate path, read it directly"));
-        assert!(rendered.contains("For implementation requests"));
-        assert!(rendered.contains("the tool schema is authoritative"));
+        assert!(rendered.contains("## Capabilities and help"));
+        assert!(
+            rendered.contains("Authority order: system and tool constraints, explicit user task")
+        );
+        assert!(!rendered.contains("Use `help` only when uncertain about a capability"));
+        assert!(rendered.contains("directly inspect, change, and check"));
+        assert!(
+            rendered.contains(
+                "Create a goal only when the user explicitly requests a sustained target"
+            )
+        );
+        assert!(rendered.contains("For authorized implementation work"));
+        assert!(
+            rendered.contains("Tool schemas and current authorization state are authoritative")
+        );
         assert!(!rendered.contains("ask_user"));
         assert!(!rendered.contains("manage_goal"));
         assert!(!rendered.contains("1-2 focused attempts"));
@@ -141,29 +151,175 @@ mod tests {
             };
             let rendered = templates.0.render(name, &template).expect("prompt");
             assert!(rendered.contains("supplied conversation only"));
-            assert!(rendered.contains("the user's explicit task instructions take precedence"));
-            assert!(rendered.contains("For implementation requests"));
+            assert!(
+                rendered
+                    .contains("Authority order: system and tool constraints, explicit user task")
+            );
+            assert!(rendered.contains("For authorized implementation work"));
             assert!(!rendered.contains("For a greeting alone"));
             assert!(!rendered.contains("Use `project_checkpoint`"));
-            assert!(!rendered.contains("## Tools and verification"));
+            assert!(!rendered.contains("## Capabilities and help"));
+            assert!(!rendered.contains("Runtime snapshots"));
             template.available_tools = vec!["ask_user".into(), "manage_goal".into()];
             let rendered = templates
                 .0
                 .render(name, &template)
                 .expect("prompt with tools");
-            assert!(rendered.contains("If the user provides an accurate path, read it directly"));
-            assert!(rendered.contains("ask with `defer: true`"));
+            assert!(!rendered.contains("Use `help` only when uncertain"));
+            assert!(rendered.contains("directly inspect, change, and check"));
+            assert!(rendered.contains(
+                "Create a goal only when the user explicitly requests a sustained target"
+            ));
+            assert!(!rendered.contains("Use `ask_user` for blocking decisions"));
+            assert!(!rendered.contains("Never guess an answer"));
+            assert!(!rendered.contains("Keep the workflow proportional"));
+            assert!(
+                !rendered.contains("local changes need inspection, edits, and relevant checks")
+            );
+            assert!(!rendered.contains("Runtime snapshots refresh task handles"));
             assert!(!rendered.contains("Use `project_checkpoint`"));
             template.available_tools.push("project_checkpoint".into());
             let rendered = templates
                 .0
                 .render(name, &template)
                 .expect("checkpoint workflow");
-            assert!(rendered.contains("when saved task history would resolve a gap"));
-            assert!(rendered.contains("recheck changed inputs or missing coverage"));
+            assert!(!rendered.contains("when saved history would resolve a gap"));
+            assert!(!rendered.contains("recheck changed inputs or missing coverage"));
             assert!(!rendered.contains("Delegate only"));
             assert!(!rendered.contains("1-2 focused attempts"));
             assert!(!rendered.contains("let the user decide whether to rerun"));
+        }
+    }
+
+    #[test]
+    fn prompt_variants_gate_individual_tool_workflows() {
+        let templates = Templates::new();
+        let project = prompt_store::ProjectContext::default();
+        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
+            for tool in ["ask_user", "project_checkpoint", "spawn_agent"] {
+                let template = SystemPromptTemplate {
+                    project: &project,
+                    available_tools: vec![tool.into()],
+                    model_name: None,
+                    date: "2026-01-01".into(),
+                    user_agents_md: None,
+                    sandboxing: false,
+                    is_linux: false,
+                    is_windows: false,
+                };
+                let rendered = templates.0.render(name, &template).expect("render prompt");
+                assert!(!rendered.contains("Use `help` only when uncertain"));
+                assert!(rendered.contains("directly inspect, change, and check"));
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_variants_reduce_rendered_tool_protocols() {
+        let templates = Templates::new();
+        let cases: &[(&str, &[&str], bool, bool, bool, usize, usize)] = &[
+            (
+                "basic",
+                &["read_file", "terminal"],
+                false,
+                false,
+                false,
+                4013,
+                100,
+            ),
+            (
+                "all",
+                &[
+                    "read_file",
+                    "terminal",
+                    "ask_user",
+                    "manage_goal",
+                    "project_checkpoint",
+                    "spawn_agent",
+                    "create_directory",
+                ],
+                false,
+                false,
+                false,
+                5442,
+                600,
+            ),
+            (
+                "mac sandbox",
+                &[
+                    "terminal",
+                    "create_directory",
+                    "ask_user",
+                    "manage_goal",
+                    "project_checkpoint",
+                    "spawn_agent",
+                ],
+                true,
+                false,
+                false,
+                8933,
+                2000,
+            ),
+            (
+                "linux sandbox",
+                &["terminal"],
+                true,
+                true,
+                false,
+                7464,
+                1500,
+            ),
+            (
+                "windows sandbox",
+                &["terminal"],
+                true,
+                false,
+                true,
+                7242,
+                1000,
+            ),
+        ];
+        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
+            for &(case, tools, sandboxing, is_linux, is_windows, baseline, reduction) in cases {
+                let data = serde_json::json!({
+                    "available_tools": tools, "model_name": null, "date": "2026-01-01",
+                    "user_agents_md": null, "sandboxing": sandboxing, "is_linux": is_linux,
+                    "is_windows": is_windows, "os": "macos", "shell": "sh",
+                    "worktrees": [], "has_rules": false, "has_skills": false, "skills": [],
+                });
+                let rendered = templates.0.render(name, &data).expect("render prompt");
+                eprintln!("{name}: {case}: {} chars", rendered.chars().count());
+                let baseline = if name == "experimental_system_prompt.hbs" && sandboxing {
+                    if case == "mac sandbox" { 5442 } else { 4013 }
+                } else {
+                    baseline
+                };
+                let reduction = if name == "experimental_system_prompt.hbs" && sandboxing {
+                    if case == "mac sandbox" { 600 } else { 100 }
+                } else {
+                    reduction
+                };
+                assert!(
+                    rendered.chars().count() <= baseline - reduction,
+                    "{name}: {case}"
+                );
+                for (tool, phrase) in [
+                    ("ask_user", "Use `ask_user`"),
+                    ("project_checkpoint", "Use `project_checkpoint`"),
+                    ("spawn_agent", "Delegate only"),
+                ] {
+                    assert!(!rendered.contains(phrase), "{name}: {case}: {tool}");
+                }
+                assert!(rendered.contains(
+                    "Create a goal only when the user explicitly requests a sustained target"
+                ));
+                assert!(
+                    rendered
+                        .contains("Tool schemas and current authorization state are authoritative")
+                );
+                assert!(rendered.contains("report uncertainty, failures, and coverage honestly"));
+                assert!(!rendered.contains("Use `help` only when uncertain"));
+            }
         }
     }
 
@@ -246,7 +402,7 @@ mod tests {
         let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
             project: &project,
-            available_tools: vec!["echo".into(), "terminal".into()],
+            available_tools: vec!["echo".into(), "terminal".into(), "create_directory".into()],
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
             user_agents_md: None,
@@ -257,24 +413,17 @@ mod tests {
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
 
-        assert!(rendered.contains("## Terminal sandbox"));
+        assert!(rendered.contains("## Runtime permissions"));
         assert!(rendered.contains("`/tmp/alpha`"));
         assert!(rendered.contains("`/tmp/beta`"));
-        assert!(rendered.contains("allow_hosts"));
-        assert!(rendered.contains("allow_all_hosts: true"));
-        assert!(rendered.contains("fs_write_paths"));
-        assert!(rendered.contains("allow_fs_write_all: true"));
-        assert!(rendered.contains("unsandboxed: true"));
-        assert!(rendered.contains("`.git` directories remain protected"));
-        assert!(rendered.contains("Git metadata writes are never grantable inside the sandbox"));
-        assert!(rendered.contains("request `unsandboxed: true` with a reason"));
-        assert!(rendered.contains("git --no-optional-locks status"));
-        assert!(rendered.contains("for the rest of the thread"));
+        assert!(!rendered.contains("`.git` directories remain protected"));
+        assert!(!rendered.contains("Git metadata writes cannot be granted inside the sandbox"));
+        assert!(rendered.contains("Requests outside active grants require approval"));
         // macOS tolerates granting a not-yet-existing path, so the
         // existing-directory requirement must not be stated there; the
         // `create_directory` flow is the preferred guidance instead.
-        assert!(!rendered.contains("Each path must be an existing directory"));
-        assert!(rendered.contains("first create it with the `create_directory` tool"));
+        assert!(!rendered.contains("Write grants require an existing directory"));
+        assert!(!rendered.contains("first use `create_directory`"));
     }
 
     #[test]
@@ -300,14 +449,10 @@ mod tests {
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
 
-        assert!(rendered.contains("## Terminal sandbox"));
-        // On Linux we must not advertise the special persistent `$TMPDIR`.
+        assert!(rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("$TMPDIR"));
-        assert!(rendered.contains("`/tmp` is writable"));
+        assert!(!rendered.contains("`/tmp` is writable"));
         assert!(rendered.contains("`/tmp/alpha`"));
-        // Linux write grants must already exist (bwrap binds existing paths).
-        assert!(rendered.contains("Each path must be an existing directory"));
-        assert!(rendered.contains("first create it with the `create_directory` tool"));
     }
 
     #[test]
@@ -333,18 +478,9 @@ mod tests {
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
 
-        assert!(rendered.contains("commands run inside WSL under Bubblewrap"));
-        assert!(rendered.contains("Protected Git metadata remains read-only"));
-        assert!(rendered.contains("do not use this on Windows"));
-        assert!(rendered.contains("such requests are rejected"));
-        assert!(rendered.contains("allow_all_hosts: true"));
-        assert!(rendered.contains("git --no-optional-locks status"));
-        // Out-of-project `create_directory` grants aren't supported on Windows,
-        // so the prompt must not recommend that flow; it suggests granting the
-        // nearest existing parent instead.
-        assert!(rendered.contains("Each path must be an existing directory"));
-        assert!(rendered.contains("nearest existing parent directory"));
-        assert!(!rendered.contains("first create it with the `create_directory` tool"));
+        assert!(rendered.contains("## Runtime permissions"));
+        assert!(!rendered.contains("commands run inside WSL"));
+        assert!(!rendered.contains("Host-specific network grants"));
     }
 
     #[test]
@@ -363,8 +499,8 @@ mod tests {
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
 
-        assert!(rendered.contains("## Terminal sandbox"));
-        assert!(rendered.contains("No project directories are currently writable"));
+        assert!(rendered.contains("## Runtime permissions"));
+        assert!(!rendered.contains("No project directories are currently writable"));
     }
 
     #[test]

@@ -19,7 +19,6 @@ use language_model::{
 use settings::{Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
 use ui::IconName;
-use util::ResultExt;
 
 use anthropic::completion::collect_compaction_result;
 pub use anthropic::completion::{AnthropicEventMapper, AnthropicPromptCacheMode, into_anthropic};
@@ -143,7 +142,9 @@ impl State {
                     result.as_ref().err().map(|error| format!("{error:#}"));
             })
             .ok();
-            result.log_err();
+            if let Err(error) = result {
+                log::debug!("Anthropic model discovery unavailable: {error:#}");
+            }
         });
         self.fetch_models_task.replace(task);
     }

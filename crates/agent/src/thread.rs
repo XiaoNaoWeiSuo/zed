@@ -70,6 +70,7 @@ use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
+const SUBAGENT_USER_QUESTION_ERROR: &str = "Subagents cannot ask the user questions. Report the missing decision to your parent agent instead; do not wait for a user response or assume approval.";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
@@ -262,6 +263,8 @@ impl DeferredQuestion {
         let Some(response) = &self.response else {
             return Ok(crate::AskUserToolOutput::Pending {
                 request_id: self.request_id.clone(),
+                question: Some(self.question.clone()),
+                schema: Some(self.schema.clone()),
             });
         };
         let response: acp_v2::CreateElicitationResponse = serde_json::from_value(response.clone())
@@ -1646,6 +1649,32 @@ impl TokenThroughput {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "tool panicked with a non-string payload".to_string()
+    }
+}
+
+/// Panics are reported to the model as `internal` failures. The side effect is
+/// unknown because a panic can happen after partial work.
+fn tool_panic_output(tool_name: &str, message: &str) -> AgentToolOutput {
+    let error = crate::tool_error_json(
+        crate::ToolErrorCategory::Internal,
+        format!("Tool `{tool_name}` panicked: {message}"),
+        false,
+        Vec::new(),
+        Some(crate::ToolSideEffect::Unknown),
+    );
+    AgentToolOutput {
+        llm_output: vec![LanguageModelToolResultContent::Text(Arc::from(error))],
+        raw_output: serde_json::json!({ "panic": message }),
+    }
+}
+
 impl Thread {
     fn prompt_capabilities(model: Option<&LanguageModel>) -> acp_v2::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
@@ -1985,7 +2014,7 @@ impl Thread {
         for question in self
             .deferred_questions
             .values()
-            .filter(|question| !question.withdrawn)
+            .filter(|question| !self.is_subagent() && !question.withdrawn)
         {
             match serde_json::from_value(question.schema.clone()) {
                 Ok(schema) => {
@@ -2110,7 +2139,11 @@ impl Thread {
                 Some(cx.weak_entity()),
             )
             .with_permission_tier_state(self.permission_tier.clone());
-            tool.replay(input, output, tool_event_stream, cx).log_err();
+            if let Err(error) = tool.replay(input, output, tool_event_stream, cx) {
+                // Historical tool inputs may not deserialize (older schemas or
+                // partial streamed edits); replay is best-effort, not a failure.
+                log::debug!("Could not replay historical tool call {tool_call_id}: {error:#}");
+            }
         }
 
         stream.update_tool_call_fields(&tool_call_id, |update| {
@@ -2585,6 +2618,7 @@ impl Thread {
         schema: &acp_v2::ElicitationSchema,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(!self.is_subagent(), SUBAGENT_USER_QUESTION_ERROR);
         if !self.deferred_questions.contains_key(&id) {
             self.deferred_questions.insert(
                 id.clone(),
@@ -3168,6 +3202,7 @@ impl Thread {
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool::default());
+        self.add_tool(crate::HelpTool::new(cx.weak_entity()));
         self.add_tool(GoalTool::new(cx.weak_entity()));
         self.add_tool(crate::ProjectCheckpointTool::new(cx.weak_entity()));
         self.add_tool(crate::InspectToolResultTool::new(cx.weak_entity()));
@@ -3392,6 +3427,53 @@ impl Thread {
             })
             .log_err();
         })
+    }
+
+    fn runtime_archive_inputs(&self, cx: &App) -> Vec<(PathBuf, Vec<crate::RuntimeTaskRecord>)> {
+        let project = self.project.read(cx);
+        if !project.is_local()
+            || self.is_subagent()
+            || TrustedWorktrees::has_restricted_worktrees(&project.worktree_store(), cx)
+        {
+            return Vec::new();
+        }
+        let Some(tool) = &self.subagent_tool else {
+            return Vec::new();
+        };
+        let records = tool
+            .model_task_states()
+            .into_iter()
+            .filter_map(|state| {
+                Some(crate::RuntimeTaskRecord {
+                    owner_session_id: self.id.0.to_string(),
+                    child_session_id: state.get("session_id")?.as_str()?.to_owned(),
+                    generation: state.get("generation")?.as_u64()?,
+                    state: state.get("state")?.as_str()?.to_owned(),
+                    result_returned_by_tool: state
+                        .get("result_returned_by_tool")
+                        .and_then(serde_json::Value::as_bool),
+                    archived: state
+                        .get("retained_snapshot_only")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && state
+                            .get("result_returned_by_tool")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true),
+                    parent_goal_id: state
+                        .get("parent_goal_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                })
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Vec::new();
+        }
+        project
+            .visible_worktrees(cx)
+            .map(|worktree| (worktree.read(cx).abs_path().to_path_buf(), records.clone()))
+            .collect()
     }
 
     fn automatic_checkpoint_inputs(
@@ -4012,6 +4094,24 @@ impl Thread {
                 }
 
                 _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+
+                let archive_inputs = this.read_with(cx, |thread, cx| {
+                    thread.runtime_archive_inputs(cx)
+                }).log_err().unwrap_or_default();
+                cx.background_spawn(async move {
+                    for (root, records) in archive_inputs {
+                        let result = (|| -> anyhow::Result<()> {
+                            let store = crate::ProjectCheckpointStore::open(&root)?;
+                            for record in records {
+                                store.upsert_runtime_task_record(&record)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            log::error!("Failed to persist runtime task metadata: {error:#}");
+                        }
+                    }
+                }).await;
 
                 let (checkpoints, roots) = this.read_with(cx, |this, cx| {
                     let checkpoints = this.automatic_checkpoint_inputs(turn_result.is_err(), false, cx);
@@ -5347,10 +5447,26 @@ impl Thread {
         .with_permission_tier_state(self.permission_tier.clone());
         tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
         let supports_images = self.model().is_some_and(|model| model.supports_images());
-        let tool_result = tool.run(tool_input, tool_event_stream, cx);
+        let tool_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tool.run(tool_input, tool_event_stream, cx)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                // A tool that panics while starting must not abort the editor.
+                let message = panic_payload_message(payload.as_ref());
+                log::error!(
+                    "Tool `{tool_name}` panicked while starting; reporting the failure to the model instead of aborting: {message}"
+                );
+                Task::ready(Err(tool_panic_output(tool_name.as_ref(), &message)))
+            }
+        };
+        let panic_tool_name = tool_name.clone();
         cx.foreground_executor().spawn(async move {
-            let (is_error, output) = match tool_result.await {
-                Ok(mut output) => {
+            let tool_result = std::panic::AssertUnwindSafe(tool_result)
+                .catch_unwind()
+                .await;
+            let (is_error, output) = match tool_result {
+                Ok(Ok(mut output)) => {
                     let contains_image = output
                         .llm_output
                         .iter()
@@ -5389,7 +5505,16 @@ impl Thread {
                         (false, output)
                     }
                 }
-                Err(output) => (true, output),
+                Ok(Err(output)) => (true, output),
+                Err(payload) => {
+                    // Panics raised while the tool future is polled would
+                    // otherwise unwind through the executor and kill the app.
+                    let message = panic_payload_message(payload.as_ref());
+                    log::error!(
+                        "Tool `{panic_tool_name}` panicked while running; reporting the failure to the model instead of aborting: {message}"
+                    );
+                    (true, tool_panic_output(&panic_tool_name, &message))
+                }
             };
 
             (
@@ -5807,6 +5932,13 @@ impl Thread {
                             }
                         }
                     }
+                    if turn.tools.contains_key(crate::HelpTool::NAME)
+                        && crate::built_in_tool(tool_name).is_some()
+                        && tool_name.as_ref() != crate::HelpTool::NAME
+                    {
+                        description = compact_tool_description(&description);
+                        compact_schema_documentation(&mut schema);
+                    }
                     LanguageModelRequestTool::function(
                         tool_name.to_string(),
                         description,
@@ -5857,7 +5989,7 @@ impl Thread {
         Ok(request)
     }
 
-    fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+    pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -5879,6 +6011,7 @@ impl Thread {
             .tools
             .iter()
             .filter(|(_, tool)| !is_restricted || tool.allow_in_restricted_mode())
+            .filter(|(tool_name, _)| !self.is_subagent() || tool_name.as_ref() != AskUserTool::NAME)
             .filter_map(|(tool_name, tool)| {
                 let terminal_variant = matches!(
                     tool_name.as_ref(),
@@ -6055,14 +6188,170 @@ impl Thread {
         available_tools: Vec<SharedString>,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
+        let runtime_context = self.runtime_context(&available_tools, cx);
         let mut messages =
             self.build_request_messages_until(available_tools, self.messages.len(), cx);
 
         if let Some(message) = self.pending_message.as_ref() {
             messages.extend(message.to_request());
         }
+        if let Some(context) = runtime_context {
+            // Refresh volatile state without persisting or summarizing it as historical fact.
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![context.into()],
+                cache: false,
+                reasoning_details: None,
+            });
+        }
 
         messages
+    }
+
+    fn is_registered_runtime_tool(&self, name: &str, tool: &Arc<dyn AnyAgentTool>) -> bool {
+        let registered_name =
+            if name == TerminalTool::NAME && tool.name().as_ref() == SandboxedTerminalTool::NAME {
+                SandboxedTerminalTool::NAME
+            } else {
+                name
+            };
+        self.tools
+            .get(registered_name)
+            .is_some_and(|registered| Arc::ptr_eq(registered, tool))
+    }
+
+    fn runtime_tool_available(&self, available_tools: &[SharedString], name: &str) -> bool {
+        available_tools.iter().any(|tool| tool.as_ref() == name)
+            && self.running_turn.as_ref().map_or_else(
+                || self.tools.contains_key(name),
+                |turn| {
+                    turn.tools
+                        .get(name)
+                        .is_some_and(|tool| self.is_registered_runtime_tool(name, tool))
+                },
+            )
+    }
+
+    fn active_terminal_is_sandboxed(&self, cx: &App) -> bool {
+        self.running_turn
+            .as_ref()
+            .and_then(|turn| turn.tools.get(TerminalTool::NAME))
+            .map(|tool| tool.name().as_ref() == SandboxedTerminalTool::NAME)
+            .unwrap_or_else(|| sandboxing_enabled_for_project(self.project.read(cx), cx))
+    }
+
+    fn terminal_execution_context(&self, cx: &App) -> serde_json::Value {
+        let sandboxed = self.active_terminal_is_sandboxed(cx);
+        serde_json::json!({
+            "sandbox_enabled": sandboxed,
+            "persistent_shell_available": cfg!(target_os = "macos") && self.project.read(cx).is_local() && !sandboxed,
+            "permission_tier": self.permission_tier(),
+        })
+    }
+
+    fn runtime_context(&self, available_tools: &[SharedString], cx: &App) -> Option<String> {
+        let has_tool = |name: &str| self.runtime_tool_available(available_tools, name);
+        let mut context = serde_json::Map::new();
+        if has_tool(AskUserTool::NAME) {
+            let questions = self.deferred_questions.values()
+                .filter(|question| !question.withdrawn && !question.delivered)
+                .map(|question| serde_json::json!({
+                    "request_id": question.request_id,
+
+                    "state": if question.response.is_some() { "response_available" } else { "pending" },
+                }))
+                .collect::<Vec<_>>();
+            if !questions.is_empty() {
+                context.insert("questions".into(), bounded_runtime_entries(questions));
+            }
+        }
+        if has_tool(TerminalTool::NAME) {
+            let sandboxed = self.active_terminal_is_sandboxed(cx);
+            let mut terminals = Vec::new();
+            if let Some(tool) = &self.terminal_tool {
+                terminals.extend(tool.model_session_states().into_iter().map(|mut state| {
+                    state["accessible_with_current_tool"] = (!sandboxed).into();
+                    state
+                }));
+            }
+            if let Some(tool) = &self.sandboxed_terminal_tool {
+                terminals.extend(tool.model_session_states().into_iter().map(|mut state| {
+                    state["accessible_with_current_tool"] = sandboxed.into();
+                    state
+                }));
+            }
+            if !terminals.is_empty() {
+                context.insert(
+                    "terminal_sessions".into(),
+                    bounded_runtime_entries(terminals),
+                );
+            }
+        }
+        if has_tool(SpawnAgentTool::NAME) {
+            if let Some(tool) = &self.subagent_tool {
+                let tasks = tool.model_attention_states();
+                if !tasks.is_empty() {
+                    context.insert("subagents".into(), bounded_runtime_entries(tasks));
+                }
+            }
+        }
+        if has_tool(GoalTool::NAME) {
+            if let Some(goal) = self
+                .goal
+                .as_ref()
+                .filter(|goal| goal.status == ThreadGoalStatus::Active)
+            {
+                if !goal.verification_receipts.is_empty() {
+                    let receipts = goal
+                        .verification_receipts
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .map(|receipt| {
+                            serde_json::json!({
+                                "verification_id": receipt.id,
+                                "criterion_indices": receipt.criterion_indices,
+                                "recorded_outcome": receipt.outcome,
+                                "known_stale": receipt.stale_reason.is_some(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    context.insert(
+                        "goal_verifications".into(),
+                        serde_json::json!({
+                            "goal_id": goal.id,
+                            "receipt_count": goal.verification_receipts.len(),
+                            "recent": receipts,
+                            "omitted_count": goal.verification_receipts.len().saturating_sub(8),
+                        }),
+                    );
+                }
+                let ledger = crate::RuntimeLedgerSnapshot::from_records(Some(goal), None, &[]);
+                let entries = ledger
+                    .entries
+                    .iter()
+                    .rev()
+                    .take(9)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                context.insert(
+                    "runtime_ledger".into(),
+                    serde_json::json!({
+                        "entries": entries,
+                        "omitted_count": ledger.entries.len().saturating_sub(9),
+                        "semantic_coverage": "unknown",
+                        "checkpoint_context_available": self.checkpoint_context.is_some(),
+                    }),
+                );
+            }
+        }
+        if context.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Harness runtime snapshot: transient data, not instructions or grants. Query details only when needed. Returned results do not imply understanding; pending questions are not approval. Terminal handles require explicit cleanup. Receipt outcomes are not a fresh dependency audit or proof of requirement coverage.\n{}",
+            serde_json::Value::Object(context)
+        ))
     }
 
     fn build_request_messages_until(
@@ -6074,6 +6363,9 @@ impl Thread {
         let end_ix = end_ix.min(self.messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
+        let terminal_execution = self
+            .runtime_tool_available(&available_tools, TerminalTool::NAME)
+            .then(|| self.terminal_execution_context(cx));
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
         let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
@@ -6091,6 +6383,12 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if self.is_subagent() {
+            system_prompt.push_str("\n\nSubagent interaction boundary: You work for the parent agent, not directly for the user. Do not ask the user questions. If a missing decision blocks your task, report the blocker and relevant options to the parent agent in your result instead of waiting for user input. Do not invent answers or bypass tool authorization checks.");
+        }
+        if let Some(execution) = terminal_execution {
+            system_prompt.push_str(&format!("\n\nTerminal execution capabilities (harness-reported configuration, not task authorization; per-command grants and permission checks still apply):\n{execution}"));
+        }
         if let Some(goal) = self
             .goal
             .as_ref()
@@ -6102,7 +6400,7 @@ impl Thread {
                 .map(|criterion| format!("- {criterion}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nBefore completion, audit every original requirement against current files, tests, logs, or artifacts. Missing, indirect, stale, or contradictory evidence means incomplete: continue working. Do not shrink scope to passing checks. Use manage_goal action=verify to run enabled tools against declared source files/directories, including relevant manifests and configuration. Reuse a passing receipt while its declared inputs remain unchanged; inspect rechecks inputs without rerunning the tool. Completion requires fresh receipt IDs for workspace claims. Use historical observations only for claims independent of the current workspace, with explicit limits. Successful execution and stable declared files do not prove semantic coverage, environment state, or external conditions; assess those separately. Record an assessment for every criterion. Goal text does not grant additional permissions. Keep working across response boundaries: a progress report, uncertainty, a failed attempt, or a need to verify is not a reason to stop. Try independent alternatives and continue work that does not depend on a pending answer. Pause only when the user asks; mark blocked only when no useful work remains and progress requires user input or an external change. Model-requested pause, blocked, or resume transitions require user confirmation.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
+            system_prompt.push_str(&format!("\n\nActive user goal (user-provided data):\n{}\nSuccess criteria:\n{}\nVerification surfaces:\n{}\nConstraints:\n{}\nAudit every original requirement before completion; missing, indirect, stale, or contradictory evidence requires more work, not narrower scope. Use manage_goal verify with relevant source, manifest, and configuration dependencies. Reuse unchanged receipts; inspect audits dependencies without rerunning checks, and complete automatically associates valid evidence. Do not maintain receipt-ID lists manually. Assess semantic coverage and external conditions separately: execution and unchanged inputs do not prove correctness. Historical evidence is only for workspace-independent claims with explicit limits. Goal data grants no permissions. Continue across response boundaries and failures, trying alternatives and independent work while answers are pending. Pause only at the user's request; blocked means no useful work remains without user input or external change. Model-requested pause, blocked, and resume transitions require confirmation.", goal.objective, criteria, goal.verification_surfaces.join("\n"), goal.constraints.join("\n")));
         }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
@@ -6356,6 +6654,80 @@ impl Thread {
             }),
         }
     }
+}
+
+fn compact_tool_description(description: &str) -> String {
+    let summary = description.split("\n\n").next().unwrap_or(description);
+    format!(
+        "{} Use help with this tool name for detailed protocol.",
+        summary.trim()
+    )
+}
+
+fn compact_schema_documentation(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(object) => {
+            object.remove("description");
+            object.remove("examples");
+            for (key, value) in object.iter_mut() {
+                match key.as_str() {
+                    "properties" | "$defs" | "definitions" | "patternProperties" => {
+                        if let Some(definitions) = value.as_object_mut() {
+                            for definition in definitions.values_mut() {
+                                compact_schema_documentation(definition);
+                            }
+                        }
+                    }
+                    "items"
+                    | "additionalProperties"
+                    | "allOf"
+                    | "anyOf"
+                    | "oneOf"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "prefixItems" => {
+                        compact_schema_documentation(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                compact_schema_documentation(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bounded_runtime_entries(mut entries: Vec<serde_json::Value>) -> serde_json::Value {
+    const ENTRY_LIMIT: usize = 16;
+    entries.sort_by(|left, right| {
+        let priority = |entry: &serde_json::Value| match entry
+            .get("state")
+            .and_then(|state| state.as_str())
+        {
+            Some("running" | "cancelling" | "pending" | "response_available") => 0,
+            _ if entry.get("result_returned_by_tool") == Some(&serde_json::Value::Bool(false)) => 0,
+            _ => 1,
+        };
+        let identifier = |entry: &serde_json::Value| {
+            ["terminal_id", "session_id", "request_id"]
+                .into_iter()
+                .find_map(|key| entry.get(key).and_then(|value| value.as_str()))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| identifier(left).cmp(&identifier(right)))
+    });
+    let omitted_count = entries.len().saturating_sub(ENTRY_LIMIT);
+    entries.truncate(ENTRY_LIMIT);
+    serde_json::json!({ "entries": entries, "omitted_count": omitted_count })
 }
 
 fn subagent_partial_output_from_messages(
@@ -7427,6 +7799,11 @@ impl ToolCallEventStream {
         withdraw: bool,
         cx: &mut App,
     ) -> Option<Task<Result<crate::AskUserToolOutput, crate::AskUserToolOutput>>> {
+        if let Err(error) = self.ensure_user_question_allowed(cx) {
+            return Some(Task::ready(Err(crate::AskUserToolOutput::Error {
+                error: error.to_string(),
+            })));
+        }
         let thread = self.thread.as_ref()?.clone();
         let exists = thread
             .read_with(cx, |thread, _| thread.deferred_question(&id).is_some())
@@ -7537,6 +7914,22 @@ impl ToolCallEventStream {
             .as_ref()
             .and_then(|thread| thread.upgrade())
             .is_some_and(|thread| thread.read(cx).is_subagent())
+    }
+
+    pub(crate) fn runtime_parent_goal_id(&self, cx: &App) -> Option<String> {
+        self.thread
+            .as_ref()?
+            .upgrade()?
+            .read(cx)
+            .goal
+            .as_ref()
+            .filter(|goal| goal.status == ThreadGoalStatus::Active)
+            .map(|goal| goal.id.clone())
+    }
+
+    pub(crate) fn ensure_user_question_allowed(&self, cx: &App) -> Result<()> {
+        anyhow::ensure!(!self.is_subagent(cx), SUBAGENT_USER_QUESTION_ERROR);
+        Ok(())
     }
 
     /// Persist the thread so a freshly recorded "for this thread" sandbox grant
@@ -8344,6 +8737,9 @@ impl ToolCallEventStream {
         schema: acp_v2::ElicitationSchema,
         cx: &mut App,
     ) -> Task<Result<acp_v2::CreateElicitationResponse>> {
+        if let Err(error) = self.ensure_user_question_allowed(cx) {
+            return Task::ready(Err(error));
+        }
         let (response_tx, response_rx) = oneshot::channel();
         if let Err(error) = self
             .stream
@@ -9141,6 +9537,516 @@ mod tests {
 
             (thread, event_stream, fake)
         })
+    }
+
+    fn runtime_snapshot_data(context: &str) -> serde_json::Value {
+        serde_json::from_str(context.split_once('\n').expect("snapshot header").1)
+            .expect("runtime snapshot JSON")
+    }
+
+    struct PanicTool;
+
+    impl AgentTool for PanicTool {
+        type Input = serde_json::Value;
+        type Output = String;
+
+        const NAME: &'static str = "panic_tool";
+
+        fn kind() -> acp_v2::ToolKind {
+            acp_v2::ToolKind::Other
+        }
+
+        fn initial_title(
+            &self,
+            _input: Result<Self::Input, serde_json::Value>,
+            _cx: &mut App,
+        ) -> SharedString {
+            "Panic".into()
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _input: ToolInput<Self::Input>,
+            _event_stream: ToolCallEventStream,
+            _cx: &mut App,
+        ) -> Task<Result<Self::Output, Self::Output>> {
+            panic!("intentional tool panic")
+        }
+    }
+
+    #[gpui::test]
+    async fn tool_panic_is_reported_as_structured_error(cx: &mut TestAppContext) {
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
+        let tool: Arc<dyn AnyAgentTool> = PanicTool.erase();
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let task = thread.update(cx, |thread, cx| {
+            thread.run_tool(
+                tool,
+                ToolInput::ready(serde_json::json!({})),
+                LanguageModelToolUseId::from("panic-call"),
+                Arc::from(PanicTool::NAME),
+                0,
+                &event_stream,
+                cancellation_rx,
+                cx,
+            )
+        });
+        let (_, result) = task.await;
+        assert!(result.is_error, "a panic must surface as an error result");
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                LanguageModelToolResultContent::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("\"category\":\"internal\""), "got {text}");
+        assert!(text.contains("panicked"), "got {text}");
+    }
+
+    #[test]
+    fn compact_tool_schemas_preserve_validation_and_named_properties() {
+        let mut schema = serde_json::json!({
+            "type": "object", "description": "long documentation",
+            "required": ["description"],
+            "properties": {
+                "description": {"type": "string", "description": "field docs"},
+                "examples": {"type": "array", "items": {"type": "string"}},
+                "mode": {"enum": ["description", "examples"], "default": "description"}
+            },
+            "examples": [{"description": "sample"}]
+        });
+        compact_schema_documentation(&mut schema);
+        assert!(schema.get("description").is_none());
+        assert!(schema.get("examples").is_none());
+        assert_eq!(schema["required"], serde_json::json!(["description"]));
+        assert_eq!(
+            schema["properties"]["description"],
+            serde_json::json!({"type":"string"})
+        );
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["description", "examples"])
+        );
+        assert!(schema["properties"].get("examples").is_some());
+        assert_eq!(
+            compact_tool_description("Read files.\n\nLong protocol."),
+            "Read files. Use help with this tool name for detailed protocol."
+        );
+    }
+
+    #[test]
+    fn compact_catalog_reduces_documentation_without_removing_tool_inputs() {
+        let mut original_bytes = 0;
+        let mut compact_bytes = 0;
+        for tool in crate::built_in_tools() {
+            let language_model::LanguageModelRequestToolInput::Function { input_schema, .. } =
+                tool.input
+            else {
+                continue;
+            };
+            let mut compact = input_schema.clone();
+            compact_schema_documentation(&mut compact);
+            original_bytes +=
+                tool.description.len() + serde_json::to_vec(&input_schema).expect("schema").len();
+            compact_bytes += compact_tool_description(&tool.description).len()
+                + serde_json::to_vec(&compact).expect("compact schema").len();
+            for key in ["type", "required", "additionalProperties"] {
+                assert_eq!(
+                    input_schema.get(key),
+                    compact.get(key),
+                    "{}: {key}",
+                    tool.name
+                );
+            }
+            assert_eq!(
+                input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .map(|properties| properties.keys().collect::<Vec<_>>()),
+                compact
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .map(|properties| properties.keys().collect::<Vec<_>>())
+            );
+        }
+        eprintln!("Tool documentation and schema bytes: {original_bytes} -> {compact_bytes}");
+        assert!(
+            compact_bytes * 100 < original_bytes * 70,
+            "expected at least 30% smaller tool surface"
+        );
+    }
+
+    #[test]
+    fn runtime_context_bounds_entries_and_prioritizes_active_handles() {
+        let mut entries = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "terminal_id": format!("terminal-{index:02}"),
+                    "state": "exited",
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.push(serde_json::json!({"terminal_id": "running", "state": "running"}));
+        entries.push(serde_json::json!({"session_id": "cancelling", "state": "cancelling"}));
+        let reversed = entries.iter().rev().cloned().collect();
+        let bounded = bounded_runtime_entries(entries);
+        assert_eq!(bounded, bounded_runtime_entries(reversed));
+        assert_eq!(bounded["omitted_count"], 6);
+        let entries = bounded["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 16);
+        assert_eq!(entries[0]["session_id"], "cancelling");
+        assert_eq!(entries[1]["terminal_id"], "running");
+    }
+
+    #[gpui::test]
+    async fn runtime_context_refreshes_questions_without_persisting_or_compacting_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            thread.messages.push(user_text_message(
+                ClientUserMessageId::new(),
+                "Current task",
+            ));
+            thread
+                .register_deferred_question(
+                    "pending-decision".into(),
+                    acp_v2::ToolCallId::new("0:question"),
+                    "Choose a direction".into(),
+                    &acp_v2::ElicitationSchema::new().string("direction", true),
+                    cx,
+                )
+                .expect("register question");
+            assert!(thread.runtime_context(&[], cx).is_none());
+            assert!(thread.runtime_context(&["read_file".into()], cx).is_none());
+            let tools = vec![AskUserTool::NAME.into()];
+            let requests = thread.build_request_messages(tools.clone(), cx);
+            let repeated = thread.build_request_messages(tools.clone(), cx);
+            assert_eq!(requests.len(), repeated.len());
+            assert_eq!(
+                thread.messages.len(),
+                1,
+                "snapshots must not accumulate in history"
+            );
+            let snapshot = requests.last().expect("snapshot");
+            assert_eq!(snapshot.role, Role::User);
+            assert!(
+                !snapshot.cache,
+                "volatile data must not extend the cached prefix"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .take(requests.len() - 1)
+                    .any(|message| message.cache)
+            );
+            let MessageContent::Text(text) = snapshot.content.first().expect("content") else {
+                panic!("snapshot text");
+            };
+            assert!(!text.contains("Choose a direction"));
+            let context = runtime_snapshot_data(text);
+            assert_eq!(
+                context["questions"]["entries"][0]["request_id"],
+                "pending-decision"
+            );
+            assert_eq!(context["questions"]["entries"][0]["state"], "pending");
+            let history =
+                thread.build_request_messages_until(tools.clone(), thread.messages.len(), cx);
+            assert!(
+                !request_texts_after_system(&history)
+                    .iter()
+                    .any(|text| text.contains("Harness runtime snapshot"))
+            );
+            thread.messages.push(summary_compaction("Task context"));
+            let context = runtime_snapshot_data(
+                &thread
+                    .runtime_context(&tools, cx)
+                    .expect("pending after compaction"),
+            );
+            assert_eq!(context["questions"]["entries"][0]["state"], "pending");
+            let response = acp_v2::CreateElicitationResponse::new(
+                acp_v2::ElicitationAction::Accept(acp_v2::ElicitationAcceptAction::new().content(
+                    BTreeMap::from([("direction".into(), "private answer".into())]),
+                )),
+            );
+            thread
+                .receive_deferred_response("pending-decision", &response, cx)
+                .expect("response");
+            let snapshot = thread
+                .runtime_context(&tools, cx)
+                .expect("response metadata");
+            assert!(
+                !snapshot.contains("private answer"),
+                "answers must be delivered by the existing decision path"
+            );
+            assert_eq!(
+                runtime_snapshot_data(&snapshot)["questions"]["entries"][0]["state"],
+                "response_available"
+            );
+            thread.deliver_deferred_responses(cx);
+            assert!(thread.runtime_context(&tools, cx).is_none());
+            thread
+                .withdraw_deferred_question("pending-decision", cx)
+                .expect("withdraw");
+            assert!(thread.runtime_context(&tools, cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn runtime_context_reports_execution_policy_without_granting_authority(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            let tools = vec![TerminalTool::NAME.into()];
+            assert!(
+                thread.runtime_context(&tools, cx).is_none(),
+                "idle configuration must not add a synthetic user turn"
+            );
+            let requests = thread.build_request_messages(tools.clone(), cx);
+            assert_eq!(requests.len(), 1);
+            let system = requests.first().expect("system prompt").string_contents();
+            assert!(system.contains("Terminal execution capabilities"));
+            assert!(system.contains("not task authorization"));
+            let context = thread.terminal_execution_context(cx);
+            assert_eq!(
+                context["sandbox_enabled"],
+                sandboxing_enabled_for_project(thread.project.read(cx), cx)
+            );
+            assert_eq!(
+                context["persistent_shell_available"],
+                cfg!(target_os = "macos")
+                    && thread.project.read(cx).is_local()
+                    && !sandboxing_enabled_for_project(thread.project.read(cx), cx)
+            );
+            assert_eq!(context["permission_tier"], "assisted");
+            thread.set_permission_tier(crate::permission_tier::PermissionTier::ReadOnly, cx);
+            let context = thread.terminal_execution_context(cx);
+            assert_eq!(context["permission_tier"], "read_only");
+            assert!(
+                !thread
+                    .build_request_messages(Vec::new(), cx)
+                    .first()
+                    .expect("system prompt")
+                    .string_contents()
+                    .contains("Terminal execution capabilities")
+            );
+            assert!(
+                thread.runtime_context(&[], cx).is_none(),
+                "hidden tools have no runtime workflow"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn runtime_context_tracks_terminal_handles_without_copying_output(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        let environment = cx.update(|cx| {
+            Rc::new(
+                crate::tests::FakeThreadEnvironment::default()
+                    .with_terminal(crate::tests::FakeTerminalHandle::new_never_exits(cx)),
+            )
+        });
+        let tool = thread.update(cx, |thread, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = ToolPermissionMode::Allow;
+            AgentSettings::override_global(settings, cx);
+            thread.add_default_tools(environment, cx);
+            thread
+                .terminal_tool
+                .as_ref()
+                .expect("terminal tool")
+                .clone()
+        });
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(tool);
+        let (events, mut receiver) = ToolCallEventStream::test();
+        let start = cx.update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(crate::TerminalToolInput {
+                    command: "private command".into(),
+                    cd: ".".into(),
+                    session: Some(crate::TerminalSessionRequest::Start),
+                    ..Default::default()
+                }),
+                events,
+                cx,
+            )
+        });
+        receiver.expect_update_fields().await;
+        start.await.expect("start terminal");
+        thread.update(cx, |thread, cx| {
+            let tools = vec![TerminalTool::NAME.into()];
+            let snapshot = thread.runtime_context(&tools, cx).expect("terminal state");
+            assert!(!snapshot.contains("private command"));
+            assert!(!snapshot.contains("partial output"));
+            let context = runtime_snapshot_data(&snapshot);
+            let session = &context["terminal_sessions"]["entries"][0];
+            assert_eq!(session["kind"], "background_terminal");
+            assert_eq!(session["state"], "running");
+            assert_eq!(
+                session["accessible_with_current_tool"],
+                !sandboxing_enabled_for_project(thread.project.read(cx), cx)
+            );
+            assert!(
+                session["terminal_id"]
+                    .as_str()
+                    .is_some_and(|identifier| !identifier.is_empty())
+            );
+        });
+        tool.clear_sessions(&cx.to_async()).expect("clear terminal");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread
+                    .runtime_context(&[TerminalTool::NAME.into()], cx)
+                    .is_none(),
+                "cleared sessions must not leave a runtime message"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn runtime_context_uses_registered_tool_identity_and_active_terminal_variant(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            thread
+                .register_deferred_question(
+                    "private-decision".into(),
+                    acp_v2::ToolCallId::new("0:question"),
+                    "Private question".into(),
+                    &acp_v2::ElicitationSchema::new().string("answer", true),
+                    cx,
+                )
+                .expect("question");
+            let (cancellation_tx, _) = watch::channel(false);
+            thread.running_turn = Some(RunningTurn::new(
+                thread.prompt_id.clone(),
+                event_stream,
+                BTreeMap::from([(AskUserTool::NAME.into(), AskUserTool::default().erase())]),
+                cancellation_tx,
+                Task::ready(()),
+            ));
+            assert!(
+                thread
+                    .runtime_context(&[AskUserTool::NAME.into()], cx)
+                    .is_none(),
+                "a same-named replacement must not reveal retained builtin state"
+            );
+            let registered = thread
+                .tools
+                .get(AskUserTool::NAME)
+                .expect("registered tool")
+                .clone();
+            thread
+                .running_turn
+                .as_mut()
+                .expect("turn")
+                .tools
+                .insert(AskUserTool::NAME.into(), registered);
+            assert!(
+                thread
+                    .runtime_context(&[AskUserTool::NAME.into()], cx)
+                    .is_some()
+            );
+            let sandboxed = thread
+                .tools
+                .get(SandboxedTerminalTool::NAME)
+                .expect("sandboxed tool")
+                .clone();
+            thread
+                .running_turn
+                .as_mut()
+                .expect("turn")
+                .tools
+                .insert(TerminalTool::NAME.into(), sandboxed);
+            let snapshot = thread.terminal_execution_context(cx);
+            assert_eq!(snapshot["sandbox_enabled"], true);
+            assert_eq!(snapshot["persistent_shell_available"], false);
+            thread.running_turn = None;
+        });
+    }
+
+    #[gpui::test]
+    async fn runtime_context_omits_empty_goal_receipts(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            thread.goal =
+                Some(ThreadGoal::new("Objective".into(), vec!["Criterion".into()]).expect("goal"));
+            let tools = vec![GoalTool::NAME.into()];
+            let snapshot = thread.runtime_context(&tools, cx).expect("goal ledger");
+            assert!(
+                !snapshot.contains("goal_verifications"),
+                "an empty receipt list must not add context: {snapshot}"
+            );
+            assert!(snapshot.contains("runtime_ledger"));
+        });
+    }
+
+    #[gpui::test]
+    async fn runtime_context_bounds_recorded_receipts_without_claiming_freshness(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            let mut goal =
+                ThreadGoal::new("Implement behavior".into(), vec!["Behavior works".into()])
+                    .expect("goal");
+            for index in 0..10 {
+                goal.verification_receipts
+                    .push(crate::GoalVerificationReceipt {
+                        id: format!("receipt-{index}"),
+                        tool_call_id: format!("tool-{index}"),
+                        tool_name: "terminal".into(),
+                        tool_input: serde_json::json!({"command": "private command"}),
+                        observed_at: Utc::now(),
+                        dependencies: Vec::new(),
+                        outcome: crate::GoalVerificationOutcome::Passed,
+                        command_status: None,
+                        output_digest: "digest".into(),
+                        preview: "private output".into(),
+                        stale_reason: (index == 9).then(|| "Source changed".into()),
+                        criterion_indices: vec![0],
+                    });
+            }
+            thread.goal = Some(goal);
+            let tools = vec![GoalTool::NAME.into()];
+            let snapshot = thread.runtime_context(&tools, cx).expect("receipt state");
+            assert!(snapshot.contains("not a fresh dependency audit"));
+            assert!(!snapshot.contains("private command"));
+            assert!(!snapshot.contains("private output"));
+            let context = runtime_snapshot_data(&snapshot);
+            assert_eq!(context["goal_verifications"]["receipt_count"], 10);
+            assert_eq!(context["goal_verifications"]["omitted_count"], 2);
+            assert_eq!(
+                context["goal_verifications"]["recent"]
+                    .as_array()
+                    .expect("recent receipts")
+                    .len(),
+                8
+            );
+            assert_eq!(
+                context["goal_verifications"]["recent"][0]["verification_id"],
+                "receipt-9"
+            );
+            assert_eq!(
+                context["goal_verifications"]["recent"][0]["known_stale"],
+                true
+            );
+            thread.goal.as_mut().expect("goal").status = ThreadGoalStatus::Completed;
+            assert!(thread.runtime_context(&tools, cx).is_none());
+        });
     }
 
     #[gpui::test]
@@ -10780,6 +11686,51 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_permission_rebinding_requires_idle_or_shared_policy(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::permission_tier::PermissionTier;
+
+        let (first_parent, _, _) = setup_thread_for_test(cx).await;
+        let (second_parent, _, _) = setup_thread_for_test(cx).await;
+        let (child, event_stream, _) = setup_thread_for_test(cx).await;
+        first_parent.update(cx, |thread, cx| {
+            thread.set_permission_tier(PermissionTier::ReadOnly, cx);
+        });
+        second_parent.update(cx, |thread, cx| {
+            thread.set_permission_tier(PermissionTier::FullAccess, cx);
+        });
+        child.update(cx, |thread, cx| {
+            thread
+                .inherit_permission_tier(&first_parent, cx)
+                .expect("initial binding");
+            let (cancellation_tx, _) = watch::channel(false);
+            thread.running_turn = Some(RunningTurn::new(
+                thread.prompt_id.clone(),
+                event_stream,
+                BTreeMap::new(),
+                cancellation_tx,
+                Task::ready(()),
+            ));
+            assert!(thread.inherit_permission_tier(&first_parent, cx).is_ok());
+            assert!(thread.inherit_permission_tier(&second_parent, cx).is_err());
+            assert_eq!(thread.permission_tier(), PermissionTier::ReadOnly);
+            thread.running_turn = None;
+            thread
+                .inherit_permission_tier(&second_parent, cx)
+                .expect("idle rebinding");
+            assert_eq!(thread.permission_tier(), PermissionTier::FullAccess);
+        });
+        second_parent.update(cx, |thread, cx| {
+            thread.set_permission_tier(PermissionTier::Assisted, cx);
+        });
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.permission_tier()),
+            PermissionTier::Assisted
+        );
+    }
+
+    #[gpui::test]
     async fn test_permission_tier_is_saved_with_thread(cx: &mut TestAppContext) {
         let (thread, _, _) = setup_thread_for_test(cx).await;
         thread.update(cx, |thread, cx| {
@@ -10801,6 +11752,206 @@ mod tests {
         assert_eq!(
             restored.permission_tier,
             crate::permission_tier::PermissionTier::Assisted
+        );
+    }
+
+    #[gpui::test]
+    async fn subagent_user_questions_are_hidden_even_when_enabled_in_profile(
+        cx: &mut TestAppContext,
+    ) {
+        let (parent, _, fake) = setup_thread_for_test(cx).await;
+        parent.update(cx, |thread, cx| {
+            thread.set_model(fake.model("fake"), cx);
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .get_mut(thread.profile())
+                .expect("profile")
+                .tools
+                .insert(AskUserTool::NAME.into(), true);
+            AgentSettings::override_global(settings, cx);
+            assert!(thread.enabled_tools(cx).contains_key(AskUserTool::NAME));
+        });
+        let child = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
+        child.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            assert!(
+                thread.tools.contains_key(AskUserTool::NAME),
+                "registration alone must not expose a tool"
+            );
+            let tools = thread.enabled_tools(cx);
+            assert!(!tools.contains_key(AskUserTool::NAME));
+            assert!(tools.contains_key(ReadFileTool::NAME));
+            let request = thread.build_request_messages(tools.keys().cloned().collect(), cx);
+            let prompt = request.first().expect("system prompt").string_contents();
+            assert!(prompt.contains("report the blocker and relevant options to the parent agent"));
+            assert!(!prompt.contains("Use `ask_user` for missing decisions"));
+        });
+        let saved = child.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let (id, project, project_context, registry, templates) =
+            child.read_with(cx, |thread, _| {
+                (
+                    thread.id.clone(),
+                    thread.project.clone(),
+                    thread.project_context.clone(),
+                    thread.context_server_registry.clone(),
+                    thread.templates.clone(),
+                )
+            });
+        let restored = cx.new(|cx| {
+            Thread::from_db(id, saved, project, project_context, registry, templates, cx)
+        });
+        restored.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            assert!(thread.is_subagent());
+            assert!(!thread.enabled_tools(cx).contains_key(AskUserTool::NAME));
+        });
+    }
+
+    #[gpui::test]
+    async fn subagent_user_questions_fail_fast_for_every_input_mode(cx: &mut TestAppContext) {
+        let (parent, _, _) = setup_thread_for_test(cx).await;
+        let child = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(AskUserTool::default());
+        for input in [
+            serde_json::json!({"question":"Choose", "options":["A", "B"]}),
+            serde_json::json!({"question":"Choose", "options":["A", "B"], "defer":true}),
+            serde_json::json!({"questions":[{"question":"Choose", "options":["A", "B"]}]}),
+            serde_json::json!({"request_id":"legacy-question", "wait":true}),
+            serde_json::json!({"request_id":"legacy-question", "withdraw":true}),
+        ] {
+            let (mut events, mut receiver) = ToolCallEventStream::test();
+            events.thread = Some(child.downgrade());
+            let task = cx.update(|cx| tool.clone().run(ToolInput::resolved(input), events, cx));
+            cx.run_until_parked();
+            let result = task
+                .now_or_never()
+                .expect("must not wait for an invisible form");
+            let Err(crate::AskUserToolOutput::Error { error }) = result else {
+                panic!("subagent question must fail");
+            };
+            assert_eq!(error, SUBAGENT_USER_QUESTION_ERROR);
+            assert!(receiver.0.next().now_or_never().flatten().is_none());
+            child.read_with(cx, |thread, _| {
+                assert!(thread.deferred_questions.is_empty())
+            });
+        }
+        let (_sender, input) = ToolInput::<crate::AskUserToolInput>::test();
+        let (mut events, _) = ToolCallEventStream::test();
+        events.thread = Some(child.downgrade());
+        let task = cx.update(|cx| tool.run(input, events, cx));
+        cx.run_until_parked();
+        assert!(
+            task.now_or_never()
+                .expect("reject even before streamed input is complete")
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn subagent_legacy_questions_do_not_wait_or_reopen(cx: &mut TestAppContext) {
+        let (parent, _, _) = setup_thread_for_test(cx).await;
+        parent.update(cx, |thread, cx| {
+            thread
+                .register_deferred_question(
+                    "legacy-question".into(),
+                    acp_v2::ToolCallId::new("0:question"),
+                    "Choose a direction".into(),
+                    &acp_v2::ElicitationSchema::new().string("answer", true),
+                    cx,
+                )
+                .expect("root question");
+        });
+        let legacy = parent.read_with(cx, |thread, _| {
+            thread
+                .deferred_question("legacy-question")
+                .expect("question")
+                .clone()
+        });
+        let child = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
+        child.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .register_deferred_question(
+                        "new-question".into(),
+                        acp_v2::ToolCallId::new("1:question"),
+                        "Choose".into(),
+                        &acp_v2::ElicitationSchema::new().string("answer", true),
+                        cx
+                    )
+                    .is_err()
+            );
+            // Simulate a question retained by a subagent before this restriction existed.
+            thread
+                .deferred_questions
+                .insert(legacy.request_id.clone(), legacy);
+        });
+        let (mut events, mut receiver) = ToolCallEventStream::test();
+        events.thread = Some(child.downgrade());
+        let form = cx.update(|cx| {
+            events.request_elicitation("Choose".into(), acp_v2::ElicitationSchema::new(), cx)
+        });
+        assert_eq!(
+            form.now_or_never()
+                .expect("immediate rejection")
+                .expect_err("no subagent forms")
+                .to_string(),
+            SUBAGENT_USER_QUESTION_ERROR
+        );
+        let answer = cx.update(|cx| {
+            events
+                .deferred_answer("legacy-question".into(), true, false, cx)
+                .expect("explicit rejection")
+        });
+        assert!(
+            answer
+                .now_or_never()
+                .expect("legacy wait must not park")
+                .is_err()
+        );
+        assert!(receiver.0.next().now_or_never().is_none());
+        let mut replay = child.update(cx, |thread, cx| thread.replay(cx));
+        while let Some(event) = replay.next().await {
+            assert!(!matches!(event, Ok(ThreadEvent::Elicitation(_))));
+        }
+        let (mut root_events, mut root_receiver) = ToolCallEventStream::test();
+        root_events.thread = Some(parent.downgrade());
+        let form = cx.update(|cx| {
+            root_events.request_elicitation("Choose".into(), acp_v2::ElicitationSchema::new(), cx)
+        });
+        let request = root_receiver.expect_elicitation().await;
+        request
+            .response
+            .send(acp_v2::CreateElicitationResponse::new(
+                acp_v2::ElicitationAction::Decline,
+            ))
+            .expect("root response");
+        assert!(form.await.is_ok(), "root elicitation remains available");
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
+        let authorization = cx.update(|cx| {
+            events.authorize(
+                "Run pwd",
+                ToolPermissionContext::new("terminal", vec!["pwd".into()]),
+                cx,
+            )
+        });
+        let request = receiver.expect_authorization().await;
+        request
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new("deny"),
+                acp_v2::PermissionOptionKind::RejectOnce,
+            ))
+            .expect("deny action");
+        assert!(
+            authorization.await.is_err(),
+            "question policy must not bypass permission approval"
         );
     }
 
@@ -10849,6 +12000,22 @@ mod tests {
             }
         }
         assert!(restored_form, "pending forms must be restored");
+        let (mut pending_events, _) = ToolCallEventStream::test();
+        pending_events.thread = Some(restored.downgrade());
+        let pending = cx.update(|cx| {
+            pending_events
+                .deferred_answer("decision".into(), false, false, cx)
+                .expect("pending lookup")
+        });
+        let pending = pending.await.expect("pending status");
+        let serialized = serde_json::to_value(&pending).expect("status JSON");
+        assert_eq!(serialized["question"], "Choose direction");
+        assert!(serialized["schema"].get("properties").is_some());
+        let LanguageModelToolResultContent::Text(text) = pending.into() else {
+            panic!("status text");
+        };
+        assert!(text.contains("Choose direction"));
+        assert!(text.contains("not an answer"));
         restored.update(cx, |thread, cx| {
             let response = acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
                 acp_v2::ElicitationAcceptAction::new().content(BTreeMap::from([("direction".into(), "B".into())])),

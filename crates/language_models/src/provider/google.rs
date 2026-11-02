@@ -22,7 +22,6 @@ pub use settings::GoogleAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
 use ui::IconName;
-use util::ResultExt as _;
 
 use language_model::ApiKeyState;
 
@@ -134,12 +133,19 @@ impl State {
             .clone();
 
         self.fetch_models_task = Some(cx.spawn(async move |this, cx| {
-            let Some(models) =
-                google_ai::list_models(http_client.as_ref(), &api_url, &api_key, &extra_headers)
-                    .await
-                    .log_err()
-            else {
-                return;
+            let models = match google_ai::list_models(
+                http_client.as_ref(),
+                &api_url,
+                &api_key,
+                &extra_headers,
+            )
+            .await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    log::debug!("Google model discovery unavailable: {error:#}");
+                    return;
+                }
             };
             this.update(cx, |this, cx| {
                 this.fetched_models = models;

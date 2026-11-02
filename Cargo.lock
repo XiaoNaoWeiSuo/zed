@@ -5063,11 +5063,13 @@ dependencies = [
  "serde_json",
  "settings",
  "shellexpand",
+ "tempfile",
  "terminal_view",
  "theme",
  "theme_settings",
  "util",
  "watch",
+ "zed_env_vars",
 ]
 
 [[package]]
@@ -8444,6 +8446,7 @@ dependencies = [
  "aws_http_client",
  "base64",
  "bedrock",
+ "chrono",
  "client",
  "clock",
  "cloud_llm_client",

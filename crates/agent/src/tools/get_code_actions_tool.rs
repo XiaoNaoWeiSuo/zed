@@ -8,7 +8,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::symbol_locator::{CodeActionStore, PendingCodeActions, SymbolLocator};
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolErrorCategory, ToolInput, ToolRecovery, ToolSideEffect,
+    tool_error_json,
+};
 
 /// Gets the list of available code actions at a symbol location from the language server.
 ///
@@ -68,12 +71,33 @@ impl AgentTool for GetCodeActionsTool {
         let project = self.project.clone();
         let store = self.code_action_store.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+            let input = input.recv().await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::InvalidInput,
+                    format!("Failed to receive tool input: {error}"),
+                    false,
+                    vec![ToolRecovery {
+                        tool: "help".into(),
+                        arguments: serde_json::json!({ "query": Self::NAME }),
+                        reason: "Check this tool's required input fields".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input.symbol.resolve(&project, cx).await.map_err(|error| {
+                tool_error_json(
+                    ToolErrorCategory::NotFound,
+                    error,
+                    false,
+                    vec![ToolRecovery {
+                        tool: "read_file".into(),
+                        arguments: serde_json::json!({ "path": input.symbol.file_path }),
+                        reason: "Re-read the file to confirm the symbol name and line".into(),
+                    }],
+                    Some(ToolSideEffect::None),
+                )
+            })?;
 
             let actions_task = project.update(cx, |project, cx| {
                 let range = resolved.position..resolved.position;
@@ -82,7 +106,15 @@ impl AgentTool for GetCodeActionsTool {
 
             let actions = actions_task
                 .await
-                .map_err(|e| format!("Failed to get code actions: {e}"))?
+                .map_err(|error| {
+                    tool_error_json(
+                        ToolErrorCategory::Unavailable,
+                        format!("Failed to get code actions: {error}"),
+                        false,
+                        vec![],
+                        Some(ToolSideEffect::None),
+                    )
+                })?
                 .unwrap_or_default();
 
             if actions.is_empty() {

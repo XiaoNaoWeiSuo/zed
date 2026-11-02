@@ -175,6 +175,8 @@ struct SubagentTask {
     completion: Option<Shared<Task<SubagentTaskSnapshot>>>,
     driver: Option<Task<()>>,
     disposal_context: gpui::AsyncApp,
+    parent_goal_id: Option<String>,
+    terminal_result_returned: bool,
 }
 
 impl Drop for SubagentTask {
@@ -199,6 +201,64 @@ impl Drop for SubagentTask {
 }
 
 impl SpawnAgentTool {
+    pub(crate) fn model_task_states(&self) -> Vec<serde_json::Value> {
+        self.model_task_states_matching(|_| true)
+    }
+
+    pub(crate) fn model_attention_states(&self) -> Vec<serde_json::Value> {
+        self.model_task_states_matching(|task| {
+            task.snapshot.state.is_active() || !task.terminal_result_returned
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn archived_task_count(&self) -> usize {
+        self.tasks
+            .borrow()
+            .values()
+            .filter(|task| !task.snapshot.state.is_active() && task.terminal_result_returned)
+            .count()
+    }
+
+    fn model_task_states_matching(
+        &self,
+        predicate: impl Fn(&SubagentTask) -> bool,
+    ) -> Vec<serde_json::Value> {
+        let tasks = self.tasks.borrow();
+        let mut tasks: Vec<_> = tasks.values().filter(|task| predicate(task)).collect();
+        tasks.sort_unstable_by(|left, right| {
+            left.snapshot.session_id.0.cmp(&right.snapshot.session_id.0)
+        });
+        tasks
+            .into_iter()
+            .map(|task| {
+                let snapshot = &task.snapshot;
+                let mut state = serde_json::json!({
+                    "session_id": snapshot.session_id,
+                    "generation": snapshot.generation,
+                    "state": snapshot.state,
+                    "result_returned_by_tool": if snapshot.state.is_active() { None } else { Some(task.terminal_result_returned) },
+                    "retained_snapshot_only": !snapshot.state.is_active(),
+                });
+                if let Some(parent_goal_id) = &task.parent_goal_id {
+                    state["parent_goal_id"] = serde_json::json!(parent_goal_id);
+                }
+                state
+            })
+            .collect()
+    }
+
+    fn mark_result_returned(&self, snapshot: &SubagentTaskSnapshot) {
+        if snapshot.state.is_active() {
+            return;
+        }
+        if let Some(task) = self.tasks.borrow_mut().get_mut(&snapshot.session_id) {
+            if task.snapshot.generation == snapshot.generation && !task.snapshot.state.is_active() {
+                task.terminal_result_returned = true;
+            }
+        }
+    }
+
     pub fn snapshots(&self) -> Vec<SubagentTaskSnapshot> {
         let mut snapshots: Vec<_> = self
             .tasks
@@ -344,6 +404,9 @@ impl AgentTool for SpawnAgentTool {
                     self.snapshot(&session_id)
                         .ok_or_else(|| error(Some(session_id), "Task was released".into()))?
                 };
+                if input.action == SpawnAgentAction::Result {
+                    self.mark_result_returned(&snapshot);
+                }
                 return Ok(SpawnAgentToolOutput::Task { task: snapshot });
             }
             if input.message.trim().is_empty() || input.wait {
@@ -360,7 +423,8 @@ impl AgentTool for SpawnAgentTool {
                 background,
                 ..
             } = input;
-            let (subagent, session_info, generation) = cx.update(|cx| {
+            let (subagent, session_info, generation, parent_goal_id) = cx.update(|cx| {
+                let parent_goal_id = event_stream.runtime_parent_goal_id(cx);
                 if let Some(session_id) = &session_id {
                     if self
                         .snapshot(session_id)
@@ -392,7 +456,7 @@ impl AgentTool for SpawnAgentTool {
                 let generation = self
                     .snapshot(&subagent.id())
                     .map_or(1, |task| task.generation.saturating_add(1));
-                Ok((subagent, session_info, generation))
+                Ok((subagent, session_info, generation, parent_goal_id))
             })?;
             event_stream.update_fields(|update| {
                 update.meta(acp_v2::Meta::from_iter([(
@@ -418,6 +482,8 @@ impl AgentTool for SpawnAgentTool {
                     completion: None,
                     driver: None,
                     disposal_context: cx.clone(),
+                    parent_goal_id,
+                    terminal_result_returned: false,
                 },
             );
             let tasks = Rc::downgrade(&self.tasks);
@@ -496,6 +562,7 @@ impl AgentTool for SpawnAgentTool {
                 return Ok(SpawnAgentToolOutput::Task { task: snapshot });
             }
             let finished = completion.await;
+            let returned_snapshot = finished.clone();
             let output = match finished.state {
                 SubagentLifecycle::Completed => Ok(SpawnAgentToolOutput::Success {
                     session_id,
@@ -530,6 +597,7 @@ impl AgentTool for SpawnAgentTool {
                 )
             })
             .map_err(|failure| error(None, failure.to_string()))?;
+            self.mark_result_returned(&returned_snapshot);
             output
         })
     }
@@ -647,6 +715,114 @@ mod tests {
             .await
     }
 
+    #[gpui::test]
+    fn model_task_states_are_sorted_and_exclude_payloads(cx: &mut gpui::TestAppContext) {
+        let cancellations = Rc::new(std::cell::Cell::new(0));
+        let sends = Rc::new(std::cell::Cell::new(0));
+        let tool = SpawnAgentTool::new(Rc::new(TestEnvironment(Rc::new(TestHandle {
+            cancellations: cancellations.clone(),
+            sends: sends.clone(),
+            response: Task::ready(String::new()).shared(),
+        }))));
+        assert!(tool.model_task_states().is_empty());
+        let payload = "private command/output/error".repeat(4096);
+        for (identifier, generation, state) in [
+            ("task-z", 5, SubagentLifecycle::Cancelled),
+            ("task-c", 3, SubagentLifecycle::Completed),
+            ("task-a", 1, SubagentLifecycle::Running),
+            ("task-d", 4, SubagentLifecycle::Failed),
+            ("task-b", 2, SubagentLifecycle::Cancelling),
+        ] {
+            let session_id = acp_v2::SessionId::new(identifier);
+            tool.tasks.borrow_mut().insert(
+                session_id.clone(),
+                SubagentTask {
+                    snapshot: SubagentTaskSnapshot {
+                        session_id: session_id.clone(),
+                        label: payload.clone(),
+                        generation,
+                        state,
+                        output: Some(payload.clone()),
+                        error: Some(payload.clone()),
+                        session_info: SubagentSessionInfo {
+                            session_id,
+                            message_start_index: 0,
+                            message_end_index: None,
+                        },
+                    },
+                    handle: None,
+                    completion: None,
+                    driver: None,
+                    disposal_context: cx.to_async(),
+                    parent_goal_id: None,
+                    terminal_result_returned: false,
+                },
+            );
+        }
+        let expected = vec![
+            json!({"session_id":"task-a", "generation":1, "state":"running", "result_returned_by_tool":null, "retained_snapshot_only":false}),
+            json!({"session_id":"task-b", "generation":2, "state":"cancelling", "result_returned_by_tool":null, "retained_snapshot_only":false}),
+            json!({"session_id":"task-c", "generation":3, "state":"completed", "result_returned_by_tool":false, "retained_snapshot_only":true}),
+            json!({"session_id":"task-d", "generation":4, "state":"failed", "result_returned_by_tool":false, "retained_snapshot_only":true}),
+            json!({"session_id":"task-z", "generation":5, "state":"cancelled", "result_returned_by_tool":false, "retained_snapshot_only":true}),
+        ];
+        assert_eq!(tool.model_task_states(), expected);
+        assert_eq!(tool.model_attention_states(), expected);
+        assert_eq!(tool.archived_task_count(), 0);
+        let completed_snapshot = tool
+            .snapshot(&acp_v2::SessionId::new("task-c"))
+            .expect("task");
+        tool.mark_result_returned(&completed_snapshot);
+        assert_eq!(tool.archived_task_count(), 1);
+        assert_eq!(
+            tool.model_attention_states(),
+            vec![
+                expected[0].clone(),
+                expected[1].clone(),
+                expected[3].clone(),
+                expected[4].clone(),
+            ],
+            "active and unread failed tasks remain visible while retrieved results archive"
+        );
+        let mut old_snapshot = completed_snapshot;
+        old_snapshot.generation = 2;
+        tool.mark_result_returned(&old_snapshot);
+        let mut archived_expected = expected.clone();
+        archived_expected[2]["result_returned_by_tool"] = json!(true);
+        assert_eq!(
+            tool.model_task_states(),
+            archived_expected,
+            "an old result cannot acknowledge a newer generation"
+        );
+        {
+            let mut tasks = tool.tasks.borrow_mut();
+            let task = tasks
+                .get_mut(&acp_v2::SessionId::new("task-c"))
+                .expect("task");
+            task.snapshot.generation = 6;
+            task.terminal_result_returned = false;
+        }
+        old_snapshot.generation = 3;
+        tool.mark_result_returned(&old_snapshot);
+        assert_eq!(tool.archived_task_count(), 0);
+        assert!(
+            tool.model_attention_states()
+                .iter()
+                .any(|state| { state["session_id"] == "task-c" && state["generation"] == 6 })
+        );
+        let mut new_generation_expected = archived_expected;
+        new_generation_expected[2]["generation"] = json!(6);
+        new_generation_expected[2]["result_returned_by_tool"] = json!(false);
+        assert_eq!(tool.clone().model_task_states(), new_generation_expected);
+        assert_eq!(cancellations.get(), 0);
+        assert_eq!(sends.get(), 0);
+        assert!(tool.tasks.borrow().values().all(|task| {
+            task.snapshot.label == payload
+                && task.snapshot.output.as_ref() == Some(&payload)
+                && task.snapshot.error.as_ref() == Some(&payload)
+        }));
+    }
+
     #[gpui::test(iterations = 10)]
     async fn background_lifecycle_retains_tasks_and_prevents_duplicate_turns(
         cx: &mut gpui::TestAppContext,
@@ -670,6 +846,12 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(sends.get(), 1);
+        assert_eq!(
+            tool.model_task_states(),
+            vec![
+                json!({"session_id":"test-child", "generation":1, "state":"running", "result_returned_by_tool":null, "retained_snapshot_only":false})
+            ]
+        );
         assert!(
             call(
                 &tool,
@@ -696,6 +878,25 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snapshot.state, SubagentLifecycle::Completed);
         assert_eq!(snapshot.output.as_deref(), Some("done"));
+        assert_eq!(
+            tool.model_task_states(),
+            vec![
+                json!({"session_id":"test-child", "generation":1, "state":"completed", "result_returned_by_tool":false, "retained_snapshot_only":true})
+            ]
+        );
+        assert_eq!(tool.archived_task_count(), 0);
+        assert_eq!(tool.model_attention_states().len(), 1);
+        assert!(
+            call(
+                &tool,
+                json!({"session_id":"test-child", "action":"status"}),
+                cx
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(tool.archived_task_count(), 0);
+        assert_eq!(tool.model_attention_states().len(), 1);
         assert!(
             tool.tasks
                 .borrow()
@@ -714,6 +915,19 @@ mod tests {
             .is_ok()
         );
         assert_eq!(sends.get(), 1);
+        assert_eq!(tool.archived_task_count(), 1);
+        assert!(tool.model_attention_states().is_empty());
+        assert_eq!(tool.model_task_states()[0]["result_returned_by_tool"], true);
+        assert!(
+            call(
+                &tool,
+                json!({"session_id":"test-child", "action":"result"}),
+                cx
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(tool.archived_task_count(), 1);
         assert!(
             call(
                 &tool,
@@ -725,9 +939,16 @@ mod tests {
         );
         assert_eq!(sends.get(), 2);
         assert_eq!(tool.snapshots().first().expect("snapshot").generation, 2);
+        assert_eq!(
+            tool.model_task_states(),
+            vec![
+                json!({"session_id":"test-child", "generation":2, "state":"completed", "result_returned_by_tool":true, "retained_snapshot_only":true})
+            ]
+        );
         tool.forget(&acp_v2::SessionId::new("test-child"))
             .expect("forget completed task");
         assert!(tool.snapshots().is_empty());
+        assert!(tool.model_task_states().is_empty());
     }
 
     #[gpui::test(iterations = 10)]
@@ -801,6 +1022,12 @@ mod tests {
             tool.snapshots().first().expect("snapshot").state,
             SubagentLifecycle::Cancelling
         );
+        assert_eq!(
+            tool.model_task_states(),
+            vec![
+                json!({"session_id":"test-child", "generation":1, "state":"cancelling", "result_returned_by_tool":null, "retained_snapshot_only":false})
+            ]
+        );
         assert!(
             call(
                 &tool,
@@ -815,6 +1042,12 @@ mod tests {
         let snapshot = tool.snapshots().pop().expect("snapshot");
         assert_eq!(snapshot.state, SubagentLifecycle::Cancelled);
         assert!(snapshot.output.is_none());
+        assert_eq!(
+            tool.model_task_states(),
+            vec![
+                json!({"session_id":"test-child", "generation":1, "state":"cancelled", "result_returned_by_tool":false, "retained_snapshot_only":true})
+            ]
+        );
     }
 
     #[test]

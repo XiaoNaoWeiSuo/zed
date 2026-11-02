@@ -2,7 +2,10 @@ use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
     resolve_global_skill_path, resolve_project_path,
 };
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolRecovery,
+    ToolSideEffect,
+};
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, anyhow};
 use fs::Fs;
@@ -20,6 +23,30 @@ use util::markdown::MarkdownInlineCode;
 /// Lists files and directories in a given path. Prefer the `grep` or `find_path` tools when searching the codebase.
 ///
 /// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+fn structured_list_error(
+    category: ToolErrorCategory,
+    message: impl std::fmt::Display,
+    recover_with: Vec<ToolRecovery>,
+) -> String {
+    let mut error = ToolError::new(category, message.to_string(), false);
+    error.recover_with = recover_with;
+    error.side_effect = Some(ToolSideEffect::None);
+    error.to_json_string()
+}
+
+fn parent_directory_recovery(path: &str) -> Vec<ToolRecovery> {
+    let parent = Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    vec![ToolRecovery {
+        tool: "list_directory".into(),
+        arguments: serde_json::json!({ "path": parent }),
+        reason: "List the parent directory to find the intended path".into(),
+    }]
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListDirectoryToolInput {
     /// The fully-qualified path of the directory to list in the project.
@@ -209,10 +236,9 @@ impl AgentTool for ListDirectoryTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| e.to_string())?;
+            let input = input.recv().await.map_err(|error| {
+                structured_list_error(ToolErrorCategory::InvalidInput, error, Vec::new())
+            })?;
 
             // Sometimes models will return these even though we tell it to give a path and not a glob.
             // When this happens, just list the root worktree directories.
@@ -263,56 +289,87 @@ impl AgentTool for ListDirectoryTool {
                             canonical_target,
                         } => (project_path, Some(canonical_target)),
                     })
-                }).map_err(|e| e.to_string())?;
+                }).map_err(|error| {
+                    structured_list_error(
+                        ToolErrorCategory::InvalidInput,
+                        error,
+                        parent_directory_recovery(&input.path),
+                    )
+                })?;
 
             // Check settings exclusions synchronously
-            project.read_with(cx, |project, cx| {
+            project.read_with(cx, |project, cx| -> std::result::Result<(), ToolError> {
                 let worktree = project
                     .worktree_for_id(project_path.worktree_id, cx)
-                    .with_context(|| {
-                        format!("{} is not in a known worktree", input.path)
-                    })?;
+                    .ok_or_else(|| ToolError::new(
+                        ToolErrorCategory::InvalidInput,
+                        format!("{} is not in a known worktree", input.path),
+                        false,
+                    ))?;
 
+                let denied = |message: String| {
+                    let mut error = ToolError::new(ToolErrorCategory::PermissionDenied, message, false);
+                    error.side_effect = Some(ToolSideEffect::None);
+                    error
+                };
                 let global_settings = WorktreeSettings::get_global(cx);
                 if global_settings.is_path_excluded(&project_path.path) {
-                    anyhow::bail!(
+                    return Err(denied(format!(
                         "Cannot list directory because its path matches the user's global `file_scan_exclusions` setting: {}",
                         input.path
-                    );
+                    )));
                 }
 
                 if global_settings.is_path_private(&project_path.path) {
-                    anyhow::bail!(
+                    return Err(denied(format!(
                         "Cannot list directory because its path matches the user's global `private_files` setting: {}",
                         input.path
-                    );
+                    )));
                 }
 
                 let worktree_settings = WorktreeSettings::get(Some((&project_path).into()), cx);
                 if worktree_settings.is_path_excluded(&project_path.path) {
-                    anyhow::bail!(
+                    return Err(denied(format!(
                         "Cannot list directory because its path matches the user's worktree `file_scan_exclusions` setting: {}",
                         input.path
-                    );
+                    )));
                 }
 
                 if worktree_settings.is_path_private(&project_path.path) {
-                    anyhow::bail!(
+                    return Err(denied(format!(
                         "Cannot list directory because its path matches the user's worktree `private_paths` setting: {}",
                         input.path
-                    );
+                    )));
                 }
 
                 let worktree_snapshot = worktree.read(cx).snapshot();
                 let Some(entry) = worktree_snapshot.entry_for_path(&project_path.path) else {
-                    anyhow::bail!("Path not found: {}", input.path);
+                    let mut error = ToolError::new(
+                        ToolErrorCategory::NotFound,
+                        format!("Path not found: {}", input.path),
+                        false,
+                    );
+                    error.recover_with = parent_directory_recovery(&input.path);
+                    error.side_effect = Some(ToolSideEffect::None);
+                    return Err(error);
                 };
                 if !entry.is_dir() {
-                    anyhow::bail!("{} is not a directory.", input.path);
+                    let mut error = ToolError::new(
+                        ToolErrorCategory::WrongResourceType,
+                        format!("{} is not a directory.", input.path),
+                        false,
+                    );
+                    error.recover_with = vec![ToolRecovery {
+                        tool: "read_file".into(),
+                        arguments: serde_json::json!({ "path": input.path }),
+                        reason: "Read the file contents instead of listing it as a directory".into(),
+                    }];
+                    error.side_effect = Some(ToolSideEffect::None);
+                    return Err(error);
                 }
 
-                anyhow::Ok(())
-            }).map_err(|e| e.to_string())?;
+                Ok(())
+            }).map_err(|error| error.to_json_string())?;
 
             if let Some(canonical_target) = &symlink_canonical_target {
                 let authorize = cx.update(|cx| {
@@ -324,13 +381,17 @@ impl AgentTool for ListDirectoryTool {
                         cx,
                     )
                 });
-                authorize.await.map_err(|e| e.to_string())?;
+                authorize.await.map_err(|error| {
+                    structured_list_error(ToolErrorCategory::PermissionDenied, error, Vec::new())
+                })?;
             }
 
             let list_path = input.path;
             cx.update(|cx| {
                 Self::build_directory_output(&project, &project_path, &list_path, cx)
-            }).map_err(|e| e.to_string())
+            }).map_err(|error| {
+                structured_list_error(ToolErrorCategory::Unavailable, error, Vec::new())
+            })
         })
     }
 }

@@ -67,6 +67,56 @@ pub struct ShellSnapshot {
     pub command: Option<CommandSnapshot>,
 }
 
+pub(crate) fn model_state_from_snapshot(snapshot: &ShellSnapshot) -> serde_json::Value {
+    let state = match &snapshot.status {
+        ShellStatus::Idle => "idle",
+        ShellStatus::Running => "running",
+        ShellStatus::Closed => "closed",
+        ShellStatus::Failed { .. } => "failed",
+    };
+    let command = snapshot.command.as_ref().map(|command| {
+        let (state, exit_code) = match &command.status {
+            CommandStatus::Running => ("running", None),
+            CommandStatus::Completed { exit_code } => ("completed", Some(*exit_code)),
+            CommandStatus::TimedOut => ("timed_out", None),
+            CommandStatus::Cancelled => ("cancelled", None),
+            CommandStatus::Failed { .. } => ("failed", None),
+        };
+        serde_json::json!({"id": command.id, "state": state, "exit_code": exit_code})
+    });
+    serde_json::json!({"state": state, "command": command})
+}
+
+#[cfg(test)]
+#[test]
+fn model_state_omits_output_and_failure_reasons() {
+    let sensitive = "private error and output".repeat(1024);
+    let snapshot = ShellSnapshot {
+        status: ShellStatus::Failed {
+            reason: sensitive.clone(),
+        },
+        command: Some(CommandSnapshot {
+            id: 42,
+            status: CommandStatus::Failed {
+                reason: sensitive.clone(),
+            },
+            output: sensitive.clone(),
+            output_truncated: true,
+        }),
+    };
+    let state = model_state_from_snapshot(&snapshot);
+    assert_eq!(
+        state,
+        serde_json::json!({
+            "state": "failed", "command": {"id": 42, "state": "failed", "exit_code": null}
+        })
+    );
+    assert_eq!(
+        snapshot.command.as_ref().expect("command").output,
+        sensitive
+    );
+}
+
 pub struct PersistentShell {
     #[cfg(target_os = "macos")]
     inner: macos::Session,
@@ -102,6 +152,29 @@ impl PersistentShell {
         }
     }
 
+    pub(crate) fn model_state(&self) -> serde_json::Value {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.model_state()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            serde_json::json!({"state": "failed", "command": null})
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.status()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "failed"
+        }
+    }
+
     pub fn snapshot(&self) -> ShellSnapshot {
         #[cfg(target_os = "macos")]
         {
@@ -118,12 +191,24 @@ impl PersistentShell {
         }
     }
 
+    pub(crate) fn close_running_command(&self, command_id: u64) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.close_if_running(Some(command_id))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = command_id;
+            Ok(())
+        }
+    }
+
     /// Synchronously stops the worker and cleans up its process group. Idempotent;
     /// subsequent calls return the same cleanup result. Running commands are cancelled.
     pub fn close(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            self.inner.close()
+            self.inner.close_if_running(None)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -359,6 +444,20 @@ done
             Ok(id)
         }
 
+        pub(super) fn model_state(&self) -> serde_json::Value {
+            model_state_from_snapshot(&lock(&self.state).snapshot)
+        }
+
+        #[cfg(test)]
+        pub(super) fn status(&self) -> &'static str {
+            match &lock(&self.state).snapshot.status {
+                ShellStatus::Idle => "idle",
+                ShellStatus::Running => "running",
+                ShellStatus::Closed => "closed",
+                ShellStatus::Failed { .. } => "failed",
+            }
+        }
+
         pub(super) fn snapshot(&self) -> ShellSnapshot {
             let state = lock(&self.state);
             let mut snapshot = state.snapshot.clone();
@@ -376,12 +475,19 @@ done
             snapshot
         }
 
-        pub(super) fn close(&self) -> Result<()> {
+        pub(super) fn close_if_running(&self, command_id: Option<u64>) -> Result<()> {
             // Serializes concurrent closes, including their joins. Submit only takes state.
             let mut worker = lock(&self.worker);
-            if let Some(worker) = worker.take() {
+            if worker.is_some() {
                 {
                     let mut state = lock(&self.state);
+                    if let Some(command_id) = command_id {
+                        if !state.snapshot.command.as_ref().is_some_and(|command| {
+                            command.id == command_id && command.status == CommandStatus::Running
+                        }) {
+                            return Ok(());
+                        }
+                    }
                     if matches!(
                         state.snapshot.status,
                         ShellStatus::Idle | ShellStatus::Running
@@ -394,6 +500,9 @@ done
                         }
                     }
                 }
+                let Some(worker) = worker.take() else {
+                    return Ok(());
+                };
                 // A disconnected receiver means cleanup has already started or finished.
                 if self.sender.send(Message::Close).is_err() {
                     log::debug!("persistent shell worker already stopped during close");
@@ -976,9 +1085,42 @@ mod tests {
     }
 
     #[test]
+    fn stale_command_cleanup_preserves_completed_and_new_commands() -> Result<()> {
+        let directory = TempDir::new()?;
+        let shell = PersistentShell::spawn(directory.path().into())?;
+        let first = shell.submit("printf retained".into(), Duration::from_secs(5))?;
+        assert_eq!(completed(&shell).output, "retained");
+        shell.close_running_command(first)?;
+        assert_eq!(
+            shell.snapshot().command.expect("retained command").output,
+            "retained"
+        );
+        let second = shell.submit(
+            "while [[ ! -e release ]]; do /bin/sleep 0.01; done; printf second".into(),
+            Duration::from_secs(10),
+        )?;
+        shell.close_running_command(first)?;
+        assert_eq!(shell.model_state()["command"]["id"], second);
+        assert_eq!(shell.status(), "running");
+        fs::write(directory.path().join("release"), "")?;
+        assert_eq!(completed(&shell).output, "second");
+        let third = shell.submit("sleep 60".into(), Duration::from_secs(10))?;
+        shell.close_running_command(third)?;
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.status, ShellStatus::Closed);
+        assert_eq!(
+            snapshot.command.expect("cancelled command").status,
+            CommandStatus::Cancelled
+        );
+        shell.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn submission_is_async_rejects_overlap_and_streams_output() -> Result<()> {
         let directory = TempDir::new()?;
         let shell = PersistentShell::spawn(directory.path().into())?;
+        assert_eq!(shell.status(), "idle");
         let id = shell.submit(
             "printf started; while [[ ! -e release ]]; do /bin/sleep 0.01; done; printf finished"
                 .into(),
@@ -992,11 +1134,14 @@ mod tests {
                 .is_some_and(|command| command.output == "started")
         });
         assert_eq!(running.status, ShellStatus::Running);
+        assert_eq!(shell.status(), "running");
         assert_eq!(running.command.expect("running command").id, id);
         fs::write(directory.path().join("release"), "")?;
         assert_eq!(completed(&shell).output, "startedfinished");
+        assert_eq!(shell.status(), "idle");
         shell.close()?;
         assert_eq!(shell.snapshot().status, ShellStatus::Closed);
+        assert_eq!(shell.status(), "closed");
         assert!(shell.submit("true".into(), Duration::from_secs(1)).is_err());
         shell.close()?;
         Ok(())
@@ -1015,7 +1160,9 @@ mod tests {
             snapshot.command.expect("timed out command").status,
             CommandStatus::TimedOut
         );
+        assert_eq!(shell.status(), "failed");
         shell.close()?;
+        assert_eq!(shell.status(), "failed");
         wait_gone(shell_pid);
         wait_gone(child_pid);
         wait_gone(-shell_pid);
@@ -1104,6 +1251,11 @@ mod tests {
         assert_eq!(command.status, CommandStatus::Completed { exit_code: 0 });
         assert_eq!(command.output.len(), OUTPUT_LIMIT);
         assert!(command.output_truncated);
+        assert_eq!(shell.status(), "idle");
+        assert_eq!(
+            shell.snapshot().command.expect("retained command").output,
+            command.output
+        );
         shell.submit("printf clean".into(), Duration::from_secs(5))?;
         let command = completed(&shell);
         assert_eq!(command.output, "clean");

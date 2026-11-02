@@ -3,11 +3,14 @@ mod streaming_fuzzy_matcher;
 mod streaming_parser;
 
 use super::tool_permissions::resolve_creatable_global_skill_path;
-use crate::{Thread, ToolCallEventStream};
+use crate::{
+    Thread, ToolCallEventStream, ToolError, ToolErrorCategory, ToolRecovery, ToolSideEffect,
+};
 use acp_thread::Diff;
 use action_log::ActionLog;
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
+
 use collections::HashSet;
 use futures::{FutureExt, channel::oneshot};
 use gpui::{App, AppContext, AsyncApp, Entity, Task, WeakEntity};
@@ -73,6 +76,8 @@ pub enum EditSessionOutput {
         old_text: Arc<String>,
         #[serde(default)]
         diff: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        edit_matches: Vec<EditMatch>,
     },
     Error {
         error: String,
@@ -80,7 +85,17 @@ pub enum EditSessionOutput {
         input_path: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         diff: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_error: Option<ToolError>,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditMatch {
+    edit_index: usize,
+    start_line: u32,
+    end_line: u32,
+    is_exact: bool,
 }
 
 impl EditSessionOutput {
@@ -89,6 +104,7 @@ impl EditSessionOutput {
             error: error.into(),
             input_path: None,
             diff: String::new(),
+            structured_error: None,
         }
     }
 }
@@ -97,18 +113,63 @@ impl std::fmt::Display for EditSessionOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EditSessionOutput::Success {
-                diff, input_path, ..
+                diff,
+                input_path,
+                edit_matches,
+                ..
             } => {
                 if diff.is_empty() {
-                    write!(f, "No edits were made.")
+                    write!(f, "No edits were made.")?;
                 } else {
-                    write!(f, "Edited {} successfully", input_path.display())
+                    write!(f, "Edited {} successfully", input_path.display())?;
                 }
+                if !edit_matches.is_empty() {
+                    write!(
+                        f,
+                        "\nMatched old_text before each edit (0-based edit indices; 1-based lines in the then-current buffer):"
+                    )?;
+                    const MATCH_PREVIEW_LIMIT: usize = 32;
+                    for edit_match in edit_matches.iter().take(MATCH_PREVIEW_LIMIT) {
+                        let match_kind = if edit_match.is_exact {
+                            "exact"
+                        } else {
+                            "fuzzy"
+                        };
+                        write!(
+                            f,
+                            "\n- Edit {}: {match_kind} match at ",
+                            edit_match.edit_index
+                        )?;
+                        if edit_match.start_line == edit_match.end_line {
+                            write!(f, "line {}.", edit_match.start_line)?;
+                        } else {
+                            write!(
+                                f,
+                                "lines {}-{}.",
+                                edit_match.start_line, edit_match.end_line
+                            )?;
+                        }
+                    }
+                    if edit_matches.len() > MATCH_PREVIEW_LIMIT {
+                        let omitted_fuzzy = edit_matches
+                            .iter()
+                            .skip(MATCH_PREVIEW_LIMIT)
+                            .filter(|edit_match| !edit_match.is_exact)
+                            .count();
+                        write!(
+                            f,
+                            "\n- {} additional edit matches omitted ({omitted_fuzzy} fuzzy).",
+                            edit_matches.len() - MATCH_PREVIEW_LIMIT
+                        )?;
+                    }
+                }
+                Ok(())
             }
             EditSessionOutput::Error {
                 error,
                 diff,
                 input_path,
+                ..
             } => {
                 write!(f, "{error}\n")?;
                 if let Some(input_path) = input_path
@@ -129,7 +190,15 @@ impl std::fmt::Display for EditSessionOutput {
 
 impl From<EditSessionOutput> for LanguageModelToolResultContent {
     fn from(output: EditSessionOutput) -> Self {
-        output.to_string().into()
+        match &output {
+            EditSessionOutput::Error {
+                structured_error: Some(error),
+                ..
+            } => serde_json::to_string(error)
+                .unwrap_or_else(|_| output.to_string())
+                .into(),
+            _ => output.to_string().into(),
+        }
     }
 }
 
@@ -268,6 +337,8 @@ pub(crate) enum EditSessionResult {
     Failed {
         error: String,
         session: Option<EditSession>,
+        category: ToolErrorCategory,
+        side_effect: ToolSideEffect,
     },
 }
 
@@ -283,40 +354,81 @@ pub(crate) async fn run_session(
                 .ensure_buffer_saved(&session.buffer, cx)
                 .await;
             let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            let edit_matches = match &session.pipeline {
+                Pipeline::Edit(pipeline) => pipeline.edit_matches.clone(),
+                Pipeline::Write(_) => Vec::new(),
+            };
             Ok(EditSessionOutput::Success {
                 old_text: session.old_text.clone(),
                 new_text,
                 input_path: session.input_path,
                 diff,
+                edit_matches,
             })
         }
         EditSessionResult::Failed {
             error,
             session: Some(session),
+            category,
+            side_effect,
         } => {
             session
                 .context
                 .ensure_buffer_saved(&session.buffer, cx)
                 .await;
             let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            let mut structured_error = ToolError::new(category, error.clone(), false);
+            structured_error.side_effect = Some(if diff.is_empty() {
+                side_effect
+            } else {
+                ToolSideEffect::Present
+            });
+            if category == ToolErrorCategory::Conflict {
+                structured_error.recover_with.push(ToolRecovery {
+                    tool: "read_file".into(),
+                    arguments: serde_json::json!({
+                        "path": session.input_path.to_string_lossy().into_owned(),
+                    }),
+                    reason: "Re-read the current file contents before attempting another edit"
+                        .into(),
+                });
+            }
             if diff.is_empty() {
-                event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
+                event_stream.update_fields(|update| {
+                    update.content(vec![
+                        serde_json::to_string(&structured_error)
+                            .unwrap_or_else(|_| error.clone())
+                            .into(),
+                    ])
+                });
             }
             Err(EditSessionOutput::Error {
                 error,
                 input_path: Some(session.input_path),
                 diff,
+                structured_error: Some(structured_error),
             })
         }
         EditSessionResult::Failed {
             error,
             session: None,
+            category,
+            side_effect,
         } => {
-            event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
+            let mut structured_error = ToolError::new(category, error.clone(), false);
+            structured_error.side_effect = Some(side_effect);
+            event_stream.update_fields(|update| {
+                update.content(vec![
+                    serde_json::to_string(&structured_error)
+                        .unwrap_or_else(|_| error.clone())
+                        .into(),
+                ])
+            });
             Err(EditSessionOutput::Error {
                 error,
                 input_path: None,
                 diff: String::new(),
+                structured_error: Some(structured_error),
             })
         }
     }
@@ -377,6 +489,93 @@ struct WritePipeline {
 struct EditPipeline {
     current_edit: Option<EditPipelineEntry>,
     file_changed_since_last_read: bool,
+    edit_matches: Vec<EditMatch>,
+    input_guard: EditInputGuard,
+}
+
+#[derive(Default)]
+struct EditInputGuard {
+    edits: Vec<ProcessedEditInput>,
+}
+
+#[derive(Default)]
+struct ProcessedEditInput {
+    old_text: String,
+    old_text_done: bool,
+    new_text: String,
+    new_text_done: bool,
+}
+
+impl EditInputGuard {
+    fn validate<'a>(
+        &self,
+        edits: impl ExactSizeIterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    ) -> Result<(), String> {
+        if edits.len() < self.edits.len() {
+            return Err(Self::error("the edits array was shortened"));
+        }
+        for (index, (old_text, new_text)) in edits.enumerate() {
+            let Some(processed) = self.edits.get(index) else {
+                break;
+            };
+            for (name, value, prefix, done) in [
+                (
+                    "old_text",
+                    old_text,
+                    &processed.old_text,
+                    processed.old_text_done,
+                ),
+                (
+                    "new_text",
+                    new_text,
+                    &processed.new_text,
+                    processed.new_text_done,
+                ),
+            ] {
+                if let Some(value) = value
+                    && (!value.starts_with(prefix.as_str()) || (done && value != prefix))
+                {
+                    return Err(Self::error(&format!(
+                        "edit {index} {name} changed after it was processed"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn error(reason: &str) -> String {
+        format!(
+            "Inconsistent streaming edit input: {reason}. No further edits were applied; earlier streamed edits may remain. Review the file before retrying."
+        )
+    }
+
+    fn record(&mut self, event: &EditEvent) {
+        let (index, chunk, done, is_old) = match event {
+            EditEvent::OldTextChunk {
+                edit_index,
+                chunk,
+                done,
+            } => (*edit_index, chunk, *done, true),
+            EditEvent::NewTextChunk {
+                edit_index,
+                chunk,
+                done,
+            } => (*edit_index, chunk, *done, false),
+        };
+        if self.edits.len() <= index {
+            self.edits
+                .resize_with(index + 1, ProcessedEditInput::default);
+        }
+        let edit = &mut self.edits[index];
+        if is_old {
+            edit.old_text.push_str(chunk);
+            edit.old_text_done = done;
+        } else {
+            edit.new_text.push_str(chunk);
+            edit.new_text_done = done;
+        }
+    }
 }
 
 enum EditPipelineEntry {
@@ -401,6 +600,8 @@ impl Pipeline {
             EditSessionMode::Edit => Self::Edit(EditPipeline {
                 current_edit: None,
                 file_changed_since_last_read,
+                edit_matches: Vec::new(),
+                input_guard: EditInputGuard::default(),
             }),
         }
     }
@@ -527,6 +728,19 @@ impl EditPipeline {
                 let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
 
                 let line = snapshot.offset_to_point(range.start).row;
+                let end = snapshot.offset_to_point(range.end);
+                // The match range is end-exclusive; a trailing newline does not include the next line.
+                let end_line = if end.column == 0 && !range.is_empty() {
+                    end.row
+                } else {
+                    end.row + 1
+                };
+                self.edit_matches.push(EditMatch {
+                    edit_index: *edit_index,
+                    start_line: line + 1,
+                    end_line,
+                    is_exact,
+                });
                 // ACP numbers lines from 1.
                 event_stream.update_fields(|update| {
                     update.locations(vec![
@@ -799,6 +1013,11 @@ impl EditSession {
             return Err("Cannot finalize edits on a write session".to_string());
         };
 
+        edit_pipeline.input_guard.validate(
+            edits
+                .iter()
+                .map(|edit| (Some(edit.old_text.as_str()), Some(edit.new_text.as_str()))),
+        )?;
         for event in &parser.finalize_edits(&edits) {
             edit_pipeline.process_event(
                 event,
@@ -883,7 +1102,20 @@ impl EditSession {
         let Some(edits) = edits else {
             return Ok(());
         };
+        edit_pipeline.input_guard.validate(
+            edits
+                .iter()
+                .map(|edit| (edit.old_text.as_deref(), edit.new_text.as_deref())),
+        )?;
+        if edits
+            .iter()
+            .take(edits.len().saturating_sub(1))
+            .any(|edit| edit.old_text.is_none() || edit.new_text.is_none())
+        {
+            return Ok(());
+        }
         for event in &parser.push_edits(edits) {
+            edit_pipeline.input_guard.record(event);
             edit_pipeline.process_event(
                 event,
                 buffer,

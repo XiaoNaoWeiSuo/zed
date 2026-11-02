@@ -1,4 +1,6 @@
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolSideEffect,
+};
 use agent_client_protocol::schema::v2 as acp;
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
@@ -67,11 +69,23 @@ impl DiagnosticsTool {
     }
 }
 
+fn structured_diagnostics_error(
+    category: ToolErrorCategory,
+    message: impl std::fmt::Display,
+) -> String {
+    let mut error = ToolError::new(category, message.to_string(), false);
+    error.side_effect = Some(ToolSideEffect::None);
+    error.to_json_string()
+}
+
 async fn with_cancellation<T>(f: impl Future<Output = T>, s: &ToolCallEventStream) -> Result<T> {
     futures::select! {
         result = f.fuse() => Ok(result),
         _ = s.cancelled_by_user().fuse() => {
-            Err("Diagnostics cancelled by user".to_string())
+            Err(structured_diagnostics_error(
+                ToolErrorCategory::Cancelled,
+                "Diagnostics cancelled by user",
+            ))
         }
     }
 }
@@ -99,14 +113,19 @@ async fn pull_diagnostics(
         Some(path) => {
             let open_buffer_task = project.update(cx, |project, cx| {
                 let Some(project_path) = project.find_project_path(path, cx) else {
-                    return Err(format!("Could not find path {} in project", path.display()));
+                    return Err(structured_diagnostics_error(
+                        ToolErrorCategory::NotFound,
+                        format!("Could not find path {} in project", path.display()),
+                    ));
                 };
                 Ok(project.open_buffer(project_path, cx))
             })?;
 
             let buffer = with_cancellation(open_buffer_task, event_stream)
                 .await?
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| {
+                    structured_diagnostics_error(ToolErrorCategory::Unavailable, error)
+                })?;
 
             let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
             let pull_task = lsp_store.update(cx, |lsp_store, cx| {
@@ -165,7 +184,9 @@ impl AgentTool for DiagnosticsTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
-            let input = input.recv().await.map_err(|e| e.to_string())?;
+            let input = input.recv().await.map_err(|error| {
+                structured_diagnostics_error(ToolErrorCategory::InvalidInput, error)
+            })?;
 
             match input.path {
                 Some(ref path) if !path.is_empty() => {
@@ -175,14 +196,19 @@ impl AgentTool for DiagnosticsTool {
 
                     let open_buffer_task = project.update(cx, |project, cx| {
                         let Some(project_path) = project.find_project_path(path, cx) else {
-                            return Err(format!("Could not find path {path} in project"));
+                            return Err(structured_diagnostics_error(
+                                ToolErrorCategory::NotFound,
+                                format!("Could not find path {path} in project"),
+                            ));
                         };
                         Ok(project.open_buffer(project_path, cx))
                     })?;
 
                     let buffer = with_cancellation(open_buffer_task, &event_stream)
                         .await?
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| {
+                            structured_diagnostics_error(ToolErrorCategory::Unavailable, error)
+                        })?;
 
                     let mut output = String::new();
                     let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());

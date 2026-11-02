@@ -33,6 +33,30 @@ use crate::provider::x_ai::XAiLanguageModelProvider;
 use crate::provider::x_ai_subscribed::XAiSubscribedProvider;
 pub use crate::settings::*;
 
+pub fn init_openai_subscribed_only(client: Arc<Client>, cx: &mut App) {
+    language_model::set_credentials_read_gate::<SettingsStore>(ai_disabled, cx);
+    let credentials_provider = client.credentials_provider();
+    LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+        register_openai_subscribed_provider(registry, &client, credentials_provider, cx);
+    });
+}
+
+fn register_openai_subscribed_provider(
+    registry: &mut LanguageModelRegistry,
+    client: &Client,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &mut Context<LanguageModelRegistry>,
+) {
+    registry.register_provider(
+        Arc::new(OpenAiSubscribedProvider::new(
+            client.http_client(),
+            credentials_provider,
+            cx,
+        )),
+        cx,
+    );
+}
+
 pub fn init(_user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
     language_model::set_credentials_read_gate::<SettingsStore>(ai_disabled, cx);
     let credentials_provider = client.credentials_provider();
@@ -484,6 +508,23 @@ mod tests {
             .filter(|provider| provider.id().0.as_ref() == id)
             .map(|provider| provider.icon())
             .collect()
+    }
+
+    #[gpui::test]
+    fn test_register_openai_subscribed_provider_in_empty_registry(cx: &mut App) {
+        let (client, credentials_provider) = init_test(cx);
+        language_model::init(cx);
+        let registry = LanguageModelRegistry::global(cx);
+        registry.update(cx, |registry, cx| {
+            register_openai_subscribed_provider(registry, &client, credentials_provider, cx);
+        });
+        let provider_ids = registry
+            .read(cx)
+            .providers()
+            .iter()
+            .map(|provider| provider.id().0.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(provider_ids, vec!["openai-subscribed"]);
     }
 
     #[gpui::test]

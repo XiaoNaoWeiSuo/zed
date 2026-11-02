@@ -93,6 +93,15 @@ struct Args {
     #[arg(long, default_value = ".")]
     output_dir: PathBuf,
 
+    /// Restrict the evaluation to the subscribed provider and a read-only fixture.
+    #[arg(long)]
+    isolated: bool,
+
+    /// Run the exact instruction in a native subagent, without a parent model turn.
+    /// Headless settings, permissions, project roots and provider cache can differ from the GUI.
+    #[arg(long)]
+    subagent: bool,
+
     /// Disable staff mode (staff mode is enabled by default).
     #[arg(long)]
     no_staff: bool,
@@ -116,6 +125,8 @@ enum AgentOutcome {
 #[derive(serde::Serialize)]
 struct EvalResult {
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     duration_secs: f64,
@@ -169,6 +180,13 @@ fn main() {
         return;
     }
 
+    if args.isolated {
+        if let Err(error) = validate_isolated_options(&args.model, *zed_env_vars::ZED_STATELESS) {
+            eprintln!("Isolated evaluation refused: {error:#}");
+            process::exit(EXIT_ERROR);
+        }
+    }
+
     env_logger::init();
 
     ctrlc::set_handler(|| {
@@ -186,28 +204,44 @@ fn main() {
         process::exit(EXIT_ERROR);
     });
 
+    if args.isolated {
+        if let Err(error) = validate_isolated_fixture(&workdir) {
+            eprintln!("Isolated evaluation refused: {error:#}");
+            process::exit(EXIT_ERROR);
+        }
+    }
+
     let output_dir = args.output_dir.clone();
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
-        eprintln!("Error creating output dir {}: {e}", output_dir.display());
-        process::exit(EXIT_ERROR);
+    if !args.isolated {
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            eprintln!("Error creating output dir {}: {e}", output_dir.display());
+            process::exit(EXIT_ERROR);
+        }
     }
     let output_dir = output_dir.canonicalize().unwrap_or_else(|e| {
         eprintln!("Invalid --output-dir {:?}: {e}", output_dir);
         process::exit(EXIT_ERROR);
     });
 
+    if args.isolated && (!output_dir.is_dir() || output_dir.starts_with(&workdir)) {
+        eprintln!("Isolated evaluation requires an existing output directory outside the fixture");
+        process::exit(EXIT_ERROR);
+    }
+
     let http_client = Arc::new(reqwest_client::ReqwestClient::new());
     let app = gpui_platform::headless().with_http_client(http_client);
 
     app.run(move |cx| {
-        let app_state = headless::init(cx);
+        let app_state = headless::init(args.isolated, cx);
         cx.set_staff(!args.no_staff);
 
         // Eval hook: enable additional feature-flag-gated tools (e.g. the LSP
         // navigation tools behind `lsp-tool` / `rename-tool`) so experiments can
         // measure the agent with tools that aren't yet GA. Comma-separated flag
         // names; unset in production.
-        if let Ok(raw_flags) = std::env::var("ZED_EVAL_ENABLE_FLAGS") {
+        if !args.isolated
+            && let Ok(raw_flags) = std::env::var("ZED_EVAL_ENABLE_FLAGS")
+        {
             let flags: Vec<String> = raw_flags
                 .split(',')
                 .map(|flag| flag.trim().to_string())
@@ -218,11 +252,17 @@ fn main() {
             }
         }
 
-        let openai_compatible_providers_json = openai_compatible_providers_override();
-        let anthropic_available_models_json = anthropic_available_models_override();
+        let openai_compatible_providers_json = (!args.isolated)
+            .then(openai_compatible_providers_override)
+            .flatten();
+        let anthropic_available_models_json = (!args.isolated)
+            .then(anthropic_available_models_override)
+            .flatten();
 
         let model_name = args.model.clone();
         let timeout = args.timeout;
+        let subagent = args.subagent;
+        let isolated = args.isolated;
         let thinking_override = args.thinking;
         let reasoning_effort = args.reasoning_effort.clone();
 
@@ -251,6 +291,20 @@ fn main() {
                 }
             }
 
+            if isolated {
+                let valid_registry = cx.update(|cx| {
+                    let registry = LanguageModelRegistry::global(cx);
+                    let providers = registry.read(cx).providers();
+                    providers.len() == 1
+                        && providers
+                            .first()
+                            .is_some_and(|provider| provider.id().0.as_ref() == "openai-subscribed")
+                });
+                if !valid_registry {
+                    eprintln!("Isolated evaluation refused: unexpected provider registry");
+                    process::exit(EXIT_ERROR);
+                }
+            }
             let auth_tasks = cx.update(|cx| {
                 LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
                     registry
@@ -260,7 +314,11 @@ fn main() {
                         .collect::<Vec<_>>()
                 })
             });
-            futures::future::join_all(auth_tasks).await;
+            let auth_results = futures::future::join_all(auth_tasks).await;
+            if isolated && auth_results.iter().any(Result::is_err) {
+                eprintln!("Isolated evaluation refused: target provider authentication failed");
+                process::exit(EXIT_ERROR);
+            }
 
             let start = Instant::now();
 
@@ -270,11 +328,13 @@ fn main() {
                 &instruction,
                 &model_name,
                 timeout,
+                subagent,
                 thinking_override,
                 reasoning_effort.as_deref(),
                 Some(&output_dir),
                 openai_compatible_providers_json.as_deref(),
                 anthropic_available_models_json.as_deref(),
+                isolated,
                 cx,
             )
             .await;
@@ -300,6 +360,7 @@ fn main() {
             let token_usage = stats.token_usage;
             let result = EvalResult {
                 status,
+                execution_mode: subagent.then_some("subagent"),
                 error,
                 duration_secs: duration.as_secs_f64(),
                 timeout_secs: timeout,
@@ -334,6 +395,50 @@ fn main() {
         })
         .detach();
     });
+}
+
+fn validate_isolated_options(model: &str, stateless: bool) -> Result<()> {
+    anyhow::ensure!(stateless, "set ZED_STATELESS before starting eval-cli");
+    anyhow::ensure!(
+        model == "openai-subscribed/gpt-6.1-terra",
+        "isolated evaluation requires openai-subscribed/gpt-6.1-terra"
+    );
+    Ok(())
+}
+
+fn validate_isolated_fixture(workdir: &std::path::Path) -> Result<()> {
+    let mut directories = vec![workdir.to_path_buf()];
+    let mut file_count = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).context("reading fixture directory")? {
+            let entry = entry.context("reading fixture entry")?;
+            let file_type = entry.file_type().context("checking fixture entry")?;
+            let name = entry.file_name();
+            anyhow::ensure!(
+                !name.to_string_lossy().starts_with('.'),
+                "fixture must not contain hidden entries"
+            );
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else {
+                anyhow::ensure!(
+                    file_type.is_file(),
+                    "fixture must contain only regular files"
+                );
+                anyhow::ensure!(
+                    name == "permission_tier.rs" || name == "sandboxing.rs",
+                    "fixture contains an unexpected file"
+                );
+                file_count += 1;
+            }
+        }
+    }
+    anyhow::ensure!(file_count > 0, "fixture contains no task files");
+    Ok(())
+}
+
+fn isolated_profile_field() -> &'static str {
+    r#", "default_profile": "isolated-eval", "profiles": {"isolated-eval": {"name": "Isolated eval", "enable_all_context_servers": false, "context_servers": {}, "tools": {"read_file": true}}}"#
 }
 
 /// Name of the env var carrying a JSON object to merge into
@@ -554,6 +659,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn isolated_options_require_stateless_and_exact_model() {
+        assert!(validate_isolated_options("openai-subscribed/gpt-6.1-terra", true).is_ok());
+        assert!(validate_isolated_options("openai-subscribed/gpt-6.1-terra", false).is_err());
+        assert!(validate_isolated_options("other/gpt-6.1-terra", true).is_err());
+        assert!(validate_isolated_options("openai-subscribed/other", true).is_err());
+    }
+
+    #[test]
+    fn isolated_profile_exposes_only_read_file() -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(&format!(
+            "{{{}}}",
+            isolated_profile_field().trim_start_matches(',')
+        ))?;
+        let profile = &value["profiles"]["isolated-eval"];
+        assert_eq!(profile["enable_all_context_servers"], false);
+        assert_eq!(profile["context_servers"], serde_json::json!({}));
+        assert_eq!(profile["tools"], serde_json::json!({"read_file": true}));
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_fixture_rejects_unrelated_and_hidden_files() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        std::fs::create_dir(fixture.path().join("src"))?;
+        std::fs::write(fixture.path().join("src/permission_tier.rs"), "fixture")?;
+        assert!(validate_isolated_fixture(fixture.path()).is_ok());
+        std::fs::write(fixture.path().join("src/other.rs"), "other")?;
+        assert!(validate_isolated_fixture(fixture.path()).is_err());
+        std::fs::remove_file(fixture.path().join("src/other.rs"))?;
+        std::fs::create_dir(fixture.path().join(".zed"))?;
+        assert!(validate_isolated_fixture(fixture.path()).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_fixture_rejects_symlinks() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        std::os::unix::fs::symlink("/tmp", fixture.path().join("sandboxing.rs"))?;
+        assert!(validate_isolated_fixture(fixture.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn anthropic_latest_alias_matches_listed_base_model() {
         assert!(model_id_matches_selected(
             &ANTHROPIC_PROVIDER_ID,
@@ -596,11 +745,13 @@ async fn run_agent(
     instruction: &str,
     model_name: &str,
     timeout: Option<u64>,
+    subagent: bool,
     thinking_override: Option<bool>,
     reasoning_effort: Option<&str>,
     output_dir: Option<&std::path::Path>,
     openai_compatible_providers_json: Option<&str>,
     anthropic_available_models_json: Option<&str>,
+    isolated: bool,
     cx: &mut AsyncApp,
 ) -> (Result<AgentOutcome>, RunStats) {
     let selected = match SelectedModel::from_str(model_name).map_err(|e| anyhow::anyhow!("{e}")) {
@@ -656,7 +807,9 @@ async fn run_agent(
         // the defaults, so it can't inherit "write"'s tools — the full set is
         // listed explicitly here. Keep WRITE_TOOLS in sync with the "write"
         // profile in assets/settings/default.json.
-        let profile_field = {
+        let profile_field = if isolated {
+            isolated_profile_field().to_string()
+        } else {
             let raw = std::env::var("ZED_EVAL_DISABLE_TOOLS").unwrap_or_default();
             let disabled = raw
                 .split(',')
@@ -732,7 +885,7 @@ async fn run_agent(
     }
 
     let project = cx.update(|cx| {
-        Project::local(
+        Project::local_with_context_servers(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
             app_state.user_store.clone(),
@@ -741,8 +894,9 @@ async fn run_agent(
             None,
             project::LocalProjectFlags {
                 init_worktree_trust: false,
-                ..Default::default()
+                watch_global_configs: !isolated,
             },
+            !isolated,
             cx,
         )
     });
@@ -764,7 +918,7 @@ async fn run_agent(
     };
 
     let output_worktree = match output_dir {
-        Some(output_dir) if !output_dir.starts_with(workdir) => {
+        Some(output_dir) if !isolated && !output_dir.starts_with(workdir) => {
             let output_worktree = project.update(cx, |project, cx| {
                 project.create_worktree(output_dir, true, cx)
             });
@@ -811,16 +965,78 @@ async fn run_agent(
         Err(e) => return (Err(e).context("creating ACP session"), RunStats::default()),
     };
 
+    let parent_thread = acp_thread;
+    let subagent_handle = if subagent {
+        match cx.update(|cx| connection.create_eval_subagent(&parent_thread, cx)) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                return (
+                    Err(error).context("creating evaluation subagent"),
+                    RunStats::default(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let acp_thread = if let Some(handle) = &subagent_handle {
+        let matches_model = cx.update(|cx| {
+            connection.thread(&handle.id(), cx).is_some_and(|thread| {
+                thread.read(cx).model().is_some_and(|model| {
+                    model.provider_id() == selected.provider
+                        && model_id_matches_selected(
+                            &model.provider_id(),
+                            &model.id(),
+                            &selected.model,
+                        )
+                })
+            })
+        });
+        if !matches_model {
+            return (
+                Err(anyhow::anyhow!(
+                    "Subagent model does not match the requested model"
+                )),
+                RunStats::default(),
+            );
+        }
+        match cx.update(|cx| parent_thread.read(cx).subagent(&handle.id()).cloned()) {
+            Some(thread) => thread,
+            None => {
+                return (
+                    Err(anyhow::anyhow!(
+                        "evaluation subagent session not registered"
+                    )),
+                    RunStats::default(),
+                );
+            }
+        }
+    } else {
+        parent_thread.clone()
+    };
+
     let _subscription = cx.subscribe(&acp_thread, |acp_thread, event, cx| {
         log_acp_thread_event(&acp_thread, event, cx);
     });
 
-    let message = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-        instruction.to_string(),
-    ))];
-
-    let send_future =
-        cx.update(|cx| connection.send_and_wait_for_completion(acp_thread.clone(), message, cx));
+    let send_future = if let Some(handle) = &subagent_handle {
+        futures::future::Either::Left(handle.send(instruction.to_string(), cx).map(|result| {
+            result.map(|_| AgentOutcome::Completed).map_err(|_| {
+                anyhow::anyhow!("Subagent failed; inspect the private thread artifact for details")
+            })
+        }))
+    } else {
+        let message = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+            instruction.to_string(),
+        ))];
+        futures::future::Either::Right(
+            cx.update(|cx| {
+                connection.send_and_wait_for_completion(acp_thread.clone(), message, cx)
+            })
+            .map(root_agent_outcome),
+        )
+    };
+    let mut send_future = send_future.fuse();
 
     let timeout_future = if let Some(timeout_secs) = timeout {
         futures::future::Either::Left(
@@ -841,34 +1057,29 @@ async fn run_agent(
     };
 
     let outcome = select_biased! {
-        result = send_future.fuse() => match result {
-            Ok(stop_reason) => {
-                eprintln!("[eval-cli] stopped: {:?}", stop_reason);
-                if let acp_v2::StopReason::Error(details) = stop_reason {
-                    Err(details
-                        .error
-                        .map(|error| anyhow::Error::new(*error))
-                        .unwrap_or_else(|| anyhow::anyhow!("Agent stopped because of an error")))
-                } else if stop_reason == acp_v2::StopReason::MaxTokens {
-                    Err(anyhow::anyhow!("Model hit maximum token limit"))
-                } else {
-                    Ok(AgentOutcome::Completed)
-                }
-            }
-            Err(e) => Err(e).context("agent run failed"),
-        },
+        result = send_future => result,
         _ = sigterm_future.fuse() => {
             eprintln!("[eval-cli] received SIGTERM, cancelling...");
-            acp_thread.update(cx, |thread: &mut acp_thread::AcpThread, cx| thread.cancel(cx))
-                .await
-                .context("cancelling agent after SIGTERM")
-                .map(|()| AgentOutcome::Interrupted)
+            match acp_thread.update(cx, |thread: &mut acp_thread::AcpThread, cx| thread.cancel(cx)).await {
+                Ok(()) => {
+                    if subagent && send_future.await.is_err() {
+                        eprintln!("[eval-cli] subagent turn ended after cancellation");
+                    }
+                    Ok(AgentOutcome::Interrupted)
+                }
+                Err(error) => Err(error).context("cancelling agent after SIGTERM"),
+            }
         },
         _ = timeout_future.fuse() => {
-            acp_thread.update(cx, |thread: &mut acp_thread::AcpThread, cx| thread.cancel(cx))
-                .await
-                .context("cancelling agent after timeout")
-                .map(|()| AgentOutcome::Timeout { seconds: timeout.unwrap_or(0) })
+            match acp_thread.update(cx, |thread: &mut acp_thread::AcpThread, cx| thread.cancel(cx)).await {
+                Ok(()) => {
+                    if subagent && send_future.await.is_err() {
+                        eprintln!("[eval-cli] subagent turn ended after cancellation");
+                    }
+                    Ok(AgentOutcome::Timeout { seconds: timeout.unwrap_or(0) })
+                }
+                Err(error) => Err(error).context("cancelling agent after timeout"),
+            }
         }
     };
 
@@ -951,6 +1162,25 @@ async fn run_agent(
             tool_calls,
         },
     )
+}
+
+fn root_agent_outcome(result: Result<acp_v2::StopReason>) -> Result<AgentOutcome> {
+    match result {
+        Ok(stop_reason) => {
+            eprintln!("[eval-cli] stopped: {:?}", stop_reason);
+            if let acp_v2::StopReason::Error(details) = stop_reason {
+                Err(details
+                    .error
+                    .map(|error| anyhow::Error::new(*error))
+                    .unwrap_or_else(|| anyhow::anyhow!("Agent stopped because of an error")))
+            } else if stop_reason == acp_v2::StopReason::MaxTokens {
+                Err(anyhow::anyhow!("Model hit maximum token limit"))
+            } else {
+                Ok(AgentOutcome::Completed)
+            }
+        }
+        Err(error) => Err(error).context("agent run failed"),
+    }
 }
 
 fn log_acp_thread_event(

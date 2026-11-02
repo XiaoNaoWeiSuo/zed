@@ -7,7 +7,6 @@ use cpal::{
 use futures::channel::oneshot;
 use gpui::{App, AsyncApp, BorrowAppContext, Global, Task};
 
-
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, mixer::Mixer, source::Buffered};
 use settings::Settings;
 use std::io::Cursor;

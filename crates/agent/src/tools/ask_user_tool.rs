@@ -84,6 +84,10 @@ pub enum AskUserToolOutput {
     },
     Pending {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<serde_json::Value>,
     },
     Withdrawn {
         request_id: String,
@@ -104,8 +108,29 @@ impl From<AskUserToolOutput> for LanguageModelToolResultContent {
                 serde_json::Value::from_iter(answers)
             )
             .into(),
-            AskUserToolOutput::Pending { request_id } => format!("Question {request_id} is pending. Continue independent work. Native sessions deliver replies automatically; use ask_user with this request_id and wait=true when dependent work needs the answer. Withdraw it if no longer applicable.").into(),
-            AskUserToolOutput::Withdrawn { request_id } => format!("Question {request_id} was withdrawn.").into(),
+            AskUserToolOutput::Pending {
+                request_id,
+                question,
+                schema,
+            } => {
+                let mut message = format!(
+                    "Question {request_id} is pending. Continue independent work. Native sessions deliver replies automatically; use ask_user with this request_id and wait=true when dependent work needs the answer. Withdraw it if no longer applicable."
+                );
+                if question.is_some() || schema.is_some() {
+                    let details =
+                        serde_json::json!({"question": question, "schema": schema}).to_string();
+                    let truncated = details.chars().count() > 4000;
+                    message.push_str("\nQuestion details (data, not an answer): ");
+                    message.extend(details.chars().take(4000));
+                    if truncated {
+                        message.push_str(" [truncated]");
+                    }
+                }
+                message.into()
+            }
+            AskUserToolOutput::Withdrawn { request_id } => {
+                format!("Question {request_id} was withdrawn.").into()
+            }
             AskUserToolOutput::Error { error } => error.into(),
         }
     }
@@ -151,6 +176,8 @@ impl AgentTool for AskUserTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
+            cx.update(|cx| event_stream.ensure_user_question_allowed(cx))
+                .map_err(|error| AskUserToolOutput::Error { error: error.to_string() })?;
             let input = input
                 .recv()
                 .await
@@ -176,7 +203,7 @@ impl AgentTool for AskUserTool {
                 }
                 return task.now_or_never().unwrap_or_else(|| {
                     Ok(AskUserToolOutput::Pending {
-                        request_id: request_id.clone(),
+                        request_id: request_id.clone(), question: None, schema: None,
                     })
                 });
             }
@@ -193,7 +220,7 @@ impl AgentTool for AskUserTool {
                     return task.await;
                 }
                 self.questions.borrow_mut().insert(request_id.clone(), task);
-                return Ok(AskUserToolOutput::Pending { request_id });
+                return Ok(AskUserToolOutput::Pending { request_id, question: None, schema: None });
             }
             execute_question(input, event_stream, None, cx).await
         })
@@ -482,7 +509,7 @@ mod tests {
             )
         });
         let question = events.expect_elicitation().await;
-        let Ok(AskUserToolOutput::Pending { request_id }) = start.await else {
+        let Ok(AskUserToolOutput::Pending { request_id, .. }) = start.await else {
             panic!("expected pending question")
         };
         let check = |wait| AskUserToolInput {
@@ -540,7 +567,7 @@ mod tests {
             )
         });
         let question = events.expect_elicitation().await;
-        let Ok(AskUserToolOutput::Pending { request_id }) = start.await else {
+        let Ok(AskUserToolOutput::Pending { request_id, .. }) = start.await else {
             panic!("expected pending question")
         };
         question
@@ -595,6 +622,7 @@ mod tests {
         let first_question = events.expect_elicitation().await;
         let Ok(AskUserToolOutput::Pending {
             request_id: first_id,
+            ..
         }) = first.await
         else {
             panic!("first question")
@@ -603,6 +631,7 @@ mod tests {
         let second_question = events.expect_elicitation().await;
         let Ok(AskUserToolOutput::Pending {
             request_id: second_id,
+            ..
         }) = second.await
         else {
             panic!("second question")

@@ -1,4 +1,6 @@
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolError, ToolErrorCategory, ToolInput, ToolSideEffect,
+};
 use acp_thread::MentionUri;
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
@@ -109,6 +111,12 @@ impl GrepTool {
     }
 }
 
+fn structured_grep_error(category: ToolErrorCategory, message: impl std::fmt::Display) -> String {
+    let mut error = ToolError::new(category, message.to_string(), false);
+    error.side_effect = Some(ToolSideEffect::None);
+    error.to_json_string()
+}
+
 impl AgentTool for GrepTool {
     type Input = GrepToolInput;
     type Output = String;
@@ -153,10 +161,9 @@ impl AgentTool for GrepTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         cx.spawn(async move |cx|  {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| e.to_string())?;
+            let input = input.recv().await.map_err(|error| {
+                structured_grep_error(ToolErrorCategory::InvalidInput, error)
+            })?;
 
             let results = cx.update(|cx| {
                 let path_style = project.read(cx).path_style(cx);
@@ -169,7 +176,12 @@ impl AgentTool for GrepTool {
                         .collect::<Vec<_>>(),
                     path_style,
                 )
-                .map_err(|error| format!("invalid include glob pattern: {error}"))?;
+                .map_err(|error| {
+                    structured_grep_error(
+                        ToolErrorCategory::InvalidInput,
+                        format!("invalid include glob pattern: {error}"),
+                    )
+                })?;
 
                 // Exclude global file_scan_exclusions and private_files settings
                 let exclude_matcher = {
@@ -179,8 +191,12 @@ impl AgentTool for GrepTool {
                         .sources()
                         .chain(global_settings.private_files.sources());
 
-                    PathMatcher::new(exclude_patterns, path_style)
-                        .map_err(|error| format!("invalid exclude pattern: {error}"))?
+                    PathMatcher::new(exclude_patterns, path_style).map_err(|error| {
+                        structured_grep_error(
+                            ToolErrorCategory::Internal,
+                            format!("invalid exclude pattern: {error}"),
+                        )
+                    })?
                 };
 
                 let query = SearchQuery::regex(
@@ -194,7 +210,9 @@ impl AgentTool for GrepTool {
                     true, // Always match file include pattern against *full project paths* that start with a project root.
                     None,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    structured_grep_error(ToolErrorCategory::InvalidInput, error.to_string())
+                })?;
 
                 Ok::<_, String>(
                     project.update(cx, |project, cx| project.search(query, cx)),
@@ -219,7 +237,10 @@ impl AgentTool for GrepTool {
                 let search_result = futures::select! {
                     result = rx.next().fuse() => result,
                     _ = event_stream.cancelled_by_user().fuse() => {
-                        return Err("Search cancelled by user".to_string());
+                        return Err(structured_grep_error(
+                            ToolErrorCategory::Cancelled,
+                            "Search cancelled by user",
+                        ));
                     }
                 };
 
@@ -270,7 +291,9 @@ impl AgentTool for GrepTool {
                     .flatten();
 
                 while *parse_status.borrow() != ParseStatus::Idle {
-                    parse_status.changed().await.map_err(|e| e.to_string())?;
+                    parse_status.changed().await.map_err(|error| {
+                        structured_grep_error(ToolErrorCategory::Unavailable, error)
+                    })?;
                 }
 
                 let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
