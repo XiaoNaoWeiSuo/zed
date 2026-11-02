@@ -191,6 +191,32 @@ impl From<&Skill> for NativeAvailableSkill {
 
 pub const COMPACT_COMMAND_NAME: &str = "compact";
 pub const GOAL_COMMAND_NAME: &str = "goal";
+pub const HANDOFF_COMMAND_NAME: &str = "handoff";
+pub const CHECKPOINT_COMMAND_NAME: &str = "checkpoint";
+
+fn handoff_command_instruction(argument: &str) -> String {
+    let argument = argument.trim();
+    let supplied = if argument.is_empty() {
+        String::new()
+    } else {
+        format!("The user supplied: \"{argument}\"\n\n")
+    };
+    format!(
+        "{supplied}Save a project checkpoint handoff now.\n\nUse the `project_checkpoint` tool with `action: \"save\"`. Choose a stable lowercase scope for the current work; if the user supplied a valid scope name, use it. Include:\n- completed: work that is actually done and verified\n- remaining: unfinished or unverified work\n- decisions: choices and assumptions worth carrying forward\n- next_steps: the smallest useful next actions\n\nKeep it concise, save it, then confirm the scope and a one-line summary. Do not stop other work unless needed to save accurately."
+    )
+}
+
+fn checkpoint_command_instruction(argument: &str) -> String {
+    let argument = argument.trim();
+    let supplied = if argument.is_empty() {
+        String::new()
+    } else {
+        format!("Read this scope first: \"{argument}\"\n\n")
+    };
+    format!(
+        "{supplied}Read saved project memory before continuing.\n\nUse the `project_checkpoint` tool: `action: \"list\"` to see saved scopes, then `action: \"read\"` for the most relevant one. Report its age, remaining work, decisions, and next steps, then continue the current task from that state. Do not edit files just to satisfy this request."
+    )
+}
 
 /// Returns the set of MCP prompt names that must be server-qualified
 /// (`/<server>.<name>`) to stay unambiguous in the slash-command popup: names
@@ -1850,13 +1876,40 @@ impl NativeAgent {
                     acp_thread::CommandCategory::Native,
                 ));
 
+        let handoff_command = acp_v2::AvailableCommand::new(
+            HANDOFF_COMMAND_NAME,
+            "Save a project handoff so a later session can resume",
+        )
+        .input(acp_v2::AvailableCommandInput::Text(
+            acp_v2::TextCommandInput::new("<scope or context>"),
+        ))
+        .meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ));
+
+        let checkpoint_command = acp_v2::AvailableCommand::new(
+            CHECKPOINT_COMMAND_NAME,
+            "Read saved project memory and continue from it",
+        )
+        .input(acp_v2::AvailableCommandInput::Text(
+            acp_v2::TextCommandInput::new("<scope>"),
+        ))
+        .meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ));
+
         let registry = state.context_server_registry.read(cx);
 
         // Reserve the built-in command name so a same-named MCP prompt is
         // force-prefixed (`/<server>.compact`) and stays reachable: an
         // unqualified `/compact` always routes to the native command.
         let ambiguous_prompt_names = ambiguous_mcp_prompt_names(
-            [COMPACT_COMMAND_NAME, GOAL_COMMAND_NAME],
+            [
+                COMPACT_COMMAND_NAME,
+                GOAL_COMMAND_NAME,
+                HANDOFF_COMMAND_NAME,
+                CHECKPOINT_COMMAND_NAME,
+            ],
             registry.prompts().map(|p| p.prompt.name.as_str()),
         );
 
@@ -1895,10 +1948,15 @@ impl NativeAgent {
             Some(command)
         });
 
-        [compact_command, goal_command]
-            .into_iter()
-            .chain(mcp_commands)
-            .collect()
+        [
+            compact_command,
+            goal_command,
+            handoff_command,
+            checkpoint_command,
+        ]
+        .into_iter()
+        .chain(mcp_commands)
+        .collect()
     }
 
     pub fn load_thread(
@@ -3657,12 +3715,23 @@ impl NativeAgentConnection {
             return Task::ready(Err(error));
         }
 
-        let goal_objective = Command::parse(&params.prompt)
+        let parsed_command = Command::parse(&params.prompt);
+        let goal_objective = parsed_command
+            .as_ref()
             .filter(|command| command.is_unqualified(GOAL_COMMAND_NAME))
             .map(|command| command.arg_value.trim().to_string());
         if goal_objective.as_ref().is_some_and(String::is_empty) {
             return Task::ready(Err(anyhow!("Provide an objective after /goal")));
         }
+        let command_instruction = parsed_command.as_ref().and_then(|command| {
+            if command.is_unqualified(HANDOFF_COMMAND_NAME) {
+                Some(handoff_command_instruction(&command.arg_value))
+            } else if command.is_unqualified(CHECKPOINT_COMMAND_NAME) {
+                Some(checkpoint_command_instruction(&command.arg_value))
+            } else {
+                None
+            }
+        });
         let path_style = project_state.project.read(cx).path_style(cx);
         let agent = self.0.downgrade();
         let prepared_session_id = session_id.clone();
@@ -3672,6 +3741,17 @@ impl NativeAgentConnection {
                 .into_iter()
                 .map(|block| UserMessageContent::from_content_block(block, path_style))
                 .collect::<Result<Vec<_>>>()?;
+            // Slash commands that delegate to the model replace the raw command
+            // text with the instruction, keeping attached mentions/images.
+            let content = if let Some(instruction) = command_instruction {
+                let mut rewritten = vec![UserMessageContent::Text(instruction)];
+                rewritten.extend(content.into_iter().filter(|content| {
+                    !matches!(content, UserMessageContent::Text(text) if text.trim_start().starts_with('/'))
+                }));
+                rewritten
+            } else {
+                content
+            };
             log::debug!("Converted prompt to message: {} chars", content.len());
             log::debug!("Client user message id: {:?}", client_user_message_id);
             log::debug!("Message content: {:?}", content);
@@ -6374,7 +6454,61 @@ mod internal_tests {
                     .iter()
                     .any(|command| command.name == GOAL_COMMAND_NAME)
             );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.name == HANDOFF_COMMAND_NAME)
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.name == CHECKPOINT_COMMAND_NAME)
+            );
         });
+    }
+
+    #[test]
+    fn test_handoff_and_checkpoint_instructions() {
+        let handoff = handoff_command_instruction("harness.stateful_shell");
+        assert!(handoff.contains("harness.stateful_shell"));
+        assert!(handoff.contains("`project_checkpoint`"));
+        assert!(handoff.contains("action: \"save\""));
+        assert!(handoff.contains("remaining"));
+
+        let checkpoint = checkpoint_command_instruction("harness.abcd_followthrough");
+        assert!(checkpoint.contains("harness.abcd_followthrough"));
+        assert!(checkpoint.contains("action: \"list\""));
+        assert!(checkpoint.contains("action: \"read\""));
+        assert!(checkpoint.contains("Do not edit files"));
+    }
+
+    #[gpui::test]
+    async fn test_handoff_command_rewrites_prompt_for_model(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("handoff-command");
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let send = cx.update(|cx| {
+            connection.send_and_wait_for_completion(
+                acp_thread.clone(),
+                vec!["/handoff harness.stateful_shell".into()],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let requests = fake.pending_completions_for(&model);
+        assert_eq!(requests.len(), 1, "expected one model request");
+        let request = serde_json::to_string(&requests[0]).expect("serialize request");
+        assert!(request.contains("project_checkpoint"));
+        assert!(request.contains("harness.stateful_shell"));
+        assert!(!request.contains("/handoff"));
+
+        cx.update(|cx| connection.cancel(&session_id, cx))
+            .expect("cancel");
+        send.await.expect("stopped");
     }
 
     #[gpui::test]

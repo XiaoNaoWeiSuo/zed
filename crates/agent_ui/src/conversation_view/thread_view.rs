@@ -16084,7 +16084,10 @@ fn leading_native_command(
     let rest = text.trim_start().strip_prefix('/')?;
     let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let name = &rest[..name_end];
-    if name == agent::GOAL_COMMAND_NAME {
+    if name == agent::GOAL_COMMAND_NAME
+        || name == agent::HANDOFF_COMMAND_NAME
+        || name == agent::CHECKPOINT_COMMAND_NAME
+    {
         return None;
     }
     let is_native = available_commands.iter().any(|command| {
@@ -16187,10 +16190,20 @@ mod tests {
         let commands = [
             native_command("compact"),
             native_command("goal"),
+            native_command("handoff"),
+            native_command("checkpoint"),
             mcp_command("deploy"),
         ];
         assert_eq!(
             leading_native_command("/goal Finish the migration", &commands),
+            None
+        );
+        assert_eq!(
+            leading_native_command("/handoff harness.stateful_shell", &commands),
+            None
+        );
+        assert_eq!(
+            leading_native_command("/checkpoint harness.abcd_followthrough", &commands),
             None
         );
 
