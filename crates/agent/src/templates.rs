@@ -118,8 +118,11 @@ mod tests {
             rendered.contains("Authority order: system and tool constraints, explicit user task")
         );
         assert!(!rendered.contains("Use `help` only when uncertain about a capability"));
-        assert!(rendered.contains("Match verification to the change's blast radius"));
-        assert!(rendered.contains("do not run the full test suite"));
+        assert!(
+            rendered
+                .contains("Verification earns its cost only when it can change your conclusion")
+        );
+        assert!(rendered.contains("If no plausible failure exists, run nothing"));
         assert!(rendered.contains("directly inspect, change, and check"));
         assert!(
             rendered.contains(
@@ -158,7 +161,11 @@ mod tests {
                     .contains("Authority order: system and tool constraints, explicit user task")
             );
             assert!(rendered.contains("For authorized implementation work"));
-            assert!(rendered.contains("Match verification to the change's blast radius"));
+            assert!(
+                rendered.contains(
+                    "Verification earns its cost only when it can change your conclusion"
+                )
+            );
             assert!(!rendered.contains("For a greeting alone"));
             assert!(!rendered.contains("Use `project_checkpoint`"));
             assert!(!rendered.contains("## Capabilities and help"));
