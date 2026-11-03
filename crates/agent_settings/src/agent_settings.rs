@@ -335,7 +335,10 @@ pub fn language_model_to_selection(
         None => LanguageModelSelection {
             provider,
             model: model_name,
-            enable_thinking: model.supports_thinking(),
+            // Thinking adds a full reasoning pass to every model call. Default
+            // it off for a freshly selected model; the user can enable it per
+            // thread or profile when a task needs it.
+            enable_thinking: false,
             effort: model
                 .default_effort_level()
                 .map(|effort| effort.value.to_string()),

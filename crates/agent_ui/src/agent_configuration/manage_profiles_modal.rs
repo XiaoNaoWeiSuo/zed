@@ -266,7 +266,9 @@ impl ManageProfilesModal {
                                     profile.default_model = Some(LanguageModelSelection {
                                         provider: LanguageModelProviderSetting(provider.clone()),
                                         model: model_id.clone(),
-                                        enable_thinking: model.supports_thinking(),
+                                        // Keep new profile models fast by default;
+                                        // thinking can be enabled per model.
+                                        enable_thinking: false,
                                         effort: model
                                             .default_effort_level()
                                             .map(|effort| effort.value.to_string()),

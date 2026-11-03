@@ -9190,10 +9190,10 @@ mod internal_tests {
         // Verify enable_thinking was written to settings as true.
         let settings_content = fs.load(paths::settings_file()).await.unwrap();
         let settings_json: serde_json::Value = serde_json::from_str(&settings_content).unwrap();
-        assert_eq!(
-            settings_json["agent"]["default_model"]["enable_thinking"],
-            json!(true),
-            "selecting a thinking model should persist enable_thinking: true to settings"
+        // Selecting a model does not enable thinking implicitly.
+        assert!(
+            settings_json["agent"]["default_model"]["enable_thinking"] != json!(true),
+            "selecting a model should not enable thinking implicitly"
         );
     }
 
@@ -9255,13 +9255,13 @@ mod internal_tests {
             .await
             .unwrap();
 
-        // select_model should have enabled thinking based on the model's supports_thinking().
+        // select_model should leave thinking off; it is opt-in.
         agent.read_with(cx, |agent, _| {
             let session = agent.sessions.get(&session_id).unwrap();
             session.thread.read_with(cx, |thread, _| {
                 assert!(
-                    thread.thinking_enabled(),
-                    "select_model should enable thinking when model supports it"
+                    !thread.thinking_enabled(),
+                    "select_model should not enable thinking implicitly"
                 );
             });
         });
@@ -9384,16 +9384,12 @@ mod internal_tests {
             .await
             .unwrap();
 
-        // Verify thinking is enabled after selecting the thinking model.
+        // Thinking is opt-in; this test covers persistence, so enable it
+        // explicitly before the thread is saved.
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&session_id).unwrap().thread.clone()
         });
-        thread.read_with(cx, |thread, _| {
-            assert!(
-                thread.thinking_enabled(),
-                "thinking should be enabled after selecting thinking model"
-            );
-        });
+        thread.update(cx, |thread, cx| thread.set_thinking_enabled(true, cx));
 
         // Send a message so the thread gets persisted.
         let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Hello".into()], cx));
