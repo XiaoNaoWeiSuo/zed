@@ -5789,8 +5789,8 @@ impl Thread {
             ..Default::default()
         };
 
-        self.extend_checkpoint_context(&mut request.messages);
         self.extend_request_history_until(&mut request.messages, self.messages.len());
+        self.extend_checkpoint_context(&mut request.messages);
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -6298,6 +6298,10 @@ impl Thread {
         if let Some(message) = self.pending_message.as_ref() {
             messages.extend(message.to_request());
         }
+        // Keep checkpoint context out of the cached prefix: it is refreshed at
+        // the end of every edit/terminal turn, and placing it before the history
+        // would invalidate the provider's prefix cache on each turn.
+        self.extend_checkpoint_context(&mut messages);
         if let Some(context) = runtime_context {
             // Refresh volatile state without persisting or summarizing it as historical fact.
             messages.push(LanguageModelRequestMessage {
@@ -6511,7 +6515,6 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        self.extend_checkpoint_context(&mut messages);
         self.extend_request_history_until(&mut messages, end_ix);
 
         if let Some(last_message) = messages.last_mut() {
@@ -6680,6 +6683,8 @@ impl Thread {
             messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
             ..Default::default()
         };
+
+        self.extend_checkpoint_context(&mut request.messages);
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -10491,24 +10496,29 @@ mod tests {
                     .push(user_text_message(ClientUserMessageId::new(), "你好"));
                 let normal = thread.build_request_messages(Vec::new(), cx);
                 let compact = thread.build_compaction_request(thread.messages.len(), &model, cx);
-                assert_eq!(
-                    request_texts(&normal)[1],
-                    request_texts(&compact.messages)[1]
-                );
+                assert_eq!(request_texts(&normal)[1], "你好");
+                assert_eq!(request_texts(&compact.messages)[1], "你好");
                 thread.summary(cx)
             });
         cx.run_until_parked();
         let request = fake.pending_completions().pop().expect("summary request");
         let texts = request_texts(&request.messages);
-        let context = texts.first().expect("checkpoint context");
-        assert!(context.contains("automatically supplied by the harness"));
+        let context_ix = texts
+            .iter()
+            .position(|text| text.contains("automatically supplied by the harness"))
+            .expect("checkpoint context");
+        assert_eq!(
+            context_ix, 1,
+            "checkpoint context follows the history so it does not break the cached prefix"
+        );
+        let context = &texts[context_ix];
         assert!(context.contains("not authored by the user"));
         assert!(context.contains("does not replace the current user request"));
         assert!(context.contains("avoid repeating work already covered by applicable evidence"));
         assert!(context.contains("preserve this provenance"));
         assert!(context.contains("previous.work"));
         assert!(!context.contains("large evidence details"));
-        assert_eq!(texts[1], "你好");
+        assert_eq!(texts[0], "你好");
         fake.send_text(
             &model,
             &request,
