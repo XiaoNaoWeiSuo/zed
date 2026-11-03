@@ -9809,11 +9809,15 @@ impl ThreadView {
         let branch = store.update(cx, |store, cx| {
             store.branch_thread(snapshot, message_id, folder_paths.clone(), cx)
         });
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             match branch.await {
                 Ok(session_id) => {
-                    this.update_in(cx, |this, window, cx| {
-                        this.workspace.update(cx, |workspace, cx| {
+                    // Opening the branch retires this view, and retiring reads
+                    // every retained thread view. That cannot happen while this
+                    // view is leased by an `update_in`, so it runs unleased.
+                    let opened = cx.update(|window, cx| {
+                        workspace.update(cx, |workspace, cx| {
                             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                                 panel.update(cx, |panel, cx| {
                                     panel.open_thread(
@@ -9825,9 +9829,9 @@ impl ThreadView {
                                     );
                                 });
                             }
-                        })?;
-                        anyhow::Ok(())
-                    })??;
+                        })
+                    });
+                    opened??;
                 }
                 Err(error) => {
                     this.update(cx, |this, cx| this.handle_thread_error(error, cx))?;
@@ -16056,6 +16060,7 @@ pub(crate) fn open_link(
             }
             _ => mention,
         };
+        let workspace_for_thread_mention = workspace.downgrade();
         workspace.update(cx, |workspace, cx| match mention {
             MentionUri::File { abs_path } => {
                 open_abs_path_at_point(workspace, abs_path, None, window, cx);
@@ -16102,11 +16107,20 @@ pub(crate) fn open_link(
             }
             MentionUri::Selection { abs_path: None, .. } => {}
             MentionUri::Thread { id, name } => {
-                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.open_thread(id, None, Some(name.into()), window, cx)
-                    });
-                }
+                // Opening a thread retires this view, and retiring reads every
+                // retained thread view, which panics while this one is leased
+                // by the click handler's update.
+                let workspace = workspace_for_thread_mention.clone();
+                window.defer(cx, move |window, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_thread(id, None, Some(name.into()), window, cx)
+                        });
+                    }
+                });
             }
             MentionUri::Fetch { url } => {
                 cx.open_url(url.as_str());

@@ -7178,6 +7178,113 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_branching_a_thread_from_its_toolbar(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        // Stored messages are keyed `native-message-{message_ix}-{content_ix}`,
+        // which is what the branch button resolves before branching.
+        let messages: Vec<Arc<agent::Message>> = serde_json::from_value(json!([{
+            "Agent": {
+                "content": [{ "Text": "Selected response" }],
+                "tool_results": {},
+                "reasoning_details": null,
+            }
+        }]))
+        .expect("stored message should deserialize");
+        let session_id = acp_v2::SessionId::new("branch-source-session");
+        let thread_store = cx.update(|cx| ThreadStore::global(cx));
+        thread_store
+            .update(cx, |store, cx| {
+                store.save_thread(
+                    session_id.clone(),
+                    agent::DbThread {
+                        title: "Branch source".into(),
+                        messages,
+                        updated_at: Utc::now(),
+                        detailed_summary: None,
+                        initial_project_snapshot: None,
+                        cumulative_token_usage: Default::default(),
+                        request_token_usage: Default::default(),
+                        model: None,
+                        profile: None,
+                        subagent_context: None,
+                        speed: None,
+                        thinking_enabled: false,
+                        thinking_effort: None,
+                        draft_prompt: None,
+                        ui_scroll_position: None,
+                        sandboxed_terminal_temp_dir: None,
+                        sandbox_grants: Default::default(),
+                        goal: None,
+                        deferred_questions: Default::default(),
+                        permission_tier: Default::default(),
+                    },
+                    PathList::default(),
+                    cx,
+                )
+            })
+            .await
+            .expect("source thread should be saved");
+
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_thread(session_id, None, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel
+            .read_with(cx, |panel, cx| panel.active_thread_view(cx))
+            .expect("source thread should be open");
+        let entry_index = thread_view
+            .read_with(cx, |view, cx| {
+                view.thread.read(cx).entries().iter().position(|entry| {
+                    matches!(entry, acp_thread::AgentThreadEntry::AssistantMessage(_))
+                })
+            })
+            .expect("stored response should render as an assistant message");
+
+        // Opening the branch retires this view, and the retire path reads every
+        // retained thread view. Doing that while this view is leased panics
+        // with "cannot read ThreadView while it is already being updated".
+        thread_view.update_in(cx, |view, window, cx| {
+            view.branch_at_message(entry_index, window, cx);
+        });
+        cx.run_until_parked();
+
+        let branched = panel
+            .read_with(cx, |panel, cx| panel.active_thread_view(cx))
+            .expect("branched thread should be open");
+        assert_ne!(branched.entity_id(), thread_view.entity_id());
+        assert_eq!(
+            branched.read_with(cx, |view, cx| view.thread.read(cx).entries().len()),
+            1,
+            "branching from the only response keeps just that response"
+        );
+    }
+
+    #[gpui::test]
     async fn test_clicking_tool_call_output_keeps_agent_panel_focused_and_zoomed(
         cx: &mut TestAppContext,
     ) {
