@@ -1737,6 +1737,37 @@ async fn test_basic_tool_calls(cx: &mut TestAppContext) {
     });
 }
 
+#[test]
+fn test_tool_result_marks_streamed_tool_use_complete() {
+    let tool_use = LanguageModelToolUse {
+        id: "call-1".into(),
+        name: "edit_file".into(),
+        raw_input: r#"{"path":"src/main.rs"}"#.into(),
+        input: language_model::LanguageModelToolUseInput::Json(serde_json::json!({
+            "path": "src/main.rs"
+        })),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    let mut message = AgentMessage {
+        content: vec![
+            AgentMessageContent::Text("Editing".into()),
+            AgentMessageContent::ToolUse(tool_use.clone()),
+        ],
+        ..Default::default()
+    };
+
+    message.mark_tool_use_complete(&tool_use.id);
+
+    assert!(
+        matches!(
+            message.content.last(),
+            Some(AgentMessageContent::ToolUse(tool_use)) if tool_use.is_input_complete
+        ),
+        "recording a result should mark the streamed tool use as finished"
+    );
+}
+
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_streaming_tool_calls(cx: &mut TestAppContext) {
@@ -5820,6 +5851,8 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
     // The retry request should contain the streaming tool's error result,
     // proving the tool terminated and its result was forwarded.
     let completion = fake.pending_completions().pop().expect("No running turn");
+    let mut completed_tool_use = tool_use.clone();
+    completed_tool_use.is_input_complete = true;
     assert_eq!(
         completion.messages[1..],
         vec![
@@ -5831,7 +5864,9 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
             },
             LanguageModelRequestMessage {
                 role: Role::Assistant,
-                content: vec![language_model::MessageContent::ToolUse(tool_use.clone())],
+                content: vec![language_model::MessageContent::ToolUse(
+                    completed_tool_use.clone()
+                )],
                 cache: false,
                 reasoning_details: None,
             },
@@ -10719,6 +10754,8 @@ async fn test_streaming_tool_error_breaks_stream_loop_immediately(cx: &mut TestA
     let completions = fake.pending_completions();
     let last_completion = completions.last().unwrap();
 
+    let mut completed_tool_use = tool_use.clone();
+    completed_tool_use.is_input_complete = true;
     assert_eq!(
         last_completion.messages[1..],
         vec![
@@ -10730,7 +10767,9 @@ async fn test_streaming_tool_error_breaks_stream_loop_immediately(cx: &mut TestA
             },
             LanguageModelRequestMessage {
                 role: Role::Assistant,
-                content: vec![language_model::MessageContent::ToolUse(tool_use.clone())],
+                content: vec![language_model::MessageContent::ToolUse(
+                    completed_tool_use.clone()
+                )],
                 cache: false,
                 reasoning_details: None,
             },
@@ -10832,6 +10871,11 @@ async fn test_streaming_tool_error_waits_for_prior_tools_to_complete(cx: &mut Te
     let completions = fake.pending_completions();
     let last_completion = completions.last().unwrap();
 
+    let mut completed_first_tool_use = first_tool_use.clone();
+    completed_first_tool_use.is_input_complete = true;
+    let mut completed_second_tool_use = second_tool_use.clone();
+    completed_second_tool_use.is_input_complete = true;
+
     assert_eq!(
         last_completion.messages[1..],
         vec![
@@ -10846,8 +10890,8 @@ async fn test_streaming_tool_error_waits_for_prior_tools_to_complete(cx: &mut Te
             LanguageModelRequestMessage {
                 role: Role::Assistant,
                 content: vec![
-                    language_model::MessageContent::ToolUse(first_tool_use.clone()),
-                    language_model::MessageContent::ToolUse(second_tool_use.clone())
+                    language_model::MessageContent::ToolUse(completed_first_tool_use.clone()),
+                    language_model::MessageContent::ToolUse(completed_second_tool_use.clone())
                 ],
                 cache: false,
                 reasoning_details: None,

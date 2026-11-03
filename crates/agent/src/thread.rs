@@ -769,6 +769,18 @@ fn codeblock_tag(full_path: &Path, line_range: Option<&RangeInclusive<u32>>) -> 
 }
 
 impl AgentMessage {
+    /// Streamed tool inputs can keep streaming after the tool already ran, so
+    /// record completion once a result proves the call finished.
+    pub(crate) fn mark_tool_use_complete(&mut self, tool_use_id: &LanguageModelToolUseId) {
+        if let Some(AgentMessageContent::ToolUse(tool_use)) = self
+            .content
+            .iter_mut()
+            .rev()
+            .find(|content| matches!(content, AgentMessageContent::ToolUse(tool_use) if &tool_use.id == tool_use_id))
+        {
+            tool_use.is_input_complete = true;
+        }
+    }
     pub fn purpose(&self) -> acp_thread::AssistantMessagePurpose {
         match self
             .reasoning_details
@@ -5060,7 +5072,9 @@ impl Thread {
         this.update(cx, |this, cx| {
             // A cancelled turn can finish its tools after a successor has started.
             if &this.prompt_id == prompt_id {
-                this.pending_message()
+                let message = this.pending_message();
+                message.mark_tool_use_complete(&tool_result.tool_use_id);
+                message
                     .tool_results
                     .insert(tool_result.tool_use_id.clone(), tool_result);
                 return;
@@ -5092,6 +5106,7 @@ impl Thread {
             // Keep late terminal output on its frozen owner, never on a reused
             // message index after rewind or on the successor's pending message.
             let mut agent_message = agent_message.clone();
+            agent_message.mark_tool_use_complete(&tool_result.tool_use_id);
             agent_message
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result);
