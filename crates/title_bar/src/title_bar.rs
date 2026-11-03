@@ -1,4 +1,4 @@
-mod agent_usage;
+pub mod agent_usage;
 mod application_menu;
 mod title_bar_settings;
 
@@ -453,7 +453,7 @@ impl TitleBar {
 
         Self {
             platform_titlebar,
-            agent_usage: cx.new(AgentUsageIndicator::new),
+            agent_usage: cx.new(|cx| AgentUsageIndicator::new(window, cx)),
             application_menu,
             workspace: workspace.weak_handle(),
             multi_workspace,

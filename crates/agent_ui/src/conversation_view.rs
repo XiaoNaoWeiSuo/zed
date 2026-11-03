@@ -30,8 +30,8 @@ use gpui::{
     Action, Animation, AnimationExt, App, ClickEvent, ClipboardItem, CursorStyle, ElementId, Empty,
     Entity, EventEmitter, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
     PlatformDisplay, ScrollHandle, SharedString, StyledText, Subscription, Task, TextRun,
-    TextStyle, WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop,
-    linear_gradient, list, pulsating_between,
+    TextStyle, WeakEntity, Window, WindowHandle, WindowId, div, ease_in_out, img,
+    linear_color_stop, linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language};
 #[cfg(test)]
@@ -932,13 +932,18 @@ impl ConversationView {
             .and_then(|connected| connected.conversation.read(cx).updated_at)
     }
 
-    fn sync_active_session_metrics(&self, cx: &mut Context<Self>) {
+    fn sync_active_session_metrics(&self, window_id: WindowId, cx: &mut Context<Self>) {
+        let metrics = agent::run_metrics::AgentRunMetrics::global(cx);
         let Some(active_thread) = self.active_thread() else {
+            metrics.update(cx, |metrics, cx| {
+                metrics.clear_active_session(window_id, cx)
+            });
             return;
         };
         let session_id = active_thread.read(cx).session_id.to_string();
-        let metrics = agent::run_metrics::AgentRunMetrics::global(cx);
-        metrics.update(cx, |metrics, cx| metrics.set_active_session(session_id, cx));
+        metrics.update(cx, |metrics, cx| {
+            metrics.set_active_session(window_id, session_id, cx)
+        });
     }
 
     pub fn navigate_to_thread(
@@ -952,7 +957,7 @@ impl ConversationView {
         };
 
         connected.navigate_to_thread(session_id);
-        self.sync_active_session_metrics(cx);
+        self.sync_active_session_metrics(window.window_handle().window_id(), cx);
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
         }
@@ -3999,7 +4004,7 @@ impl ConversationView {
 
 impl Render for ConversationView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_active_session_metrics(cx);
+        self.sync_active_session_metrics(window.window_handle().window_id(), cx);
         self.sync_request_elicitation_states(window, cx);
         let request_elicitation_connection = self.request_elicitation_connection();
         let active_thread_renders_request_elicitations =

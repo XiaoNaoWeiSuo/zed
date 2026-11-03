@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Entity, Global};
+use gpui::{App, AppContext as _, Context, Entity, Global, WindowId};
 use language_model::LanguageModelProviderId;
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +43,12 @@ impl AgentMetricsSnapshot {
     }
 }
 
-/// Per-session metrics plus the currently viewed session.
+/// Per-session metrics plus the session each window is currently viewing.
 #[derive(Default)]
 pub struct AgentRunMetrics {
-    active_session: Option<String>,
+    /// Keyed by window so a detached companion window and its source window
+    /// do not overwrite each other's indicator state on every render.
+    active_sessions: HashMap<WindowId, String>,
     snapshots: HashMap<String, AgentMetricsSnapshot>,
 }
 
@@ -64,9 +66,9 @@ impl AgentRunMetrics {
         entity
     }
 
-    pub fn active_snapshot(&self) -> Option<&AgentMetricsSnapshot> {
-        self.active_session
-            .as_ref()
+    pub fn active_snapshot(&self, window_id: WindowId) -> Option<&AgentMetricsSnapshot> {
+        self.active_sessions
+            .get(&window_id)
             .and_then(|session_id| self.snapshots.get(session_id))
     }
 
@@ -74,11 +76,25 @@ impl AgentRunMetrics {
         self.snapshots.get(session_id)
     }
 
-    pub fn set_active_session(&mut self, session_id: String, cx: &mut Context<Self>) {
-        if self.active_session.as_deref() == Some(&session_id) {
+    /// Drops the window's indicator state when the window no longer displays
+    /// a conversation, so a detached thread's metrics do not linger in the
+    /// window it came from.
+    pub fn clear_active_session(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self.active_sessions.remove(&window_id).is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_active_session(
+        &mut self,
+        window_id: WindowId,
+        session_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_sessions.get(&window_id).map(String::as_str) == Some(session_id.as_str()) {
             return;
         }
-        self.active_session = Some(session_id.clone());
+        self.active_sessions.insert(window_id, session_id.clone());
         if !self.snapshots.contains_key(&session_id) {
             let kvp = KeyValueStore::global(cx);
             let key = format!("{METRICS_KEY_PREFIX}{session_id}");
@@ -133,5 +149,60 @@ impl AgentRunMetrics {
             .detach();
         }
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, WindowId};
+
+    fn snapshot(model: &str) -> AgentMetricsSnapshot {
+        AgentMetricsSnapshot {
+            model: Some(model.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    fn active_sessions_are_scoped_to_each_window(cx: &mut TestAppContext) {
+        let metrics = cx.new(|_| AgentRunMetrics::default());
+        let window_a = WindowId::from(1);
+        let window_b = WindowId::from(2);
+
+        cx.update(|cx| {
+            metrics.update(cx, |metrics, cx| {
+                metrics.update_session("session-a".to_string(), snapshot("a"), false, cx);
+                metrics.update_session("session-b".to_string(), snapshot("b"), false, cx);
+                metrics.set_active_session(window_a, "session-a".to_string(), cx);
+                metrics.set_active_session(window_b, "session-b".to_string(), cx);
+            });
+        });
+
+        metrics.read_with(cx, |metrics, _| {
+            assert_eq!(
+                metrics
+                    .active_snapshot(window_a)
+                    .and_then(|snapshot| snapshot.model.as_deref()),
+                Some("a"),
+                "each window must see its own conversation's metrics"
+            );
+            assert_eq!(
+                metrics
+                    .active_snapshot(window_b)
+                    .and_then(|snapshot| snapshot.model.as_deref()),
+                Some("b")
+            );
+        });
+
+        cx.update(|cx| {
+            metrics.update(cx, |metrics, cx| {
+                metrics.clear_active_session(window_a, cx);
+            });
+        });
+        metrics.read_with(cx, |metrics, _| {
+            assert!(metrics.active_snapshot(window_a).is_none());
+            assert!(metrics.active_snapshot(window_b).is_some());
+        });
     }
 }

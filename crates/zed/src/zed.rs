@@ -895,7 +895,12 @@ async fn initialize_agent_panel(
 
     workspace_handle.update_in(&mut cx, |_workspace, window, cx| {
         let workspace = cx.entity();
-        agent_ui::restore_detached_threads(&workspace, window, cx);
+        // Restoring loads a thread and detaches it into a companion window,
+        // which reads the workspace. That cannot run while this update holds
+        // the workspace lease.
+        window.defer(cx, move |window, cx| {
+            agent_ui::restore_detached_threads(&workspace, window, cx);
+        });
     })?;
 
     anyhow::Ok(())

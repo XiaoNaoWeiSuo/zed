@@ -10,6 +10,7 @@ use gpui::{
 };
 use project::Project;
 use serde::{Deserialize, Serialize};
+use title_bar::agent_usage::AgentUsageIndicator;
 use ui::{GradientFade, Tab, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{AppState, MultiWorkspace, Workspace};
@@ -27,6 +28,7 @@ pub struct CompanionWindow {
     title: SharedString,
     returned: bool,
     focus_handle: FocusHandle,
+    agent_usage: Entity<AgentUsageIndicator>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -54,6 +56,8 @@ impl CompanionWindow {
                 cx.notify();
             });
 
+        let agent_usage = cx.new(|cx| AgentUsageIndicator::new(window, cx));
+
         Self {
             conversation,
             thread_id,
@@ -63,6 +67,7 @@ impl CompanionWindow {
             title,
             returned: false,
             focus_handle: cx.focus_handle(),
+            agent_usage,
             _subscriptions: vec![subscription],
         }
     }
@@ -188,6 +193,7 @@ impl CompanionWindow {
             .children(running_tasks)
             .children(project_memory_button)
             .children(sandbox_status)
+            .child(self.agent_usage.clone())
             .child(
                 IconButton::new("return-to-main-window", IconName::ArrowLeft)
                     .icon_size(IconSize::Small)

@@ -21,6 +21,7 @@ test-support = [
     "reqwest_client",
     "workspace/test-support",
     "agent/test-support",
+    "title_bar/test-support",
 ]
 audio = ["dep:audio"]
 unit-eval = []
@@ -105,6 +106,7 @@ terminal_view.workspace = true
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+title_bar.workspace = true
 ui.workspace = true
 unicode-script.workspace = true
 unicode-segmentation.workspace = true
@@ -136,6 +138,7 @@ languages = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, "features" = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
+recent_projects = { workspace = true, features = ["test-support"] }
 remote = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 
@@ -146,3 +149,4 @@ reqwest_client.workspace = true
 tempfile.workspace = true
 vim.workspace = true
 terminal = { workspace = true, features = ["test-support"] }
+title_bar = { workspace = true, features = ["test-support"] }

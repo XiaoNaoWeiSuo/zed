@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use agent::run_metrics::AgentRunMetrics;
 use chrono::TimeZone as _;
 use gpui::{
-    Context, Entity, PathBuilder, Pixels, Render, Subscription, Task, Window, canvas, point, px,
+    Context, Entity, PathBuilder, Pixels, Render, Subscription, Task, Window, WindowId, canvas,
+    point, px,
 };
 use language_model::{
     LanguageModelProviderId, LanguageModelRegistry, ProviderUsage, ProviderUsageWindow,
@@ -14,6 +15,7 @@ const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Compact agent throughput metrics and the active provider's usage limits.
 pub struct AgentUsageIndicator {
+    window_id: WindowId,
     metrics: Entity<AgentRunMetrics>,
     usage: Option<ProviderUsage>,
     usage_provider: Option<LanguageModelProviderId>,
@@ -28,7 +30,8 @@ pub struct AgentUsageIndicator {
 }
 
 impl AgentUsageIndicator {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &Window, cx: &mut Context<Self>) -> Self {
+        let window_id = window.window_handle().window_id();
         let metrics = AgentRunMetrics::global(cx);
         let _metrics_subscription = cx.observe(&metrics, |this, _, cx| {
             this.refresh_usage(cx);
@@ -45,6 +48,7 @@ impl AgentUsageIndicator {
         });
 
         Self {
+            window_id,
             metrics,
             usage: None,
             usage_provider: None,
@@ -63,7 +67,7 @@ impl AgentUsageIndicator {
         let (running, provider_id, model) = {
             let metrics = self.metrics.read(cx);
             metrics
-                .active_snapshot()
+                .active_snapshot(self.window_id)
                 .map(|snapshot| {
                     (
                         snapshot.running,
@@ -437,7 +441,12 @@ impl AgentUsageIndicator {
 
 impl Render for AgentUsageIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(snapshot) = self.metrics.read(cx).active_snapshot().cloned() else {
+        let Some(snapshot) = self
+            .metrics
+            .read(cx)
+            .active_snapshot(self.window_id)
+            .cloned()
+        else {
             return div().into_any_element();
         };
         if !snapshot.running && snapshot.model.is_none() {
