@@ -165,20 +165,53 @@ fi
 
 GIT_VERSION="v2.43.3"
 GIT_VERSION_SHA="fa29823"
+GIT_TARBALL_SHA256_ARM64="f014b290f36d121bbc47b29b556044c4f6a2f6494cf78ed2eacfa501b77363b6"
+GIT_TARBALL_SHA256_X64="02fb29a47a07e9a7f841888661f32ebc80a56930864dd19b674d80ffc429c96d"
 
 function download_and_unpack() {
     local url=$1
     local path_to_unpack=$2
     local target_path=$3
+    local expected_sha256=$4
 
     temp_dir=$(mktemp -d)
+    local archive="$temp_dir/archive.tar.gz"
 
     if ! command -v curl &> /dev/null; then
         echo "curl is not installed. Please install curl to continue."
         exit 1
     fi
 
-    curl --silent --fail --location "$url" | tar -xvz -C "$temp_dir" -f - $path_to_unpack
+    # Downloads go through whatever proxy the environment configures, and a
+    # truncated transfer used to surface as "bin/git: Not found in archive".
+    # Retry, then verify the checksum so a partial archive fails with a useful
+    # message instead of a confusing tar error.
+    if ! curl --silent --fail --location \
+        --retry 5 --retry-delay 2 --retry-all-errors \
+        --connect-timeout 20 --max-time 600 \
+        "$url" -o "$archive"; then
+        echo "error: failed to download $url"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+
+    if [[ -n "$expected_sha256" ]]; then
+        local actual_sha256
+        actual_sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
+        if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+            echo "error: checksum mismatch for $url"
+            echo "  expected: $expected_sha256"
+            echo "  actual:   $actual_sha256"
+            rm -rf "$temp_dir"
+            exit 1
+        fi
+    fi
+
+    if ! tar -xzf "$archive" -C "$temp_dir" "$path_to_unpack"; then
+        echo "error: $url does not contain $path_to_unpack"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
 
     mv "$temp_dir/$path_to_unpack" "$target_path"
 
@@ -194,10 +227,10 @@ function download_git() {
 
     case "$architecture" in
         aarch64-apple-darwin)
-            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-arm64.tar.gz" bin/git ./git
+            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-arm64.tar.gz" bin/git ./git "$GIT_TARBALL_SHA256_ARM64"
             ;;
         x86_64-apple-darwin)
-            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-x64.tar.gz" bin/git ./git
+            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-x64.tar.gz" bin/git ./git "$GIT_TARBALL_SHA256_X64"
             ;;
         *)
             echo "Unsupported architecture: $architecture"
