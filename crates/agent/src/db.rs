@@ -240,9 +240,12 @@ impl DbThread {
             if let crate::Message::Agent(message) = message.as_ref() {
                 anyhow::ensure!(
                     message.content.iter().all(|content| match content {
+                        // A recorded result is what proves the call ran: streamed
+                        // tool inputs can persist as incomplete even after the
+                        // tool replied, which made otherwise finished threads
+                        // impossible to branch.
                         AgentMessageContent::ToolUse(tool_use) => {
-                            tool_use.is_input_complete
-                                && message.tool_results.contains_key(&tool_use.id)
+                            message.tool_results.contains_key(&tool_use.id)
                         }
                         _ => true,
                     }),
@@ -1086,6 +1089,69 @@ mod tests {
         assert!(source.reasoning_details.is_none());
     }
 
+    fn thread_with_tool_call(is_input_complete: bool, record_result: bool) -> DbThread {
+        let tool_use = language_model::LanguageModelToolUse {
+            id: "call-1".into(),
+            name: "edit_file".into(),
+            raw_input: r#"{"path":"src/main.rs"}"#.into(),
+            input: language_model::LanguageModelToolUseInput::Json(serde_json::json!({
+                "path": "src/main.rs"
+            })),
+            is_input_complete,
+            thought_signature: None,
+        };
+        let mut message = AgentMessage::default();
+        message.content = vec![
+            AgentMessageContent::Text("Applied the edit.".into()),
+            AgentMessageContent::ToolUse(tool_use.clone()),
+        ];
+        if record_result {
+            message.tool_results.insert(
+                tool_use.id.clone(),
+                language_model::LanguageModelToolResult {
+                    tool_use_id: tool_use.id.clone(),
+                    tool_name: tool_use.name.clone(),
+                    is_error: false,
+                    content: vec![language_model::LanguageModelToolResultContent::Text(
+                        "edited".into(),
+                    )],
+                    output: None,
+                },
+            );
+        }
+
+        let mut thread = make_thread("Source", Utc::now());
+        thread.messages = vec![
+            Arc::new(crate::Message::Agent(message)),
+            Arc::new(crate::Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text("Done.".into())],
+                ..Default::default()
+            })),
+        ];
+        thread
+    }
+
+    #[test]
+    fn test_branch_allows_finished_tool_call_with_streamed_input() {
+        let thread = thread_with_tool_call(false, true);
+        let branch = thread
+            .branch_at_message(&acp_v2::MessageId::new("native-message-1-0"))
+            .expect("a tool call with a recorded result is finished");
+        assert_eq!(branch.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_branch_rejects_tool_call_without_result() {
+        let thread = thread_with_tool_call(true, false);
+        let error = thread
+            .branch_at_message(&acp_v2::MessageId::new("native-message-1-0"))
+            .expect_err("an unfinished tool call still blocks branching");
+        assert!(
+            error.to_string().contains("unfinished tool call"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn test_branch_preserves_opaque_reasoning_only_at_complete_message_boundary() {
         for content_index in [0, 1] {
@@ -1181,17 +1247,17 @@ mod tests {
                 .messages
                 .push(Arc::new(crate::Message::Agent(agent_message)));
             let branch = thread.branch_at_message(&acp_v2::MessageId::new("native-message-0-1"));
-            if completed && input_complete {
-                let branch = branch.expect("completed tool can be branched");
+            if completed {
+                let branch = branch.expect("a tool call with a recorded result can be branched");
                 let crate::Message::Agent(message) = branch.messages[0].as_ref() else {
                     panic!("expected agent message");
                 };
                 assert_eq!(message.content.len(), 2);
                 assert_eq!(message.tool_results.get(&tool_use.id), Some(&result));
-                assert_eq!(
-                    message.content[0],
-                    AgentMessageContent::ToolUse(tool_use.clone())
-                );
+                assert!(matches!(
+                    &message.content[0],
+                    AgentMessageContent::ToolUse(retained) if retained.id == tool_use.id
+                ));
             } else {
                 assert!(branch.is_err());
             }
