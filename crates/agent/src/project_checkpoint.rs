@@ -539,41 +539,112 @@ fn rank_scopes(
     scopes
 }
 
+/// Reduces stored checkpoint records to the small digest that is injected into
+/// every request. Full records, evidence, and file lists stay on disk and are
+/// read on demand through `project_checkpoint`, so the injected payload does
+/// not grow with the checkpoint history.
 pub fn checkpoint_model_context(context: &str) -> String {
-    fn compact(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(fields) => {
-                if let Some(evidence) = fields.remove("evidence") {
-                    fields.insert(
-                        "evidence_available_on_demand".into(),
-                        serde_json::json!(
-                            evidence
-                                .as_array()
-                                .is_some_and(|entries| !entries.is_empty())
-                        ),
-                    );
-                }
-                for value in fields.values_mut() {
-                    compact(value);
-                }
-            }
-            serde_json::Value::Array(entries) => {
-                for value in entries {
-                    compact(value);
-                }
-            }
-            _ => {}
-        }
-    }
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(context) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(context) else {
         return serde_json::json!({"checkpoint_unavailable": true, "reason": "Invalid checkpoint context; read the saved scope if needed"}).to_string();
     };
-    compact(&mut value);
-    let context = value.to_string();
-    if context.chars().count() > 16_000 {
-        return serde_json::json!({"handoff_details_omitted": true, "reason": "Checkpoint context exceeds the model budget; use project_checkpoint list/read if relevant"}).to_string();
+    if let Ok(digest) = serde_json::to_string(&checkpoint_digest(value, true))
+        && digest.chars().count() <= 6_000
+    {
+        return digest;
     }
-    context
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(context)
+        && let Ok(digest) = serde_json::to_string(&checkpoint_digest(value, false))
+        && digest.chars().count() <= 6_000
+    {
+        return digest;
+    }
+    serde_json::json!({
+        "checkpoint_digest": true,
+        "checkpoint_unavailable": true,
+        "reason": "Checkpoint context is too large; use project_checkpoint read/list",
+    })
+    .to_string()
+}
+
+fn checkpoint_digest(value: serde_json::Value, include_lists: bool) -> serde_json::Value {
+    let serde_json::Value::Array(sections) = value else {
+        return value;
+    };
+    let mut roots = Vec::new();
+    for section in sections {
+        let serde_json::Value::Object(mut fields) = section else {
+            continue;
+        };
+        if fields.contains_key("additional_roots_omitted") {
+            roots.push(serde_json::Value::Object(fields));
+            continue;
+        }
+        let mut digest = serde_json::Map::new();
+        for key in [
+            "root",
+            "scope",
+            "created_at",
+            "record_kind",
+            "interrupted",
+            "branch",
+            "current_revision_changed",
+            "current_branch_changed",
+            "historical_state",
+            "checkpoint_unavailable",
+            "available_scope_count",
+            "more_scopes_available",
+            "evidence_count",
+        ] {
+            if let Some(value) = fields.remove(key) {
+                digest.insert(key.into(), value);
+            }
+        }
+        for key in ["completed", "remaining", "decisions", "next_steps"] {
+            if let Some(entries) = fields
+                .remove(key)
+                .and_then(|value| value.as_array().cloned())
+            {
+                if entries.is_empty() {
+                    continue;
+                }
+                digest.insert(format!("{key}_count"), entries.len().into());
+                if include_lists {
+                    let kept = entries.into_iter().take(3).collect::<Vec<_>>();
+                    digest.insert(key.into(), serde_json::Value::Array(kept));
+                }
+            }
+        }
+        if let Some(entries) = fields
+            .remove("changed_files")
+            .and_then(|value| value.as_array().cloned())
+            && !entries.is_empty()
+        {
+            digest.insert("changed_files_count".into(), entries.len().into());
+            if include_lists {
+                digest.insert(
+                    "changed_files".into(),
+                    serde_json::Value::Array(entries.into_iter().take(5).collect()),
+                );
+            }
+        }
+        if let Some(scopes) = fields
+            .remove("available_scopes")
+            .and_then(|value| value.as_array().cloned())
+            && !scopes.is_empty()
+        {
+            digest.insert(
+                "available_scopes".into(),
+                serde_json::Value::Array(scopes.into_iter().take(2).collect()),
+            );
+        }
+        digest.insert("checkpoint_digest".into(), true.into());
+        digest.insert(
+            "details_available_via".into(),
+            "project_checkpoint read/list".into(),
+        );
+        roots.push(serde_json::Value::Object(digest));
+    }
+    serde_json::Value::Array(roots)
 }
 
 pub fn load_checkpoint_context(roots: &[CheckpointRoot]) -> Result<Option<String>> {
@@ -1937,28 +2008,14 @@ mod tests {
         assert_eq!(entry["more_scopes_available"], false);
         assert_eq!(entry["historical_state"], true);
         assert_eq!(entry["record_kind"], "task_handoff");
-        assert_eq!(
-            entry["recent_context_compaction"]["scope"],
-            compaction.scope
-        );
-        assert_eq!(
-            entry["recent_context_compaction"]["created_at"],
-            serde_json::to_value(compaction.created_at)?
-        );
-        assert_eq!(
-            entry["recent_context_compaction"]["record_kind"],
-            "context_compaction"
-        );
-        assert_eq!(
-            entry["recent_context_compaction"]["summary"],
-            serde_json::to_value(&compaction.decisions)?
-        );
+        assert_eq!(entry["checkpoint_digest"], true);
+        assert!(entry.get("recent_context_compaction").is_none());
         assert!(!session_context.contains("unrelated-"));
         Ok(())
     }
 
     #[test]
-    fn model_context_keeps_handoff_but_expands_evidence_only_on_demand() -> Result<()> {
+    fn model_context_injects_a_digest_and_reads_details_on_demand() -> Result<()> {
         let original = serde_json::json!([{
             "root": "project", "scope": "agent", "created_at": "historical time",
             "remaining": ["Verify recovery"],
@@ -1969,18 +2026,19 @@ mod tests {
         let projected: serde_json::Value = serde_json::from_str(&projected)?;
         assert_eq!(projected[0]["scope"], "agent");
         assert_eq!(projected[0]["remaining"][0], "Verify recovery");
+        assert_eq!(projected[0]["remaining_count"], 1);
         assert_eq!(projected[0]["created_at"], "historical time");
-        assert_eq!(projected[0]["evidence_available_on_demand"], true);
+        assert_eq!(projected[0]["checkpoint_digest"], true);
         assert_eq!(
-            projected[0]["recent_automatic_checkpoint"]["evidence_available_on_demand"],
-            true
+            projected[0]["details_available_via"],
+            "project_checkpoint read/list"
         );
         assert!(!projected.to_string().contains("session:old"));
         assert!(original[0]["evidence"].is_array());
         let oversized = serde_json::json!({"remaining": ["x".repeat(20_000)]});
         let bounded: serde_json::Value =
             serde_json::from_str(&checkpoint_model_context(&oversized.to_string()))?;
-        assert_eq!(bounded["handoff_details_omitted"], true);
+        assert_eq!(bounded["checkpoint_unavailable"], true);
         let invalid: serde_json::Value =
             serde_json::from_str(&checkpoint_model_context("invalid"))?;
         assert_eq!(invalid["checkpoint_unavailable"], true);
