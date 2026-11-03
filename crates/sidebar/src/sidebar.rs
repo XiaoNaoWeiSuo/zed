@@ -8170,12 +8170,25 @@ fn all_thread_infos_for_workspace(
     cx: &App,
 ) -> impl Iterator<Item = ActiveThreadInfo> {
     let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
-        return None.into_iter().flatten();
+        return Vec::new().into_iter();
     };
     let agent_panel = agent_panel.read(cx);
+
+    // Threads detached into companion windows are no longer held by the
+    // panel, but they are still live and must keep their sidebar status.
+    let detached_views = agent_ui::detached_conversation_views(cx)
+        .into_iter()
+        .filter(|(source_workspace, _)| {
+            source_workspace
+                .upgrade()
+                .is_some_and(|source_workspace| source_workspace == *workspace)
+        })
+        .map(|(_, conversation_view)| conversation_view);
+
     let threads = agent_panel
         .conversation_views()
         .into_iter()
+        .chain(detached_views)
         .filter_map(|conversation_view| {
             let has_pending_tool_call = conversation_view
                 .read(cx)
@@ -8222,9 +8235,10 @@ fn all_thread_infos_for_workspace(
                 has_pending_question,
                 diff_stats,
             })
-        });
+        })
+        .collect::<Vec<_>>();
 
-    Some(threads).into_iter().flatten()
+    threads.into_iter()
 }
 
 pub fn dump_workspace_info(

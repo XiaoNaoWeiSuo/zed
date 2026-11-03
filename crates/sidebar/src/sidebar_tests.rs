@@ -4580,6 +4580,57 @@ async fn test_parallel_threads_shown_with_live_status(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_detached_thread_keeps_running_status_in_sidebar(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+
+    let session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    cx.run_until_parked();
+
+    let thread_id = panel.read_with(cx, |panel, cx| {
+        panel.active_thread_id(cx).expect("active thread")
+    });
+    assert!(
+        visible_entries_as_strings(&sidebar, cx)
+            .iter()
+            .any(|entry| entry.contains("(running)")),
+        "the attached thread should report its running status"
+    );
+
+    panel
+        .update_in(cx, |panel, window, cx| {
+            panel.detach_active_thread(window, cx)
+        })
+        .expect("detaching the thread should succeed");
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let entry = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id => Some(thread),
+                _ => None,
+            })
+            .expect("the detached thread should still appear in the sidebar");
+        assert!(entry.is_live, "detached thread should stay live");
+        assert_eq!(
+            entry.status,
+            AgentThreadStatus::Running,
+            "detached thread should keep reporting that it is running"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     cx: &mut TestAppContext,
 ) {

@@ -504,6 +504,32 @@ pub fn detached_thread_window(
     window.update(cx, |_, _, _| ()).ok().map(|()| window)
 }
 
+/// Conversation views owned by companion windows, paired with the workspace
+/// they were detached from. The sidebar uses this to keep reporting live
+/// status for threads that no panel holds any more.
+pub fn detached_conversation_views(
+    cx: &App,
+) -> Vec<(WeakEntity<Workspace>, Entity<ConversationView>)> {
+    let Some(threads) = cx.try_global::<DetachedThreads>() else {
+        return Vec::new();
+    };
+    threads
+        .entries
+        .values()
+        .filter_map(|entry| {
+            entry
+                .window
+                .read_with(cx, |companion, _cx| {
+                    (
+                        companion.source_workspace.clone(),
+                        companion.conversation.clone(),
+                    )
+                })
+                .ok()
+        })
+        .collect()
+}
+
 fn register_detached_thread(thread: DetachedThread, cx: &mut App) {
     init_detached_threads(cx);
     cx.global_mut::<DetachedThreads>()
