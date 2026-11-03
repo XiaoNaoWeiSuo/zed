@@ -935,6 +935,9 @@ pub struct ThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    pending_elicitation_page: usize,
+    pending_elicitation_focus: FocusHandle,
+    autofocused_pending_elicitation: Option<(ElicitationEntryId, usize)>,
     checkpoint_card_visible: bool,
     checkpoint_evidence_request_id: usize,
     checkpoint_evidence_text: Option<String>,
@@ -1533,6 +1536,9 @@ impl ThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            pending_elicitation_page: 0,
+            pending_elicitation_focus: cx.focus_handle(),
+            autofocused_pending_elicitation: None,
             checkpoint_card_visible: false,
             checkpoint_evidence_request_id: 0,
             checkpoint_evidence_text: None,
@@ -9261,7 +9267,7 @@ impl ThreadView {
                     }
                     if should_render_elicitation(elicitation) {
                         let elicitation =
-                            self.render_elicitation(entry_ix, elicitation, window, cx);
+                            self.render_elicitation(entry_ix, elicitation, None, window, cx);
 
                         if let Some(handle) = self
                             .entry_view_state
@@ -9456,66 +9462,204 @@ impl ThreadView {
         &self,
         entry_ix: usize,
         elicitation: &Elicitation,
+        max_height: Option<Pixels>,
         _window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        ElicitationCard::new(
+        let card = ElicitationCard::new(
             entry_ix,
             elicitation,
             self.agent_display_name.clone(),
             self.elicitation_form_states.get(&elicitation.id),
             self.elicitation_card_handlers(cx),
-        )
-        .render(cx)
+        );
+        match max_height {
+            Some(max_height) => card.max_height(max_height).render(cx),
+            None => card.render(cx),
+        }
+    }
+
+    pub(crate) fn first_field_focus_handle(
+        &self,
+        elicitation_id: &ElicitationEntryId,
+        cx: &App,
+    ) -> Option<FocusHandle> {
+        let thread = self.thread.read(cx);
+        let (_, elicitation) = thread.elicitation(elicitation_id)?;
+        let acp_v2::ElicitationMode::Form(mode) = &elicitation.request.mode else {
+            return None;
+        };
+        let state = self.elicitation_form_states.get(elicitation_id)?;
+        state.first_text_field_focus_handle(&mode.requested_schema, cx)
     }
 
     /// Pending questions live above the composer so later transcript activity
-    /// cannot scroll them out of view.
+    /// cannot scroll them out of view. Only one question is shown at a time;
+    /// stacking them made the actions unreachable on short windows.
     fn render_pending_elicitations(
-        &self,
-        window: &Window,
-        cx: &Context<Self>,
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let thread = self.thread.read(cx);
-        let pending = thread
-            .entries()
-            .iter()
-            .enumerate()
-            .filter_map(|(entry_ix, entry)| {
-                let AgentThreadEntry::Elicitation(elicitation_id) = entry else {
-                    return None;
-                };
-                let (_, elicitation) = thread.elicitation(elicitation_id)?;
-                (matches!(elicitation.status, ElicitationStatus::Pending { .. })
-                    && should_render_elicitation(elicitation))
-                .then_some((entry_ix, elicitation))
-            })
-            .collect::<Vec<_>>();
+        let pending = {
+            let thread = self.thread.read(cx);
+            thread
+                .entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(entry_ix, entry)| {
+                    let AgentThreadEntry::Elicitation(elicitation_id) = entry else {
+                        return None;
+                    };
+                    let (_, elicitation) = thread.elicitation(elicitation_id)?;
+                    (matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        && should_render_elicitation(elicitation))
+                    .then(|| (entry_ix, elicitation.id.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
         if pending.is_empty() {
+            self.pending_elicitation_page = 0;
+            self.autofocused_pending_elicitation = None;
             return None;
         }
-        let entry_view_state = self.entry_view_state.read(cx);
 
+        let total = pending.len();
+        if self.pending_elicitation_page >= total {
+            self.pending_elicitation_page = total - 1;
+        }
+        let page = self.pending_elicitation_page;
+        let (entry_ix, elicitation_id) = pending[page].clone();
+
+        // Focusing a question when it appears keeps Enter and Tab working
+        // without having to click into the form first.
+        let already_focused = self
+            .autofocused_pending_elicitation
+            .as_ref()
+            .is_some_and(|(id, focused_page)| id == &elicitation_id && *focused_page == page);
+        if !already_focused {
+            self.autofocused_pending_elicitation = Some((elicitation_id.clone(), page));
+            if let Some(field_focus) = self.first_field_focus_handle(&elicitation_id, cx) {
+                let focus_id = elicitation_id.clone();
+                cx.defer_in(window, move |this, window, cx| {
+                    let still_pending = {
+                        let thread = this.thread.read(cx);
+                        thread
+                            .elicitation(&focus_id)
+                            .is_some_and(|(_, elicitation)| {
+                                matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                            })
+                    };
+                    if still_pending {
+                        window.focus(&field_focus, cx);
+                    }
+                });
+            }
+        }
+
+        let max_height = {
+            let desired = window.viewport_size().height * 0.45;
+            if desired < px(240.) {
+                px(240.)
+            } else if desired > px(560.) {
+                px(560.)
+            } else {
+                desired
+            }
+        };
+        let pager_height = if total > 1 { px(28.) } else { px(0.) };
+
+        let pager = (total > 1).then(|| {
+            h_flex()
+                .debug_selector(|| "pending-elicitation-pager".to_string())
+                .w_full()
+                .gap_1()
+                .items_center()
+                .px_2()
+                .child(
+                    Label::new(format!("Question {} of {}", page + 1, total))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .debug_selector(|| "pending-elicitation-previous".to_string())
+                        .child(
+                            IconButton::new("pending-elicitation-prev", IconName::ChevronLeft)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .alpha(if page == 0 { 0.35 } else { 1.0 })
+                                .tooltip(Tooltip::text("Previous Question"))
+                                .when(page > 0, |this| {
+                                    this.on_click(cx.listener(|this, _, _, cx| {
+                                        this.pending_elicitation_page =
+                                            this.pending_elicitation_page.saturating_sub(1);
+                                        cx.notify();
+                                    }))
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "pending-elicitation-next".to_string())
+                        .child(
+                            IconButton::new("pending-elicitation-next", IconName::ChevronRight)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .alpha(if page + 1 >= total { 0.35 } else { 1.0 })
+                                .tooltip(Tooltip::text("Next Question"))
+                                .when(page + 1 < total, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.pending_elicitation_page =
+                                            (this.pending_elicitation_page + 1).min(total - 1);
+                                        cx.notify();
+                                    }))
+                                }),
+                        ),
+                )
+                .into_any_element()
+        });
+
+        let thread = self.thread.read(cx);
+        let (_, elicitation) = thread.elicitation(&elicitation_id)?;
+        let entry_view_state = self.entry_view_state.read(cx);
+        let card = self.render_elicitation(
+            entry_ix,
+            elicitation,
+            Some(max_height - pager_height),
+            window,
+            cx,
+        );
+        let card = if let Some(handle) = entry_view_state
+            .entry(entry_ix)
+            .and_then(|entry| entry.focus_handle(cx))
+        {
+            card.track_focus(&handle).into_any()
+        } else {
+            card.into_any()
+        };
+
+        let submit_id = elicitation_id.clone();
         Some(
             v_flex()
                 .id("pending-elicitations")
+                .debug_selector(|| "pending-elicitations".to_string())
                 .w_full()
-                .max_h(px(320.))
-                .overflow_y_scroll()
-                .gap_2()
-                .px_2()
-                .pb_2()
-                .children(pending.into_iter().map(|(entry_ix, elicitation)| {
-                    let card = self.render_elicitation(entry_ix, elicitation, window, cx);
-                    if let Some(handle) = entry_view_state
-                        .entry(entry_ix)
-                        .and_then(|entry| entry.focus_handle(cx))
-                    {
-                        card.track_focus(&handle).into_any()
-                    } else {
-                        card.into_any()
-                    }
+                .max_h(max_height)
+                .track_focus(&self.pending_elicitation_focus)
+                .key_context("Elicitation")
+                .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                    this.submit_elicitation(submit_id.clone(), window, cx);
                 }))
+                .gap_2()
+                .pb_2()
+                .children(pager)
+                .child(
+                    div()
+                        .debug_selector(move || format!("pending-elicitation-page-{page}"))
+                        .child(card),
+                )
                 .into_any_element(),
         )
     }

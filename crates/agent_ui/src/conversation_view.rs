@@ -7386,6 +7386,99 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_pending_questions_page_one_at_a_time(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = PreloadedElicitationConnection::default();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id),
+                            acp_v2::ElicitationSchema::new().string("answer", true),
+                        ),
+                        "Second question",
+                    ),
+                    cx,
+                )
+                .expect("second question should be accepted")
+                .detach();
+        });
+        cx.run_until_parked();
+
+        let elicitation_entries = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(entry_ix, entry)| {
+                    matches!(entry, acp_thread::AgentThreadEntry::Elicitation(_))
+                        .then_some(entry_ix)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(elicitation_entries.len(), 2, "two questions are pending");
+        assert!(cx.debug_bounds("pending-elicitations").is_some());
+        assert!(cx.debug_bounds("pending-elicitation-pager").is_some());
+
+        let first_card = "pending-elicitation-page-0";
+        let second_card = "pending-elicitation-page-1";
+        assert!(cx.debug_bounds(first_card).is_some());
+        assert!(
+            cx.debug_bounds(second_card).is_none(),
+            "questions are paged instead of stacked"
+        );
+
+        let next_button = cx
+            .debug_bounds("pending-elicitation-next")
+            .expect("next question button");
+        cx.simulate_click(next_button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds(first_card).is_none());
+        assert!(cx.debug_bounds(second_card).is_some());
+    }
+
+    #[gpui::test]
+    async fn test_pending_question_takes_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = PreloadedElicitationConnection::default();
+        let elicitation_id = connection.elicitation_id.clone();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.run_until_parked();
+
+        let elicitation_id = elicitation_id
+            .lock()
+            .clone()
+            .expect("connection should preload an elicitation");
+        let thread_view = conversation_view
+            .read_with(cx, |view, _| view.root_thread_view())
+            .expect("root thread view");
+        let first_field = thread_view
+            .read_with(cx, |view, cx| {
+                view.first_field_focus_handle(&elicitation_id, cx)
+            })
+            .expect("question should have a text field");
+        cx.update(|window, _| {
+            assert!(
+                first_field.is_focused(window),
+                "a pinned question should take focus so Enter and Tab work"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_resume_without_history_adds_notice(cx: &mut TestAppContext) {
         init_test(cx);
 

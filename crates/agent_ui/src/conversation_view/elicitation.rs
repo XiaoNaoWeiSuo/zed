@@ -11,7 +11,10 @@ use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
 use editor::Editor;
 use futures::channel::oneshot;
-use gpui::{AnyElement, App, Div, Empty, Entity, Focusable, Role, SharedString, Window, div};
+use gpui::{
+    AnyElement, App, Div, Empty, Entity, FocusHandle, Focusable, Pixels, Role, SharedString,
+    Window, div,
+};
 use project::Project;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -127,6 +130,21 @@ pub(crate) struct ElicitationFormState {
 }
 
 impl ElicitationFormState {
+    /// The focus handle of the first text field in schema order, so a newly
+    /// shown question can take focus before the user clicks into it.
+    pub(crate) fn first_text_field_focus_handle(
+        &self,
+        schema: &acp::ElicitationSchema,
+        cx: &App,
+    ) -> Option<FocusHandle> {
+        schema
+            .properties
+            .iter()
+            .find_map(|(name, _)| match self.fields.get(name) {
+                Some(ElicitationFieldState::Text(editor)) => Some(editor.focus_handle(cx)),
+                _ => None,
+            })
+    }
     pub(crate) fn new(schema: &acp::ElicitationSchema, window: &mut Window, cx: &mut App) -> Self {
         Self::new_with_context(schema, None, window, cx)
     }
@@ -1975,6 +1993,7 @@ pub(crate) struct ElicitationCard<'a> {
     requester_name: SharedString,
     form_state: Option<&'a ElicitationFormState>,
     handlers: ElicitationCardHandlers,
+    max_height: Option<Pixels>,
 }
 
 impl<'a> ElicitationCard<'a> {
@@ -1991,7 +2010,15 @@ impl<'a> ElicitationCard<'a> {
             requester_name,
             form_state,
             handlers,
+            max_height: None,
         }
+    }
+
+    /// Caps the card's height and scrolls the body, so the actions stay
+    /// reachable on short windows and tall forms.
+    pub(crate) fn max_height(mut self, max_height: Pixels) -> Self {
+        self.max_height = Some(max_height);
+        self
     }
 
     pub(crate) fn render(self, cx: &App) -> Div {
@@ -2031,10 +2058,19 @@ impl<'a> ElicitationCard<'a> {
             }
             _ => body,
         };
+        let max_height = self.max_height;
+        let entry_ix = self.entry_ix;
+        let body = div()
+            .id(("elicitation-body", self.entry_ix))
+            .when_some(max_height, |this, _| {
+                this.min_h_0().flex_1().overflow_y_scroll()
+            })
+            .child(body);
 
         v_flex()
             .key_context("Elicitation")
             .tab_group()
+            .debug_selector(move || format!("elicitation-card-{entry_ix}"))
             .on_action(|_: &menu::SelectNext, window, cx| window.focus_next(cx))
             .on_action(|_: &menu::SelectPrevious, window, cx| window.focus_prev(cx))
             .mx_5()
@@ -2043,6 +2079,9 @@ impl<'a> ElicitationCard<'a> {
             .border_1()
             .border_color(border_color)
             .overflow_hidden()
+            .when_some(max_height, |this, max_height| {
+                this.max_h(max_height).min_h_0()
+            })
             .child(
                 h_flex()
                     .h_8()
