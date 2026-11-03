@@ -2290,6 +2290,7 @@ impl Sidebar {
         if is_group_header_after_first {
             v_flex()
                 .w_full()
+                .pt_1()
                 .border_t_1()
                 .border_color(cx.theme().colors().border)
                 .child(rendered)
@@ -2369,13 +2370,19 @@ impl Sidebar {
             == WindowBackgroundAppearance::Opaque
             && sidebar_base_bg.a >= 1.0;
 
+        // Group headers sit one step above thread entries as labels rather
+        // than peers: smaller, semibold, muted, and led by a folder icon.
         let label = if highlight_positions.is_empty() {
             Label::new(label.clone())
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD)
                 .when(!is_active, |this| this.color(Color::Muted))
                 .when(!opaque_window, |this| this.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(label.clone(), highlight_positions.to_vec())
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD)
                 .when(!is_active, |this| this.color(Color::Muted))
                 .when(!opaque_window, |this| this.truncate())
                 .into_any_element()
@@ -2445,6 +2452,15 @@ impl Sidebar {
                     .min_w_0()
                     .w_full()
                     .gap_1()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(if is_active {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
                     .child(label)
                     .when_some(
                         self.render_remote_project_icon(ix, host.as_ref()),
@@ -6374,6 +6390,7 @@ impl Sidebar {
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .sidebar_compact(true)
+            .indent(px(18.))
             .question_pending(thread.has_pending_question && !is_renaming)
             .icon(icon)
             .when(is_draft, |this| {
@@ -6705,6 +6722,7 @@ impl Sidebar {
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
             .sidebar_compact(true)
+            .indent(px(18.))
             .single_line(true)
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))

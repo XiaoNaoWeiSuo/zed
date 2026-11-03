@@ -47,6 +47,7 @@ pub struct ThreadItem {
     title_generating: bool,
     question_pending: bool,
     sidebar_compact: bool,
+    indent: Option<Pixels>,
     single_line: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
@@ -85,6 +86,7 @@ impl ThreadItem {
             title_generating: false,
             question_pending: false,
             sidebar_compact: false,
+            indent: None,
             single_line: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
@@ -163,6 +165,12 @@ impl ThreadItem {
 
     pub fn sidebar_compact(mut self, compact: bool) -> Self {
         self.sidebar_compact = compact;
+        self
+    }
+
+    /// Left padding that visually nests the entry beneath its project header.
+    pub fn indent(mut self, indent: Pixels) -> Self {
+        self.indent = Some(indent);
         self
     }
 
@@ -520,6 +528,7 @@ impl RenderOnce for ThreadItem {
             .when(self.sidebar_compact, |this| this.py_0p5())
             .when(!self.sidebar_compact, |this| this.py_1())
             .px_1p5()
+            .when_some(self.indent, |this, indent| this.pl(indent))
             .when(self.selected, |s| s.bg(color.ghost_element_selected))
             .border_1()
             .border_r_2()
