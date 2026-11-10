@@ -181,8 +181,35 @@ pub(crate) struct ModelEditState {
     pub(crate) original_name: String,
     pub(crate) display_name: Entity<Editor>,
     pub(crate) max_tokens: Entity<Editor>,
+    pub(crate) max_output_tokens: Entity<Editor>,
+    pub(crate) max_completion_tokens: Entity<Editor>,
+    pub(crate) reasoning_effort: OpenAiReasoningEffort,
     pub(crate) supports_tools: ToggleState,
     pub(crate) supports_images: ToggleState,
+    pub(crate) supports_parallel_tool_calls: ToggleState,
+    pub(crate) supports_prompt_cache_key: ToggleState,
+    pub(crate) supports_chat_completions: ToggleState,
+    pub(crate) supports_thinking: ToggleState,
+    pub(crate) supports_prompt_caching: ToggleState,
+    pub(crate) interleaved_reasoning: ToggleState,
+    pub(crate) max_tokens_parameter: ToggleState,
+    pub(crate) error: Option<SharedString>,
+}
+
+struct ModelEditValues {
+    display_name: Option<String>,
+    max_tokens: u64,
+    max_output_tokens: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    reasoning_effort: Option<OpenAiReasoningEffort>,
+    tools: bool,
+    images: bool,
+    parallel_tool_calls: bool,
+    prompt_cache_key: bool,
+    chat_completions: bool,
+    prompt_caching: bool,
+    interleaved_reasoning: bool,
+    max_tokens_parameter: bool,
 }
 
 fn open_model_edit(
@@ -207,7 +234,7 @@ fn open_model_edit(
     } else {
         return;
     };
-    let (display_name, max_tokens, tools, images) = match kind {
+    let values = match kind {
         CompatibleProviderKind::OpenAi => {
             let configured = settings
                 .openai_compatible
@@ -218,12 +245,24 @@ fn open_model_edit(
                         .iter()
                         .find(|m| m.name == model.id.0.as_ref())
                 });
-            (
-                configured.and_then(|m| m.display_name.clone()),
-                configured.map_or(model.max_token_count, |m| m.max_tokens),
-                configured.map_or(true, |m| m.capabilities.tools),
-                configured.map_or(false, |m| m.capabilities.images),
-            )
+            ModelEditValues {
+                display_name: configured.and_then(|m| m.display_name.clone()),
+                max_tokens: configured.map_or(model.max_token_count, |m| m.max_tokens),
+                max_output_tokens: configured.and_then(|m| m.max_output_tokens),
+                max_completion_tokens: configured.and_then(|m| m.max_completion_tokens),
+                reasoning_effort: configured.and_then(|m| m.reasoning_effort),
+                tools: configured.map_or(true, |m| m.capabilities.tools),
+                images: configured.map_or(false, |m| m.capabilities.images),
+                parallel_tool_calls: configured
+                    .map_or(false, |m| m.capabilities.parallel_tool_calls),
+                prompt_cache_key: configured.map_or(false, |m| m.capabilities.prompt_cache_key),
+                chat_completions: configured.map_or(true, |m| m.capabilities.chat_completions),
+                prompt_caching: false,
+                interleaved_reasoning: configured
+                    .map_or(false, |m| m.capabilities.interleaved_reasoning),
+                max_tokens_parameter: configured
+                    .map_or(false, |m| m.capabilities.max_tokens_parameter),
+            }
         }
         CompatibleProviderKind::Anthropic => {
             let configured = settings
@@ -235,23 +274,64 @@ fn open_model_edit(
                         .iter()
                         .find(|m| m.name == model.id.0.as_ref())
                 });
-            (
-                configured.and_then(|m| m.display_name.clone()),
-                configured.map_or(model.max_token_count, |m| m.max_tokens),
-                configured.map_or(true, |m| m.capabilities.tools),
-                configured.map_or(false, |m| m.capabilities.images),
-            )
+            ModelEditValues {
+                display_name: configured.and_then(|m| m.display_name.clone()),
+                max_tokens: configured.map_or(model.max_token_count, |m| m.max_tokens),
+                max_output_tokens: configured.and_then(|m| m.max_output_tokens),
+                max_completion_tokens: None,
+                reasoning_effort: None,
+                tools: configured.map_or(true, |m| m.capabilities.tools),
+                images: configured.map_or(false, |m| m.capabilities.images),
+                parallel_tool_calls: false,
+                prompt_cache_key: false,
+                chat_completions: false,
+                prompt_caching: configured.map_or(false, |m| m.capabilities.prompt_caching),
+                interleaved_reasoning: false,
+                max_tokens_parameter: false,
+            }
         }
     };
+
+    let max_tokens = values.max_tokens.to_string();
+    let max_output_tokens = values.max_output_tokens.map(|tokens| tokens.to_string());
+    let max_completion_tokens = values
+        .max_completion_tokens
+        .map(|tokens| tokens.to_string());
+    let reasoning_effort = values
+        .reasoning_effort
+        .unwrap_or(OpenAiReasoningEffort::Medium);
 
     settings_window.model_edit = Some(ModelEditState {
         provider_id,
         kind,
         original_name: model.id.0.to_string(),
-        display_name: new_input("Display name", display_name.as_deref(), false, window, cx),
-        max_tokens: new_input("200000", Some(&max_tokens.to_string()), false, window, cx),
-        supports_tools: tools.into(),
-        supports_images: images.into(),
+        display_name: new_input(
+            "Display name",
+            values.display_name.as_deref(),
+            false,
+            window,
+            cx,
+        ),
+        max_tokens: new_input("200000", Some(&max_tokens), false, window, cx),
+        max_output_tokens: new_input("Optional", max_output_tokens.as_deref(), false, window, cx),
+        max_completion_tokens: new_input(
+            "Optional",
+            max_completion_tokens.as_deref(),
+            false,
+            window,
+            cx,
+        ),
+        reasoning_effort,
+        supports_tools: values.tools.into(),
+        supports_images: values.images.into(),
+        supports_parallel_tool_calls: values.parallel_tool_calls.into(),
+        supports_prompt_cache_key: values.prompt_cache_key.into(),
+        supports_chat_completions: values.chat_completions.into(),
+        supports_thinking: values.reasoning_effort.is_some().into(),
+        supports_prompt_caching: values.prompt_caching.into(),
+        interleaved_reasoning: values.interleaved_reasoning.into(),
+        max_tokens_parameter: values.max_tokens_parameter.into(),
+        error: None,
     });
     settings_window.push_dynamic_sub_page(
         format!("Edit {}", model.name.0),
@@ -267,12 +347,13 @@ fn open_model_edit(
 fn render_model_edit_page(
     settings_window: &SettingsWindow,
     scroll_handle: &ScrollHandle,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let Some(state) = settings_window.model_edit.as_ref() else {
         return div().into_any_element();
     };
+    let is_openai = matches!(state.kind, CompatibleProviderKind::OpenAi);
     v_flex()
         .size_full()
         .child(
@@ -295,37 +376,127 @@ fn render_model_edit_page(
                     &state.max_tokens,
                     cx,
                 ))
+                .child(render_form_field(
+                    "Max Output Tokens",
+                    "Optional. Leave empty to use the model default.",
+                    &state.max_output_tokens,
+                    cx,
+                ))
+                .when(is_openai, |this| {
+                    this.child(render_form_field(
+                        "Max Completion Tokens",
+                        "Optional. The maximum completion tokens for OpenAI-compatible requests.",
+                        &state.max_completion_tokens,
+                        cx,
+                    ))
+                })
                 .child(
-                    h_flex()
-                        .gap_4()
-                        .child(
-                            Checkbox::new("model-edit-tools", state.supports_tools.into())
-                                .label("Supports tools")
-                                .on_click(cx.listener(|this, checked: &ToggleState, _, cx| {
-                                    if let Some(state) = this.model_edit.as_mut() {
-                                        state.supports_tools = *checked;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Checkbox::new("model-edit-images", state.supports_images.into())
-                                .label("Supports images")
-                                .on_click(cx.listener(|this, checked: &ToggleState, _, cx| {
-                                    if let Some(state) = this.model_edit.as_mut() {
-                                        state.supports_images = *checked;
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
+                    v_flex()
+                        .gap_2()
+                        .child(render_model_edit_checkbox(
+                            "model-edit-tools",
+                            "Supports tools",
+                            state.supports_tools,
+                            |state, value| state.supports_tools = value,
+                            cx,
+                        ))
+                        .child(render_model_edit_checkbox(
+                            "model-edit-images",
+                            "Supports images",
+                            state.supports_images,
+                            |state, value| state.supports_images = value,
+                            cx,
+                        ))
+                        .when(is_openai, |this| {
+                            this.child(render_model_edit_checkbox(
+                                "model-edit-parallel-tool-calls",
+                                "Supports parallel_tool_calls",
+                                state.supports_parallel_tool_calls,
+                                |state, value| state.supports_parallel_tool_calls = value,
+                                cx,
+                            ))
+                            .child(render_model_edit_checkbox(
+                                "model-edit-prompt-cache-key",
+                                "Supports prompt_cache_key",
+                                state.supports_prompt_cache_key,
+                                |state, value| state.supports_prompt_cache_key = value,
+                                cx,
+                            ))
+                            .child(
+                                Label::new(
+                                    "Sends the conversation ID as prompt_cache_key so the provider can route repeated prefixes to the same cache.",
+                                )
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(render_model_edit_checkbox(
+                                "model-edit-chat-completions",
+                                "Supports /chat/completions",
+                                state.supports_chat_completions,
+                                |state, value| state.supports_chat_completions = value,
+                                cx,
+                            ))
+                            .child(
+                                Label::new(
+                                    "Disable to use the Responses API. The endpoint must support /v1/responses.",
+                                )
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(render_model_edit_checkbox(
+                                "model-edit-thinking",
+                                "Supports thinking",
+                                state.supports_thinking,
+                                |state, value| state.supports_thinking = value,
+                                cx,
+                            ))
+                            .when(state.supports_thinking.selected(), |this| {
+                                this.child(render_model_edit_reasoning_effort_selector(
+                                    state.reasoning_effort,
+                                    window,
+                                    cx,
+                                ))
+                                .when(state.supports_chat_completions.selected(), |this| {
+                                    this.child(render_model_edit_checkbox(
+                                        "model-edit-interleaved-reasoning",
+                                        "Preserves thinking in chat history",
+                                        state.interleaved_reasoning,
+                                        |state, value| state.interleaved_reasoning = value,
+                                        cx,
+                                    ))
+                                })
+                            })
+                            .when(state.supports_chat_completions.selected(), |this| {
+                                this.child(render_model_edit_checkbox(
+                                    "model-edit-max-tokens-parameter",
+                                    "Uses max_tokens for output limit",
+                                    state.max_tokens_parameter,
+                                    |state, value| state.max_tokens_parameter = value,
+                                    cx,
+                                ))
+                            })
+                        })
+                        .when(!is_openai, |this| {
+                            this.child(render_model_edit_checkbox(
+                                "model-edit-prompt-caching",
+                                "Sends prompt caching breakpoints",
+                                state.supports_prompt_caching,
+                                |state, value| state.supports_prompt_caching = value,
+                                cx,
+                            ))
+                        }),
                 )
+                .when_some(state.error.clone(), |this, error| {
+                    this.child(render_form_error(error))
+                })
                 .child(
                     h_flex()
                         .gap_1()
                         .child(Button::new("save-model", "Save").on_click(cx.listener(
                             |this, _, window, cx| {
-                                this.save_model_edit(cx);
-                                this.pop_sub_page(window, cx);
+                                if this.save_model_edit(cx) {
+                                    this.pop_sub_page(window, cx);
+                                }
                             },
                         )))
                         .child(Button::new("cancel-model", "Cancel").on_click(cx.listener(
@@ -340,19 +511,63 @@ fn render_model_edit_page(
 }
 
 impl SettingsWindow {
-    fn save_model_edit(&mut self, cx: &mut Context<Self>) {
+    fn save_model_edit(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(state) = self.model_edit.as_ref() else {
-            return;
+            return false;
         };
         let provider_id = state.provider_id.clone();
         let kind = state.kind;
         let name = state.original_name.clone();
         let display_name = state.display_name.read(cx).text(cx).trim().to_string();
-        let Ok(max_tokens) = state.max_tokens.read(cx).text(cx).trim().parse::<u64>() else {
-            return;
-        };
+        let max_tokens_text = state.max_tokens.read(cx).text(cx);
+        let max_output_tokens_text = state.max_output_tokens.read(cx).text(cx);
+        let max_completion_tokens_text = state.max_completion_tokens.read(cx).text(cx);
         let tools = state.supports_tools.selected();
         let images = state.supports_images.selected();
+        let parallel_tool_calls = state.supports_parallel_tool_calls.selected();
+        let prompt_cache_key = state.supports_prompt_cache_key.selected();
+        let chat_completions = state.supports_chat_completions.selected();
+        let supports_thinking = state.supports_thinking.selected();
+        let reasoning_effort = state.reasoning_effort;
+        let prompt_caching = state.supports_prompt_caching.selected();
+        let interleaved_reasoning = state.interleaved_reasoning.selected();
+        let max_tokens_parameter = state.max_tokens_parameter.selected();
+
+        let max_tokens = match parse_u64_field(max_tokens_text.trim(), "Context Window") {
+            Ok(max_tokens) => max_tokens,
+            Err(error) => {
+                if let Some(state) = self.model_edit.as_mut() {
+                    state.error = Some(error);
+                }
+                cx.notify();
+                return false;
+            }
+        };
+        let max_output_tokens =
+            match parse_optional_u64_field(max_output_tokens_text.trim(), "Max Output Tokens") {
+                Ok(max_output_tokens) => max_output_tokens,
+                Err(error) => {
+                    if let Some(state) = self.model_edit.as_mut() {
+                        state.error = Some(error);
+                    }
+                    cx.notify();
+                    return false;
+                }
+            };
+        let max_completion_tokens = match parse_optional_u64_field(
+            max_completion_tokens_text.trim(),
+            "Max Completion Tokens",
+        ) {
+            Ok(max_completion_tokens) => max_completion_tokens,
+            Err(error) => {
+                if let Some(state) = self.model_edit.as_mut() {
+                    state.error = Some(error);
+                }
+                cx.notify();
+                return false;
+            }
+        };
+
         let fs = <dyn fs::Fs>::global(cx);
         settings::update_settings_file(fs, cx, move |settings, _| {
             let language_models = settings.language_models.get_or_insert_default();
@@ -385,8 +600,18 @@ impl SettingsWindow {
                         .expect("model exists");
                     model.display_name = (!display_name.is_empty()).then_some(display_name);
                     model.max_tokens = max_tokens;
+                    model.max_output_tokens = max_output_tokens;
+                    model.max_completion_tokens = max_completion_tokens;
+                    model.reasoning_effort = supports_thinking.then_some(reasoning_effort);
                     model.capabilities.tools = tools;
                     model.capabilities.images = images;
+                    model.capabilities.parallel_tool_calls = parallel_tool_calls;
+                    model.capabilities.prompt_cache_key = prompt_cache_key;
+                    model.capabilities.chat_completions = chat_completions;
+                    model.capabilities.interleaved_reasoning =
+                        supports_thinking && chat_completions && interleaved_reasoning;
+                    model.capabilities.max_tokens_parameter =
+                        chat_completions && max_tokens_parameter;
                 }
                 CompatibleProviderKind::Anthropic => {
                     let Some(provider) = language_models
@@ -418,12 +643,15 @@ impl SettingsWindow {
                         .expect("model exists");
                     model.display_name = (!display_name.is_empty()).then_some(display_name);
                     model.max_tokens = max_tokens;
+                    model.max_output_tokens = max_output_tokens;
                     model.capabilities.tools = tools;
                     model.capabilities.images = images;
+                    model.capabilities.prompt_caching = prompt_caching;
                 }
             }
         });
         self.model_edit = None;
+        true
     }
 }
 
@@ -1113,6 +1341,7 @@ struct ModelInput {
     supports_prompt_cache_key: ToggleState,
     supports_chat_completions: ToggleState,
     supports_thinking: ToggleState,
+    supports_prompt_caching: ToggleState,
     interleaved_reasoning: ToggleState,
     max_tokens_parameter: ToggleState,
 }
@@ -1147,6 +1376,7 @@ impl ModelInput {
             supports_prompt_cache_key: prompt_cache_key.into(),
             supports_chat_completions: chat_completions.into(),
             supports_thinking: ToggleState::Unselected,
+            supports_prompt_caching: ToggleState::Unselected,
             interleaved_reasoning: interleaved_reasoning.into(),
             max_tokens_parameter: max_tokens_parameter.into(),
         }
@@ -1171,6 +1401,67 @@ fn new_input(
         }
         editor
     })
+}
+
+fn render_model_edit_checkbox(
+    id: &'static str,
+    label: &'static str,
+    state: ToggleState,
+    update: fn(&mut ModelEditState, ToggleState),
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    Checkbox::new(id, state).label(label).on_click(cx.listener(
+        move |this, checked, _window, cx| {
+            if let Some(state) = this.model_edit.as_mut() {
+                update(state, *checked);
+            }
+            cx.notify();
+        },
+    ))
+}
+
+fn render_model_edit_reasoning_effort_selector(
+    selected: OpenAiReasoningEffort,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let settings_window = cx.weak_entity();
+    let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+        for effort in OpenAiReasoningEffort::OPENAI_COMPATIBLE_SELECTABLE {
+            let is_selected = effort == selected;
+            let settings_window = settings_window.clone();
+            menu.push_item(
+                ui::ContextMenuEntry::new(effort.label())
+                    .toggleable(IconPosition::End, is_selected)
+                    .handler(move |_window, cx| {
+                        settings_window
+                            .update(cx, |this, cx| {
+                                if let Some(state) = this.model_edit.as_mut() {
+                                    state.reasoning_effort = effort;
+                                }
+                                cx.notify();
+                            })
+                            .log_err();
+                    }),
+            );
+        }
+        menu
+    });
+
+    v_flex()
+        .gap_1()
+        .child(Label::new("Default reasoning effort").size(LabelSize::Small))
+        .child(
+            DropdownMenu::new(
+                ElementId::Name("model-edit-reasoning-effort".into()),
+                selected.label(),
+                menu,
+            )
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .aria_label("Default reasoning effort"),
+        )
 }
 
 fn open_llm_provider_form(
@@ -1506,6 +1797,16 @@ fn render_model_capabilities(
                 })
             })
         })
+        .when(matches!(kind, CompatibleProviderKind::Anthropic), |this| {
+            this.child(render_capability_checkbox(
+                "supports-prompt-caching",
+                index,
+                "Sends prompt caching breakpoints",
+                model.supports_prompt_caching,
+                |model, state| model.supports_prompt_caching = state,
+                cx,
+            ))
+        })
 }
 
 fn render_capability_checkbox(
@@ -1629,6 +1930,7 @@ struct ModelValues {
     supports_prompt_cache_key: bool,
     supports_chat_completions: bool,
     supports_thinking: bool,
+    supports_prompt_caching: bool,
     interleaved_reasoning: bool,
     max_tokens_parameter: bool,
 }
@@ -1667,6 +1969,7 @@ fn save_llm_provider_form(
                     supports_prompt_cache_key: model.supports_prompt_cache_key.selected(),
                     supports_chat_completions: model.supports_chat_completions.selected(),
                     supports_thinking: model.supports_thinking.selected(),
+                    supports_prompt_caching: model.supports_prompt_caching.selected(),
                     interleaved_reasoning: model.interleaved_reasoning.selected(),
                     max_tokens_parameter: model.max_tokens_parameter.selected(),
                 })
@@ -1879,7 +2182,7 @@ fn parse_anthropic_model(
         capabilities: AnthropicCompatibleModelCapabilities {
             tools: model.supports_tools,
             images: model.supports_images,
-            prompt_caching: false,
+            prompt_caching: model.supports_prompt_caching,
         },
     })
 }
@@ -1887,5 +2190,15 @@ fn parse_anthropic_model(
 fn parse_u64_field(value: &str, name: &str) -> Result<u64, SharedString> {
     value
         .parse::<u64>()
+        .map_err(|_| format!("{name} must be a number").into())
+}
+
+fn parse_optional_u64_field(value: &str, name: &str) -> Result<Option<u64>, SharedString> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
         .map_err(|_| format!("{name} must be a number").into())
 }
