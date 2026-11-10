@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use crate::{AgentTool, SiblingThreadRequest, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
-/// Create a new agent thread that runs in parallel with this one.
+/// Create a new agent thread that runs in parallel with this one. Only use this
+/// after the user explicitly asks for or approves another thread. Pass `agent`
+/// and/or `model` to choose them explicitly; call `list_agents_and_models` for
+/// valid values, or omit both to use the user's defaults.
 ///
-/// Only use this after the user explicitly asks for or approves another thread.
 /// The new thread appears in the agent sidebar just like a thread the user created
 /// themselves, and runs independently — you will NOT receive its output and you
 /// cannot interact with it afterwards. Use `spawn_agent` instead if you need the

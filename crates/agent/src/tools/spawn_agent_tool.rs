@@ -16,7 +16,9 @@ use acp_thread::AgentModelId;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
-/// Spawn a sub-agent for a well-scoped task.
+/// Spawn a sub-agent for a well-scoped task. Pass `model` with an exact
+/// `list_agents_and_models` model ID to choose a different model; omit it to
+/// follow the configured subagent model or the parent model.
 ///
 /// ### Designing delegated subtasks
 /// - An agent does not see your conversation history. Include all relevant context (file paths, requirements, constraints) in the message.

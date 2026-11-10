@@ -9773,6 +9773,24 @@ mod tests {
     }
 
     #[test]
+    fn compact_delegation_descriptions_keep_model_selection() {
+        for description in [
+            SpawnAgentTool::description(),
+            CreateThreadTool::description(),
+        ] {
+            let compact = compact_tool_description(description.as_ref());
+            assert!(
+                compact.contains("`model`"),
+                "compacted description must mention model selection: {compact}"
+            );
+            assert!(
+                compact.contains("list_agents_and_models"),
+                "compacted description must point at model discovery: {compact}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_catalog_reduces_documentation_without_removing_tool_inputs() {
         let mut original_bytes = 0;
         let mut compact_bytes = 0;
