@@ -884,8 +884,12 @@ impl Sidebar {
                     this.subscribe_to_workspace(workspace, window, cx);
                     this.schedule_update_entries(false, cx);
                 }
-                MultiWorkspaceEvent::WorkspaceRemoved(_)
-                | MultiWorkspaceEvent::ProjectGroupsChanged => {
+                MultiWorkspaceEvent::WorkspaceRemoved(workspace_id) => {
+                    this.handle_workspace_removed(*workspace_id, cx);
+                    this.schedule_update_entries(false, cx);
+                }
+                MultiWorkspaceEvent::ProjectGroupsChanged => {
+                    this.clear_project_header_menu_handles();
                     this.schedule_update_entries(false, cx);
                 }
             },
@@ -1185,10 +1189,48 @@ impl Sidebar {
     fn sync_active_entry_from_active_workspace(&mut self, cx: &App) {
         let panel = self
             .active_workspace(cx)
-            .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx));
         if let Some(panel) = panel {
             self.sync_active_entry_from_panel(&panel, cx);
         }
+        if self.pending_thread_activation.is_none() && self.active_entry_is_stale(cx) {
+            self.active_entry = None;
+        }
+    }
+
+    fn active_entry_is_stale(&self, cx: &App) -> bool {
+        let Some(entry) = self.active_entry.as_ref() else {
+            return false;
+        };
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return true;
+        };
+        !multi_workspace
+            .read(cx)
+            .workspaces()
+            .any(|workspace| workspace == entry.workspace())
+    }
+
+    /// Cached project-header popovers are keyed by list row, and their builders
+    /// or deployed menus can capture workspace entities. Drop them whenever the
+    /// project set or ordering changes so a removed workspace cannot be kept
+    /// alive by a stale cache entry.
+    fn clear_project_header_menu_handles(&mut self) {
+        self.project_header_menu_handles.clear();
+        self.project_header_new_thread_menu_handles.clear();
+        self.project_header_menu_ix = None;
+    }
+
+    fn handle_workspace_removed(&mut self, workspace_id: EntityId, cx: &mut Context<Self>) {
+        if self
+            .active_entry
+            .as_ref()
+            .is_some_and(|entry| entry.workspace().entity_id() == workspace_id)
+        {
+            self.active_entry = None;
+        }
+        self.clear_project_header_menu_handles();
+        cx.notify();
     }
 
     /// When switching workspaces, the active panel may still be showing

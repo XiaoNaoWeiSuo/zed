@@ -313,14 +313,14 @@ pub enum Diff {
 impl Diff {
     pub fn finalized(
         path: String,
-        old_text: Option<String>,
+        old_text: Option<Arc<str>>,
         new_text: String,
         language_registry: Arc<LanguageRegistry>,
     ) -> Self {
         let base_text_exists = old_text.is_some();
         Self::Finalized(FinalizedDiff {
             path,
-            base_text: Arc::from(old_text.unwrap_or_default()),
+            base_text: old_text.unwrap_or_else(|| Arc::from("")),
             base_text_exists,
             state: FinalizedDiffState::Deferred(DeferredSource {
                 new_text,
@@ -433,7 +433,7 @@ impl Diff {
                         finalized.export_resolved(resolved, cx)
                     }
                     FinalizedDiffState::Deferred(deferred) => finalized
-                        .normalized_changed_text(deferred.new_text.clone())
+                        .normalized_changed_text(deferred.new_text.as_ref())
                         .unwrap_or_default(),
                 };
                 (Some(finalized.path.as_str().into()), buffer_text)
@@ -465,7 +465,7 @@ impl Diff {
                 }
                 FinalizedDiffState::Deferred(deferred) => *deferred.has_changes.get_or_init(|| {
                     finalized
-                        .normalized_changed_text(deferred.new_text.clone())
+                        .normalized_changed_text(deferred.new_text.as_ref())
                         .is_some()
                 }),
             },
@@ -722,7 +722,7 @@ impl FinalizedDiff {
         if resolved.populated.get() {
             return !resolved.multibuffer.read(cx).is_empty();
         }
-        self.normalized_changed_text(resolved.new_buffer.read(cx).text())
+        self.normalized_changed_text(&resolved.new_buffer.read(cx).text())
             .is_some()
     }
 
@@ -736,12 +736,13 @@ impl FinalizedDiff {
                 .map(|buffer| buffer.read(cx).text())
                 .join("\n");
         }
-        self.normalized_changed_text(resolved.new_buffer.read(cx).text())
+        self.normalized_changed_text(&resolved.new_buffer.read(cx).text())
             .unwrap_or_default()
     }
 
-    fn normalized_changed_text(&self, mut new_text: String) -> Option<String> {
+    fn normalized_changed_text(&self, new_text: &str) -> Option<String> {
         let base_text = LineEnding::normalize_arc(self.base_text.clone());
+        let mut new_text = new_text.to_string();
         LineEnding::normalize(&mut new_text);
         (!self.base_text_exists || new_text.as_str() != base_text.as_ref()).then_some(new_text)
     }
@@ -1223,7 +1224,7 @@ mod tests {
             let diff = cx.new(|_| {
                 Diff::finalized(
                     "test.rs".into(),
-                    old_text.map(str::to_string),
+                    old_text.map(Arc::from),
                     new_text.to_string(),
                     languages.clone(),
                 )

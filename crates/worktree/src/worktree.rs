@@ -3348,7 +3348,12 @@ impl BackgroundScannerState {
     }
 
     async fn insert_entry(&mut self, entry: Entry, fs: &dyn Fs, watcher: &dyn Watcher) -> Entry {
+        let previous_canonical_path = self
+            .snapshot
+            .entry_for_path(&entry.path)
+            .and_then(|existing| existing.canonical_path.clone());
         let entry = self.snapshot.insert_entry(entry, fs).await;
+        self.sync_symlink_registration(previous_canonical_path.as_deref(), &entry);
         if entry.path.file_name() == Some(&DOT_GIT) {
             self.insert_git_repository(entry.path.clone(), fs, watcher)
                 .await;
@@ -3404,6 +3409,11 @@ impl BackgroundScannerState {
         let mut entries_by_id_edits = Vec::new();
 
         for entry in entries {
+            let previous_canonical_path = self
+                .snapshot
+                .entry_for_path(&entry.path)
+                .and_then(|existing| existing.canonical_path.clone());
+            self.sync_symlink_registration(previous_canonical_path.as_deref(), &entry);
             entries_by_id_edits.push(Edit::Insert(PathEntry {
                 id: entry.id,
                 path: entry.path.clone(),
@@ -3445,6 +3455,48 @@ impl BackgroundScannerState {
             removed_descendant_abs_paths,
             preserve_repository_watches,
         );
+    }
+
+    fn register_symlink_path(&mut self, canonical_path: Arc<Path>, path: Arc<RelPath>) {
+        let paths = self
+            .symlink_paths_by_target
+            .entry(canonical_path)
+            .or_default();
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+
+    fn unregister_symlink_path(&mut self, canonical_path: &Path, path: &RelPath) {
+        let Some(paths) = self.symlink_paths_by_target.get_mut(canonical_path) else {
+            return;
+        };
+        if let Some(index) = paths.iter().position(|existing| existing.as_ref() == path) {
+            paths.swap_remove(index);
+        }
+        if paths.is_empty() {
+            self.symlink_paths_by_target.remove(canonical_path);
+        }
+    }
+
+    /// Keeps the alias index in sync with a snapshot entry that was just
+    /// inserted or replaced. Only directory symlinks participate in event
+    /// remapping, so file symlinks never enter the index.
+    fn sync_symlink_registration(&mut self, previous: Option<&Path>, entry: &Entry) {
+        let current = entry
+            .is_dir()
+            .then(|| entry.canonical_path.as_deref())
+            .flatten();
+        if previous == current {
+            return;
+        }
+
+        if let Some(previous) = previous {
+            self.unregister_symlink_path(previous, &entry.path);
+        }
+        if let Some(current) = current {
+            self.register_symlink_path(Arc::from(current), entry.path.clone());
+        }
     }
 
     fn unwatch_path(
@@ -3515,6 +3567,10 @@ impl BackgroundScannerState {
             }
 
             self.removed_entries.insert(entry);
+
+            if let Some(canonical_path) = entry.canonical_path.as_deref() {
+                self.unregister_symlink_path(canonical_path, &entry.path);
+            }
 
             if entry.path.file_name() == Some(GITIGNORE) {
                 let abs_parent_path = self.snapshot.absolutize(&entry.path.parent().unwrap());
@@ -4917,7 +4973,25 @@ impl BackgroundScanner {
 
                 let mut dot_git_paths = None;
 
-                if self.track_git_repositories {
+                // Probing every ancestor costs metadata I/O per component and
+                // dominates batches of remapped symlink events. A `.git`
+                // component covers normal repositories, linked worktrees and
+                // submodules; known repository directories cover bare
+                // repositories, whose root has no `.git` component.
+                let may_be_in_git_dir = abs_path
+                    .as_path()
+                    .components()
+                    .any(|component| component.as_os_str() == OsStr::new(DOT_GIT))
+                    || snapshot.git_repositories.values().any(|repository| {
+                        abs_path
+                            .as_path()
+                            .starts_with(repository.common_dir_abs_path.as_ref())
+                            || abs_path
+                                .as_path()
+                                .starts_with(repository.repository_dir_abs_path.as_ref())
+                    });
+
+                if self.track_git_repositories && may_be_in_git_dir {
                     for ancestor in abs_path.as_path().ancestors() {
                         if is_dot_git(ancestor, self.fs.as_ref()).await {
                             let path_in_git_dir = abs_path
@@ -5582,17 +5656,6 @@ impl BackgroundScanner {
 
                 if !canonical_path.starts_with(root_canonical_path) {
                     child_entry.is_external = true;
-                }
-
-                if child_metadata.is_dir {
-                    let mut state = self.state.lock().await;
-                    let paths = state
-                        .symlink_paths_by_target
-                        .entry(Arc::from(canonical_path.clone()))
-                        .or_default();
-                    if !paths.iter().any(|path| path == &child_path) {
-                        paths.push(child_path.clone());
-                    }
                 }
 
                 child_entry.canonical_path = Some(canonical_path.into());

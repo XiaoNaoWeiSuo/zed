@@ -351,7 +351,7 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "new content");
-        assert_eq!(*old_text, "old content");
+        assert_eq!(old_text.as_ref(), "old content");
     }
 
     #[gpui::test]
@@ -996,7 +996,7 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "new line 1\nnew line 2\n");
-        assert_eq!(*old_text, "old line 1\nold line 2\nold line 3\n");
+        assert_eq!(old_text.as_ref(), "old line 1\nold line 2\nold line 3\n");
 
         // Diff is finalized after completion
         diff.read_with(cx, |diff, _| assert!(matches!(diff, Diff::Finalized(_))));
@@ -1063,7 +1063,7 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "new line 1\nnew line 2\nnew line 3\n");
-        assert_eq!(*old_text, "old line 1\nold line 2\nold line 3\n");
+        assert_eq!(old_text.as_ref(), "old line 1\nold line 2\nold line 3\n");
     }
 
     #[gpui::test]

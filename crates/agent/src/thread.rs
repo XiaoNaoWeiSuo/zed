@@ -2074,6 +2074,13 @@ impl Thread {
         let output = tool_result
             .as_ref()
             .and_then(|result| result.output.clone());
+        // Edit tools replay a structured diff that already carries the changed
+        // text. Retaining their raw JSON would keep another full pre/post-edit
+        // file copy for every historical edit.
+        let retain_raw_output = !matches!(
+            tool_use.name.as_ref(),
+            EditFileTool::NAME | WriteFileTool::NAME
+        );
         let replay_content = tool_result.and_then(Self::tool_result_content_for_replay);
         let status = tool_result
             .as_ref()
@@ -2116,8 +2123,10 @@ impl Thread {
             );
             stream.update_tool_call_fields(&tool_call_id, |update| {
                 let mut update = update.status(status);
-                if let Some(output) = output {
-                    update = update.raw_output(output);
+                if retain_raw_output {
+                    if let Some(output) = output {
+                        update = update.raw_output(output);
+                    }
                 }
                 if let Some(content) = replay_content {
                     update = update.content(content);
@@ -2160,8 +2169,12 @@ impl Thread {
 
         stream.update_tool_call_fields(&tool_call_id, |update| {
             let update = update.status(status);
-            if let Some(output) = output {
-                update.raw_output(output)
+            if retain_raw_output {
+                if let Some(output) = output {
+                    update.raw_output(output)
+                } else {
+                    update
+                }
             } else {
                 update
             }

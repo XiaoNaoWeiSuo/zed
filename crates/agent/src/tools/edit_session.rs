@@ -73,7 +73,7 @@ pub enum EditSessionOutput {
         #[serde(alias = "original_path")]
         input_path: PathBuf,
         new_text: String,
-        old_text: Arc<String>,
+        old_text: Arc<str>,
         #[serde(default)]
         diff: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -320,7 +320,7 @@ impl EditSessionContext {
                 event_stream.update_diff(cx.new(|_| {
                     Diff::finalized(
                         input_path.to_string_lossy().into_owned(),
-                        Some(old_text.to_string()),
+                        Some(old_text),
                         new_text,
                         self.language_registry.clone(),
                     )
@@ -359,7 +359,7 @@ pub(crate) async fn run_session(
                 Pipeline::Write(_) => Vec::new(),
             };
             Ok(EditSessionOutput::Success {
-                old_text: session.old_text.clone(),
+                old_text: Arc::from(session.old_text.as_str()),
                 new_text,
                 input_path: session.input_path,
                 diff,

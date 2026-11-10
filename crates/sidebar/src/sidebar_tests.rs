@@ -11287,6 +11287,77 @@ async fn test_unarchive_after_removing_parent_project_group_restores_real_thread
 }
 
 #[gpui::test]
+async fn test_workspace_removal_clears_active_entry_and_menu_caches(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", serde_json::json!({ "src": {} }))
+        .await;
+    fs.insert_tree("/project-b", serde_json::json!({ "src": {} }))
+        .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = project::Project::test(fs.clone(), ["/project-b".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let workspace_a = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b.clone(), window, cx)
+    });
+    add_agent_panel(&workspace_b, cx);
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_b.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    let weak_a = workspace_a.downgrade();
+    sidebar.update(cx, |sidebar, _cx| {
+        sidebar.active_entry = Some(ActiveEntry::Thread {
+            thread_id: ThreadId::new(),
+            session_id: None,
+            workspace: workspace_a.clone(),
+        });
+        sidebar
+            .project_header_menu_handles
+            .insert(0, Default::default());
+        sidebar
+            .project_header_new_thread_menu_handles
+            .insert(0, Default::default());
+        sidebar.project_header_menu_ix = Some(0);
+    });
+
+    let removed = multi_workspace
+        .update_in(cx, |mw, window, cx| {
+            mw.remove(
+                vec![workspace_a.clone()],
+                RemovalIntent::KeepProject,
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("remove workspace");
+    assert!(removed, "workspace should be removed");
+    drop(workspace_a);
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(
+            sidebar.active_entry.is_none(),
+            "active entry from a removed workspace should be cleared"
+        );
+        assert_eq!(sidebar.project_header_menu_ix, None);
+    });
+    assert!(
+        weak_a.upgrade().is_none(),
+        "removed workspace should be released after sidebar caches are cleared"
+    );
+}
+
+#[gpui::test]
 async fn test_unarchive_does_not_create_duplicate_real_thread_metadata(cx: &mut TestAppContext) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {

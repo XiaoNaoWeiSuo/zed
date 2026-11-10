@@ -3218,7 +3218,7 @@ impl ToolCallContent {
                 let diff = cx.new(|_| {
                     Diff::finalized(
                         source.path.to_string_lossy().into_owned(),
-                        source.old_text.clone(),
+                        source.old_text.clone().map(Arc::from),
                         source.new_text.clone(),
                         language_registry.clone(),
                     )
@@ -9918,7 +9918,7 @@ mod tests {
             let native_diff = cx.new(|_| {
                 Diff::finalized(
                     "native.rs".into(),
-                    Some("before".into()),
+                    Some(Arc::from("before")),
                     "after".into(),
                     languages.clone(),
                 )

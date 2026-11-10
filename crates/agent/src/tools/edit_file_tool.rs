@@ -1711,7 +1711,8 @@ mod tests {
         };
         assert_eq!(new_text, "MODIFIED 1\nline 2\nline 3\nline 4\nMODIFIED 5\n");
         assert_eq!(
-            *old_text, "line 1\nline 2\nline 3\nline 4\nline 5\n",
+            old_text.as_ref(),
+            "line 1\nline 2\nline 3\nline 4\nline 5\n",
             "old_text should reflect the original file content before any edits"
         );
     }
