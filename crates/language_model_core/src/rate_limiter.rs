@@ -92,7 +92,12 @@ impl RateLimiter {
     {
         let guard = self.semaphore.acquire_arc();
         async move {
+            let queued_at = std::time::Instant::now();
             let guard = guard.await;
+            log::debug!(
+                "Model concurrency queue wait: {} ms",
+                queued_at.elapsed().as_millis()
+            );
             let result = future.await?;
             drop(guard);
             Ok(result)
@@ -112,7 +117,12 @@ impl RateLimiter {
     {
         let guard = self.semaphore.acquire_arc();
         async move {
+            let queued_at = std::time::Instant::now();
             let guard = guard.await;
+            log::debug!(
+                "Model concurrency queue wait: {} ms",
+                queued_at.elapsed().as_millis()
+            );
             let inner = future.await?;
             Ok(RateLimitGuard {
                 inner,

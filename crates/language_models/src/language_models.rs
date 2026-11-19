@@ -8,12 +8,14 @@ use gpui::{App, Context, Entity};
 use language_model::{LanguageModelProviderId, LanguageModelRegistry};
 use provider::deepseek::DeepSeekLanguageModelProvider;
 
+pub mod completion_http_client;
 pub mod extension;
 pub mod provider;
 mod settings;
 
 pub use crate::extension::init_proxy as init_extension_proxy;
 
+use crate::completion_http_client::completion_http_client;
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
@@ -33,6 +35,10 @@ use crate::provider::x_ai::XAiLanguageModelProvider;
 use crate::provider::x_ai_subscribed::XAiSubscribedProvider;
 pub use crate::settings::*;
 
+fn completion_client(client: &Client, cx: &App) -> Arc<dyn ::http_client::HttpClient> {
+    completion_http_client(client.http_client(), (*cx.background_executor()).clone())
+}
+
 pub fn init_openai_subscribed_only(client: Arc<Client>, cx: &mut App) {
     language_model::set_credentials_read_gate::<SettingsStore>(ai_disabled, cx);
     let credentials_provider = client.credentials_provider();
@@ -49,7 +55,7 @@ fn register_openai_subscribed_provider(
 ) {
     registry.register_provider(
         Arc::new(OpenAiSubscribedProvider::new(
-            client.http_client(),
+            completion_client(client, cx),
             credentials_provider,
             cx,
         )),
@@ -256,7 +262,7 @@ fn register_compatible_providers(
                 CompatibleProviderKind::OpenAi => registry.register_provider(
                     Arc::new(OpenAiCompatibleLanguageModelProvider::new(
                         provider_id.clone(),
-                        client.http_client(),
+                        completion_client(client.as_ref(), cx),
                         credentials_provider.clone(),
                         cx,
                     )),
@@ -265,7 +271,7 @@ fn register_compatible_providers(
                 CompatibleProviderKind::Anthropic => registry.register_provider(
                     Arc::new(AnthropicCompatibleLanguageModelProvider::new(
                         provider_id.clone(),
-                        client.http_client(),
+                        completion_client(client.as_ref(), cx),
                         credentials_provider.clone(),
                         cx,
                     )),
@@ -284,7 +290,7 @@ fn register_language_model_providers(
 ) {
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -292,7 +298,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(OpenAiLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -300,7 +306,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(OllamaLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -308,7 +314,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(LmStudioLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -316,7 +322,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(LlamaCppLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -324,7 +330,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(DeepSeekLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -332,7 +338,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(GoogleLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -340,7 +346,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         MistralLanguageModelProvider::global(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         ),
@@ -348,7 +354,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(BedrockLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -356,7 +362,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(OpenRouterLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -364,7 +370,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(VercelAiGatewayLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -372,7 +378,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(XAiLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -380,7 +386,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(XAiSubscribedProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -388,7 +394,7 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(OpenCodeLanguageModelProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider.clone(),
             cx,
         )),
@@ -397,7 +403,7 @@ fn register_language_model_providers(
     registry.register_provider(Arc::new(CopilotChatLanguageModelProvider::new(cx)), cx);
     registry.register_provider(
         Arc::new(OpenAiSubscribedProvider::new(
-            client.http_client(),
+            completion_client(&client, cx),
             credentials_provider,
             cx,
         )),
@@ -408,11 +414,11 @@ fn register_language_model_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::http_client::FakeHttpClient;
     use anyhow::Result;
     use clock::FakeSystemClock;
     use feature_flags::FeatureFlagAppExt as _;
     use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _};
-    use http_client::FakeHttpClient;
     use language_model::IconOrSvg;
     use release_channel::AppVersion;
     use std::future::Future;

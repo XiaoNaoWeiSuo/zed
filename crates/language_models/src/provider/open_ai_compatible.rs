@@ -9,14 +9,9 @@ use language_model::{
     LanguageModelCompletionStream, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoiceSupport,
-    ModelRateLimiters, ProviderSettingsView, RateLimiter, SubPageProviderSettings,
-    unavailable_error,
+    ModelRateLimiters, ProviderSettingsView, SubPageProviderSettings, unavailable_error,
 };
-use open_ai::{
-    ResponseStreamEvent,
-    responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
-    stream_completion,
-};
+use open_ai::{responses::stream_response, stream_completion};
 use settings::Settings;
 use std::sync::Arc;
 use ui::IconName;
@@ -97,6 +92,7 @@ impl OpenAiCompatibleLanguageModelProvider {
             },
             supports_streaming_tools: true,
             supports_thinking: default_thinking_reasoning_effort(model).is_some(),
+            supports_disabling_thinking: supports_none_reasoning_effort(model),
             supported_effort_levels: supported_thinking_effort_levels(model).into(),
             supports_split_token_display: true,
             max_output_tokens: model.max_output_tokens,
@@ -127,97 +123,6 @@ impl OpenAiCompatibleLanguageModelProvider {
             .find(|available| available.name == model.id.0.as_ref())
             .cloned()
             .ok_or_else(|| unavailable_error(model))
-    }
-
-    fn stream_chat_completion(
-        &self,
-        request_limiter: &RateLimiter,
-        request: open_ai::Request,
-        cx: &AsyncApp,
-    ) -> BoxFuture<
-        'static,
-        Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<ResponseStreamEvent, LanguageModelCompletionError>,
-            >,
-            LanguageModelCompletionError,
-        >,
-    > {
-        let http_client = self.http_client.clone();
-
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
-            )
-        });
-
-        let provider = self.name.clone();
-        let future = request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_completion(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
-            );
-            let response = request.await?;
-            Ok(response)
-        });
-
-        async move { Ok(future.await?.boxed()) }.boxed()
-    }
-
-    fn stream_response(
-        &self,
-        request_limiter: &RateLimiter,
-        request: ResponseRequest,
-        cx: &AsyncApp,
-    ) -> BoxFuture<
-        'static,
-        Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<ResponsesStreamEvent, open_ai::RequestError>,
-            >,
-        >,
-    > {
-        let http_client = self.http_client.clone();
-
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
-            )
-        });
-
-        let provider = self.name.clone();
-        let future = request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_response(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
-            );
-            let response = request.await?;
-            Ok(response)
-        });
-
-        async move { Ok(future.await?.boxed()) }.boxed()
     }
 }
 
@@ -304,62 +209,96 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
             Err(error) => return async move { Err(error) }.boxed(),
         };
         let request_limiter = self.request_limiters.for_model(&model.id);
-        // `speed` can leak in from a parent thread's model; this provider never
-        // supports fast mode, and arbitrary compatible endpoints reject `service_tier`.
-        request.speed = None;
+        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
+            let api_url = &state.settings.api_url;
+            (
+                state.api_key_state.key(api_url),
+                api_url.clone(),
+                state.settings.custom_headers.clone(),
+            )
+        });
+        let http_client = self.http_client.clone();
+        let provider = self.name.clone();
+        let provider_id = self.id.clone();
+        let executor = cx.background_executor().clone();
+        let future = cx.background_spawn(async move {
+            // `speed` can leak in from a parent thread's model; this provider never
+            // supports fast mode, and arbitrary compatible endpoints reject `service_tier`.
+            request.speed = None;
 
-        if config.capabilities.chat_completions {
-            let reasoning_effort = chat_completion_reasoning_effort(&request, &config);
-            let request = match into_open_ai(
-                request,
-                &config.name,
-                config.capabilities.parallel_tool_calls,
-                config.capabilities.prompt_cache_key,
-                config.max_output_tokens,
-                chat_completion_max_tokens_parameter(&config),
-                reasoning_effort,
-                config.capabilities.interleaved_reasoning,
-            ) {
-                Ok(request) => request,
-                Err(error) => return async move { Err(error.into()) }.boxed(),
+            let events = if config.capabilities.chat_completions {
+                let completions = request_limiter
+                    .stream(async move {
+                        let reasoning_effort = chat_completion_reasoning_effort(&request, &config);
+                        let request = into_open_ai(
+                            request,
+                            &config.name,
+                            config.capabilities.parallel_tool_calls,
+                            config.capabilities.prompt_cache_key,
+                            config.max_output_tokens,
+                            chat_completion_max_tokens_parameter(&config),
+                            reasoning_effort,
+                            config.capabilities.interleaved_reasoning,
+                        )?;
+                        let Some(api_key) = api_key else {
+                            return Err(LanguageModelCompletionError::NoApiKey { provider });
+                        };
+                        Ok(stream_completion(
+                            http_client.as_ref(),
+                            provider.0.as_str(),
+                            &api_url,
+                            &api_key,
+                            request,
+                            &extra_headers,
+                        )
+                        .await?)
+                    })
+                    .await?;
+                ChatCompletionEventMapper::new()
+                    .map_stream(completions.boxed())
+                    .boxed()
+            } else {
+                let compaction_state_owner = provider_id.clone();
+                let completions = request_limiter
+                    .stream(async move {
+                        disable_response_thinking_for_none_effort(&mut request, &config);
+                        let request = into_open_ai_response(
+                            request,
+                            &config.name,
+                            config.capabilities.parallel_tool_calls,
+                            config.capabilities.prompt_cache_key,
+                            config.max_output_tokens,
+                            default_thinking_reasoning_effort(&config),
+                            supports_none_reasoning_effort(&config),
+                            &provider_id,
+                        )?;
+                        // Preserve the Responses helper's anyhow error boundary.
+                        let Some(api_key) = api_key else {
+                            return Err(anyhow::Error::from(
+                                LanguageModelCompletionError::NoApiKey { provider },
+                            )
+                            .into());
+                        };
+                        Ok(stream_response(
+                            http_client.as_ref(),
+                            provider.0.as_str(),
+                            &api_url,
+                            &api_key,
+                            request,
+                            &extra_headers,
+                        )
+                        .await
+                        .map_err(LanguageModelCompletionError::from)
+                        .map_err(anyhow::Error::from)?)
+                    })
+                    .await?;
+                OpenAiResponseEventMapper::new(compaction_state_owner)
+                    .map_stream(completions.boxed())
+                    .boxed()
             };
-            let completions = self.stream_chat_completion(&request_limiter, request, cx);
-            let executor = cx.background_executor().clone();
-            async move {
-                let mapper = ChatCompletionEventMapper::new();
-                Ok(language_model::stream_in_background(
-                    mapper.map_stream(completions.await?).boxed(),
-                    executor,
-                ))
-            }
-            .boxed()
-        } else {
-            disable_response_thinking_for_none_effort(&mut request, &config);
-            let request = match into_open_ai_response(
-                request,
-                &config.name,
-                config.capabilities.parallel_tool_calls,
-                config.capabilities.prompt_cache_key,
-                config.max_output_tokens,
-                default_thinking_reasoning_effort(&config),
-                supports_none_reasoning_effort(&config),
-                &self.id,
-            ) {
-                Ok(request) => request,
-                Err(error) => return async move { Err(error.into()) }.boxed(),
-            };
-            let completions = self.stream_response(&request_limiter, request, cx);
-            let compaction_state_owner = self.id.clone();
-            let executor = cx.background_executor().clone();
-            async move {
-                let mapper = OpenAiResponseEventMapper::new(compaction_state_owner);
-                Ok(language_model::stream_in_background(
-                    mapper.map_stream(completions.await?).boxed(),
-                    executor,
-                ))
-            }
-            .boxed()
-        }
+            Ok(language_model::stream_in_background(events, executor))
+        });
+        async move { future.await }.boxed()
     }
 }
 
@@ -408,7 +347,8 @@ fn chat_completion_max_tokens_parameter(
 fn supports_none_reasoning_effort(model: &AvailableModel) -> bool {
     // Only an explicit `none` configuration guarantees that the endpoint
     // accepts "none". Models configured with low/high/... may reject it (for
-    // example gpt-6.1-sol), so leave the field out instead.
+    // example gpt-6.1-sol). Omitting the field does not guarantee that thinking
+    // is disabled.
     model.reasoning_effort == Some(open_ai::ReasoningEffort::None)
 }
 
@@ -458,6 +398,110 @@ mod tests {
                 chat_completions: false,
                 ..Default::default()
             },
+        }
+    }
+
+    #[gpui::test]
+    async fn request_conversion_waits_for_background_concurrency_slot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (provider, model) = cx.update(|cx| {
+            let id: Arc<str> = "test-compatible-background".into();
+            let mut config = available_model(None);
+            config.capabilities.chat_completions = true;
+            let state = State::new(
+                id.clone(),
+                Arc::new(credentials_provider::test_support::FakeCredentialsProvider::default()),
+                |_, _| None,
+                cx,
+            );
+            state.update(cx, |state, _| {
+                state.settings.available_models = vec![config.clone()]
+            });
+            let provider = OpenAiCompatibleLanguageModelProvider {
+                id: id.clone().into(),
+                name: id.into(),
+                http_client: http_client::FakeHttpClient::with_404_response(),
+                state,
+                request_limiters: ModelRateLimiters::new(1),
+            };
+            let model = provider.language_model(&config);
+            (provider, model)
+        });
+        let limiter = provider.request_limiters.for_model(&model.id);
+        let held_slot = limiter
+            .stream(async { Ok(futures::stream::pending::<()>()) })
+            .await
+            .expect("hold concurrency slot");
+        let request = LanguageModelRequest {
+            tools: vec![language_model::LanguageModelRequestTool {
+                name: "custom".into(),
+                description: String::new(),
+                input: language_model::LanguageModelRequestToolInput::Custom { format: None },
+            }],
+            ..Default::default()
+        };
+        let mut completion = provider.stream_completion(&model, request, &cx.to_async());
+        assert!(
+            (&mut completion).now_or_never().is_none(),
+            "conversion must not run synchronously on the foreground thread"
+        );
+        cx.run_until_parked();
+        assert!(
+            (&mut completion).now_or_never().is_none(),
+            "queued requests must not convert large contexts before acquiring a slot"
+        );
+        drop(held_slot);
+        let error = completion
+            .await
+            .err()
+            .expect("custom tools rejected by chat completions");
+        assert!(error.to_string().contains("does not support custom tools"));
+    }
+
+    #[gpui::test]
+    fn thinking_capabilities_require_explicit_none_to_disable(cx: &mut App) {
+        let id: Arc<str> = "test-compatible-provider".into();
+        let provider = OpenAiCompatibleLanguageModelProvider {
+            id: id.clone().into(),
+            name: id.clone().into(),
+            http_client: http_client::FakeHttpClient::with_404_response(),
+            state: State::new(
+                id,
+                Arc::new(credentials_provider::test_support::FakeCredentialsProvider::default()),
+                |_, _| None,
+                cx,
+            ),
+            request_limiters: ModelRateLimiters::default(),
+        };
+
+        for (reasoning_effort, supports_thinking, supports_disabling_thinking) in [
+            (Some(open_ai::ReasoningEffort::Medium), true, false),
+            (Some(open_ai::ReasoningEffort::High), true, false),
+            (Some(open_ai::ReasoningEffort::None), false, true),
+            (None, false, false),
+        ] {
+            for chat_completions in [false, true] {
+                let mut config = available_model(reasoning_effort);
+                config.capabilities.chat_completions = chat_completions;
+                let model = provider.language_model(&config);
+
+                assert_eq!(model.supports_thinking, supports_thinking);
+                assert_eq!(
+                    model.supports_disabling_thinking(),
+                    supports_disabling_thinking
+                );
+                assert_eq!(
+                    model.supports_disabling_thinking_at_effort(None),
+                    supports_disabling_thinking
+                );
+                for effort in model.supported_effort_levels.iter() {
+                    assert_eq!(
+                        model.supports_disabling_thinking_at_effort(Some(effort.value.as_ref())),
+                        supports_disabling_thinking
+                    );
+                }
+            }
         }
     }
 
@@ -711,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn response_thinking_effort_preserves_explicit_none() {
+    fn response_thinking_effort_preserves_explicit_none() -> Result<()> {
         let model = available_model(Some(open_ai::ReasoningEffort::None));
         let mut request = LanguageModelRequest {
             thinking_allowed: true,
@@ -722,5 +766,19 @@ mod tests {
         disable_response_thinking_for_none_effort(&mut request, &model);
         assert!(!request.thinking_allowed);
         assert_eq!(request.thinking_effort, None);
+
+        let request = into_open_ai_response(
+            request,
+            &model.name,
+            model.capabilities.parallel_tool_calls,
+            model.capabilities.prompt_cache_key,
+            model.max_output_tokens,
+            default_thinking_reasoning_effort(&model),
+            supports_none_reasoning_effort(&model),
+            &LanguageModelProviderId::new("test-compatible-provider"),
+        )?;
+        let serialized = serde_json::to_value(request)?;
+        assert_eq!(serialized["reasoning"], json!({ "effort": "none" }));
+        Ok(())
     }
 }

@@ -591,11 +591,11 @@ impl LanguageModelClient for OpenCodeLanguageModelProvider {
         let api_key = self.current_api_key(cx);
         let executor = cx.background_executor().clone();
         let stream_in_background = config.model.protocol() != ApiProtocol::Google;
-        async move {
+        let completion = cx.background_spawn(async move {
             let api_key = api_key.ok_or(LanguageModelCompletionError::NoApiKey {
                 provider: PROVIDER_NAME,
             })?;
-            let stream = request_limiter
+            request_limiter
                 .stream(async move {
                     opencode::completion::stream_completion(
                         http_client.as_ref(),
@@ -611,7 +611,10 @@ impl LanguageModelClient for OpenCodeLanguageModelProvider {
                     )
                     .await
                 })
-                .await?;
+                .await
+        });
+        async move {
+            let stream = completion.await?;
             Ok(if stream_in_background {
                 language_model::stream_in_background(stream.boxed(), executor)
             } else {

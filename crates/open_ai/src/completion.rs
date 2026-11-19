@@ -760,6 +760,7 @@ pub struct OpenAiResponseEventMapper {
     current_message_phase: Option<String>,
     pending_stop_reason: Option<StopReason>,
     pending_compaction_items: usize,
+    started: bool,
 }
 
 #[derive(Default)]
@@ -786,6 +787,7 @@ impl OpenAiResponseEventMapper {
             current_message_phase: None,
             pending_stop_reason: None,
             pending_compaction_items: 0,
+            started: false,
         }
     }
 
@@ -807,6 +809,14 @@ impl OpenAiResponseEventMapper {
         event: ResponsesStreamEvent,
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
         match event {
+            ResponsesStreamEvent::Created { .. } | ResponsesStreamEvent::InProgress { .. } => {
+                if self.started {
+                    Vec::new()
+                } else {
+                    self.started = true;
+                    vec![Ok(LanguageModelCompletionEvent::Started)]
+                }
+            }
             ResponsesStreamEvent::OutputItemAdded { item, .. } => {
                 let mut events = Vec::new();
 
@@ -1088,8 +1098,6 @@ impl OpenAiResponseEventMapper {
             | ResponsesStreamEvent::ReasoningTextDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryPartDone { .. }
             | ResponsesStreamEvent::ReasoningDone { .. }
-            | ResponsesStreamEvent::Created { .. }
-            | ResponsesStreamEvent::InProgress { .. }
             | ResponsesStreamEvent::Unknown => Vec::new(),
         }
     }
@@ -1644,6 +1652,88 @@ mod tests {
             content: Vec::new(),
             encrypted_content: encrypted_content.map(str::to_string),
             status,
+        }
+    }
+
+    #[test]
+    fn responses_stream_starts_once_before_streaming_content() {
+        for first_event in [
+            ResponsesStreamEvent::Created {
+                response: ResponseSummary::default(),
+            },
+            ResponsesStreamEvent::InProgress {
+                response: ResponseSummary::default(),
+            },
+        ] {
+            let mut mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID);
+            assert!(matches!(
+                mapper.map_event(first_event).as_slice(),
+                [Ok(LanguageModelCompletionEvent::Started)]
+            ));
+
+            for event in [
+                ResponsesStreamEvent::Created {
+                    response: ResponseSummary::default(),
+                },
+                ResponsesStreamEvent::InProgress {
+                    response: ResponseSummary::default(),
+                },
+            ] {
+                assert!(mapper.map_event(event).is_empty());
+            }
+
+            assert!(matches!(
+                mapper
+                    .map_event(ResponsesStreamEvent::ReasoningSummaryTextDelta {
+                        item_id: "reasoning_123".into(),
+                        output_index: 0,
+                        summary_index: 0,
+                        delta: "Thinking".into(),
+                    })
+                    .as_slice(),
+                [Ok(LanguageModelCompletionEvent::Thinking { text, signature: None })]
+                    if text == "Thinking"
+            ));
+            assert!(matches!(
+                mapper
+                    .map_event(ResponsesStreamEvent::OutputTextDelta {
+                        item_id: "msg_123".into(),
+                        output_index: 1,
+                        content_index: Some(0),
+                        delta: "Hello".into(),
+                    })
+                    .as_slice(),
+                [Ok(LanguageModelCompletionEvent::Text(text))] if text == "Hello"
+            ));
+            assert!(matches!(
+                mapper
+                    .map_event(ResponsesStreamEvent::Completed {
+                        response: ResponseSummary {
+                            usage: Some(ResponseUsage {
+                                input_tokens: Some(5),
+                                output_tokens: Some(3),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    })
+                    .as_slice(),
+                [
+                    Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        ..
+                    })),
+                    Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn))
+                ]
+            ));
+            assert!(
+                mapper
+                    .map_event(ResponsesStreamEvent::InProgress {
+                        response: ResponseSummary::default(),
+                    })
+                    .is_empty()
+            );
         }
     }
 

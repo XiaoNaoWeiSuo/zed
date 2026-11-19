@@ -27,7 +27,7 @@ pub struct ReqwestClient {
 
 impl ReqwestClient {
     /// Shared connection-management configuration for every client this type
-    /// builds. `read_timeout` sets an idle timeout on each body read (see
+    /// builds. `read_timeout` bounds response headers and each body read (see
     /// [`ReqwestClient::proxy_user_agent_and_read_timeout`]); `None` leaves
     /// reads without a timeout.
     fn builder(read_timeout: Option<Duration>) -> reqwest::ClientBuilder {
@@ -68,10 +68,10 @@ impl ReqwestClient {
     }
 
     /// Like [`ReqwestClient::proxy_and_user_agent`], but also applies a
-    /// per-read idle timeout. `read_timeout` fires only after that long with no
-    /// bytes received on a response body and resets on every chunk, so it
-    /// aborts a silently stalled stream without disturbing a healthy one that
-    /// merely goes quiet between chunks. Callers streaming long-lived responses
+    /// per-read idle timeout. `read_timeout` bounds the wait for response headers
+    /// and resets after each response body chunk. It is not a total request
+    /// deadline: streams can outlive it as long as each read completes in time.
+    /// Callers streaming long-lived responses
     /// (e.g. LLM completions, which can pause for tens of seconds during
     /// provider-side reasoning while keep-alive bytes still flow) should size
     /// it comfortably above the provider's keep-alive interval.
@@ -469,6 +469,143 @@ mod tests {
         );
         drop(response);
         server.join().unwrap();
+    }
+
+    fn serve_read_timeout_response(
+        respond: impl FnOnce(&mut std::net::TcpStream) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<(String, std::thread::JoinHandle<anyhow::Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                anyhow::ensure!(
+                    reader.read_line(&mut line)? != 0,
+                    "incomplete request headers"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            drop(reader);
+            respond(&mut stream)
+        });
+        Ok((format!("http://{address}/"), server))
+    }
+
+    fn wait_for_timeout_connection_close(stream: &mut std::net::TcpStream) -> anyhow::Result<()> {
+        let mut buffer = [0; 1];
+        match stream.read(&mut buffer) {
+            Ok(0) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+            result => {
+                anyhow::bail!("expected the timed-out client to close its connection: {result:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_timeout_applies_before_response_headers() -> anyhow::Result<()> {
+        let (url, server) = serve_read_timeout_response(wait_for_timeout_connection_close)?;
+        let client = ReqwestClient::proxy_user_agent_and_read_timeout(
+            None,
+            "test",
+            Some(Duration::from_millis(250)),
+        )?;
+        let request = HttpRequest::get(url)
+            .timeout(Duration::from_secs(3))
+            .body(AsyncBody::default())?;
+        let started_at = Instant::now();
+        let result = futures::executor::block_on(client.send(request));
+        let elapsed = started_at.elapsed();
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server panicked"))??;
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected a header timeout"))?;
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
+        assert!(elapsed < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_timeout_applies_to_stalled_response_body() -> anyhow::Result<()> {
+        let (url, server) = serve_read_timeout_response(|stream| {
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\na")?;
+            wait_for_timeout_connection_close(stream)
+        })?;
+        let client = ReqwestClient::proxy_user_agent_and_read_timeout(
+            None,
+            "test",
+            Some(Duration::from_millis(250)),
+        )?;
+        let request = HttpRequest::get(url)
+            .timeout(Duration::from_secs(3))
+            .body(AsyncBody::default())?;
+        let mut response = futures::executor::block_on(client.send(request))?;
+        // Reqwest creates its per-read timer when the body is polled.
+        let _runtime = client.handle.enter();
+        let mut body = Vec::new();
+        let started_at = Instant::now();
+        let result = futures::executor::block_on(response.body_mut().read_to_end(&mut body));
+        let elapsed = started_at.elapsed();
+        drop(response);
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server panicked"))??;
+        let error = anyhow::Error::from(
+            result
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected a body idle timeout"))?,
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
+        assert_eq!(body, b"a");
+        assert!(elapsed < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_timeout_resets_for_healthy_stream() -> anyhow::Result<()> {
+        let read_timeout = Duration::from_secs(1);
+        let (url, server) = serve_read_timeout_response(|stream| {
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\n")?;
+            for _ in 0..15 {
+                std::thread::sleep(Duration::from_millis(100));
+                stream.write_all(b"a")?;
+            }
+            Ok(())
+        })?;
+        let client =
+            ReqwestClient::proxy_user_agent_and_read_timeout(None, "test", Some(read_timeout))?;
+        let request = HttpRequest::get(url)
+            .timeout(Duration::from_secs(5))
+            .body(AsyncBody::default())?;
+        let started_at = Instant::now();
+        let mut response = futures::executor::block_on(client.send(request))?;
+        // Reqwest creates its per-read timer when the body is polled.
+        let _runtime = client.handle.enter();
+        let mut body = Vec::new();
+        futures::executor::block_on(response.body_mut().read_to_end(&mut body))?;
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server panicked"))??;
+        assert_eq!(body, b"aaaaaaaaaaaaaaa");
+        assert!(started_at.elapsed() > read_timeout);
+        Ok(())
     }
 
     #[test]
