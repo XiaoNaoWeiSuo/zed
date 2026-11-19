@@ -2705,9 +2705,9 @@ impl NativeAgentConnection {
                     let previous = agent.update(cx, |agent, _cx| -> Result<_> {
                         let session = agent
                             .sessions
-                            .get_mut(&session_id)
+                            .get(&session_id)
                             .context("Session not found")?;
-                        let Some(execution) = &mut session.execution else {
+                        let Some(execution) = &session.execution else {
                             return Ok(None);
                         };
                         if execution.completion.peek().is_some() {
@@ -2716,18 +2716,48 @@ impl NativeAgentConnection {
                         if automatic_resume {
                             return Err(acp_thread::SubmissionCancelled.into());
                         }
-                        if let Some(sender) = execution.cancellation.take()
+                        Ok(Some(execution.completion.clone()))
+                    })??;
+                    let Some(previous) = previous else {
+                        break;
+                    };
+
+                    // A plain prompt sent while a turn is running joins that
+                    // turn at its next loop boundary instead of cancelling it.
+                    // Pending approvals are the exception: a follow-up there
+                    // still denies the tool call rather than being queued.
+                    if !automatic_resume
+                        && let Some(content) = content.as_ref()
+                        && let Some(message_id) =
+                            Self::interject_running_turn(&agent, &session_id, content, cx)?
+                    {
+                        let previous = previous.clone();
+                        cx.spawn(async move |_cx| {
+                            let result =
+                                previous.await.unwrap_or(Ok(acp_v2::StopReason::Cancelled));
+                            if completion_sender.send(result).is_err() {
+                                log::debug!("Interjected submission observer was dropped");
+                            }
+                        })
+                        .detach();
+                        return Ok(acp_v2::PromptResponse::new(message_id.message_id()));
+                    }
+
+                    agent.update(cx, |agent, _cx| -> Result<()> {
+                        let session = agent
+                            .sessions
+                            .get_mut(&session_id)
+                            .context("Session not found")?;
+                        if let Some(execution) = &mut session.execution
+                            && let Some(sender) = execution.cancellation.take()
                             && sender
                                 .send(NativeCancellation::InterruptedByFollowUp)
                                 .is_err()
                         {
                             log::debug!("Native execution already completed");
                         }
-                        Ok(Some(execution.completion.clone()))
+                        Ok(())
                     })??;
-                    let Some(previous) = previous else {
-                        break;
-                    };
                     if let Err(error) = previous
                         .await
                         .context("Previous native execution was released")?
@@ -2858,6 +2888,60 @@ impl NativeAgentConnection {
             }
         });
         (receipt, completion)
+    }
+
+    /// Queues a plain prompt into a running turn instead of cancelling it.
+    /// Returns the message ID when the prompt was queued.
+    fn interject_running_turn(
+        agent: &WeakEntity<NativeAgent>,
+        session_id: &acp_v2::SessionId,
+        content: &[acp_v2::ContentBlock],
+        cx: &mut AsyncApp,
+    ) -> Result<Option<ClientUserMessageId>> {
+        cx.update(|cx| -> Result<Option<ClientUserMessageId>> {
+            let (thread, acp_thread) = agent.read_with(cx, |agent, _cx| {
+                let session = agent
+                    .sessions
+                    .get(session_id)
+                    .context("Session not found")?;
+                Ok::<_, anyhow::Error>((
+                    session.thread.clone(),
+                    session
+                        .acp_thread
+                        .upgrade()
+                        .context("Session was released")?,
+                ))
+            })??;
+            // A pending approval must still be resolved by the follow-up
+            // instead of being left running in the background.
+            if acp_thread.read(cx).is_waiting_for_confirmation()
+                || thread.read(cx).end_turn_at_next_boundary()
+            {
+                return Ok(None);
+            }
+            let retry_action = agent.read_with(cx, |agent, cx| {
+                let project_state = agent
+                    .session_project_state(session_id)
+                    .context("Project state not found for session")?;
+                anyhow::Ok(NativeRetryAction::for_prompt(
+                    content.to_vec(),
+                    project_state,
+                    cx,
+                ))
+            })??;
+            if !matches!(retry_action, NativeRetryAction::Prompt(_)) {
+                return Ok(None);
+            }
+            let message_id = ClientUserMessageId::new();
+            let path_style = thread.read(cx).project().read(cx).path_style(cx);
+            thread.update(cx, |thread, cx| {
+                thread.interject_user_block(message_id.clone(), content.to_vec(), path_style, cx)
+            })?;
+            acp_thread.update(cx, |thread, cx| {
+                thread.upsert_local_user_message(message_id.clone(), content.to_vec(), cx)
+            })?;
+            Ok(Some(message_id))
+        })
     }
 
     fn drive_execution(
@@ -5431,7 +5515,7 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_native_follow_up_serializes_and_retry_reuses_message(cx: &mut TestAppContext) {
+    async fn test_native_follow_up_interjects_without_cancelling_turn(cx: &mut TestAppContext) {
         let fake = init_test(cx);
         let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
         let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
@@ -5443,39 +5527,58 @@ mod internal_tests {
         });
         let first_receipt = first_receipt.await.expect("first accepted");
         cx.run_until_parked();
+        let first_request = fake
+            .pending_completions_for(&model)
+            .pop()
+            .expect("first reaches model");
+
         let (second_receipt, second_completion) = cx.update(|cx| {
             connection.submit_native(session_id.clone(), Some(vec!["follow-up".into()]), cx)
         });
-        let second_receipt = second_receipt
-            .await
-            .expect("follow-up accepted after old cleanup");
+        let second_receipt = second_receipt.await.expect("follow-up accepted");
+        cx.run_until_parked();
+        assert!(
+            first_completion.peek().is_none(),
+            "a follow-up must not cancel the running turn"
+        );
+        assert!(second_completion.peek().is_none());
+
+        // The follow-up is delivered after the current response, at the next
+        // loop boundary, without a new execution.
+        fake.send_text(&model, &first_request, "first answer");
+        fake.end_stream(&model, &first_request);
+        cx.run_until_parked();
+        let next_request = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .find(|request| request.intent == Some(CompletionIntent::UserPrompt))
+            .expect("follow-up reaches model");
+        assert_eq!(next_request.intent, Some(CompletionIntent::UserPrompt));
+        let texts = next_request
+            .messages
+            .iter()
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>();
+        assert!(texts.iter().any(|text| text == "follow-up"));
+        fake.send_text(&model, &next_request, "second answer");
+        fake.end_stream(&model, &next_request);
+        cx.run_until_parked();
+
         assert_eq!(
             first_completion
                 .await
                 .expect("first driver completed")
-                .expect("cancelled"),
-            acp_v2::StopReason::Cancelled
+                .expect("end turn"),
+            acp_v2::StopReason::EndTurn
         );
-        assert!(second_completion.peek().is_none());
-        cx.run_until_parked();
-        cx.update(|cx| connection.cancel(&session_id, cx))
-            .expect("cancellation succeeds");
         assert_eq!(
             second_completion
                 .await
-                .expect("second driver completed")
-                .expect("cancelled"),
-            acp_v2::StopReason::Cancelled
+                .expect("interjected submission completed")
+                .expect("end turn"),
+            acp_v2::StopReason::EndTurn
         );
-        let retry_receipt = acp_thread
-            .update(cx, |thread, cx| thread.retry(cx))
-            .await
-            .expect("retry accepted");
-        let Some(acp_thread::SubmissionResponse::Accepted(retry_receipt)) = retry_receipt else {
-            panic!("retry returns acceptance");
-        };
-        assert_eq!(retry_receipt.message_id, second_receipt.message_id);
-        cx.run_until_parked();
+
         let saved = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
         assert_eq!(
             saved
@@ -5488,20 +5591,6 @@ mod internal_tests {
                 .collect::<Vec<_>>(),
             vec![first_receipt.message_id, second_receipt.message_id]
         );
-        let request = fake
-            .pending_completions_for(&model)
-            .pop()
-            .expect("retry reaches model");
-        fake.send_text(&model, &request, "retried");
-        fake.end_stream(&model, &request);
-        cx.run_until_parked();
-        acp_thread.read_with(cx, |thread, cx| {
-            assert!(
-                matches!(thread.foreground_state(), Some(acp_v2::StateUpdate::Idle(idle))
-                if idle.stop_reason == Some(acp_v2::StopReason::EndTurn))
-            );
-            assert!(thread.to_markdown(cx).contains("retried"));
-        });
     }
 
     #[gpui::test]

@@ -7055,10 +7055,22 @@ async fn run_deferred_question_scenario(timing: DeferredResponseTiming, cx: &mut
         let requests = fake.pending_completions_for(&model);
         assert_eq!(
             requests.len(),
-            2,
-            "one abandoned fake request and one user follow-up; no automatic interruption"
+            1,
+            "a follow-up must not interrupt the in-flight request"
         );
-        assert!(requests.last().expect("user request").messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content|
+
+        // Finishing the current response delivers the follow-up at the next
+        // loop boundary, in the same turn.
+        fake.send_last_text(&model, "Working independently.");
+        fake.end_last(&model);
+        cx.run_until_parked();
+        let user_requests = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .filter(|request| request.intent == Some(CompletionIntent::UserPrompt))
+            .collect::<Vec<_>>();
+        assert_eq!(user_requests.len(), 1);
+        assert!(user_requests.last().expect("user request").messages.iter().any(|message| message.role == Role::User && message.content.iter().any(|content|
             matches!(content, MessageContent::Text(text) if text.contains("Follow-up takes priority")))));
         fake.send_last_text(&model, "Following your new instruction.");
         fake.end_last(&model);

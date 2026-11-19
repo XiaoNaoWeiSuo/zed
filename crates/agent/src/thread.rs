@@ -1505,6 +1505,11 @@ pub(crate) struct StreamingSaveKey {
     permission_tier: crate::permission_tier::PermissionTier,
 }
 
+struct InterjectedMessage {
+    id: ClientUserMessageId,
+    content: Arc<[UserMessageContent]>,
+}
+
 pub struct Thread {
     id: acp_v2::SessionId,
     prompt_id: PromptId,
@@ -1515,6 +1520,10 @@ pub struct Thread {
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
     summary: Option<SharedString>,
     messages: Vec<Arc<Message>>,
+    /// User messages that arrived while a turn was running. They are inserted
+    /// into `messages` at the next loop boundary, after the in-flight tool
+    /// results, instead of cancelling the turn.
+    interjected_messages: Vec<InterjectedMessage>,
     // Message count cannot detect replacements in frozen history while a successor streams.
     retained_history_revision: usize,
     user_store: Entity<UserStore>,
@@ -1846,6 +1855,7 @@ impl Thread {
             pending_summary_generation: None,
             summary: None,
             messages: Vec::new(),
+            interjected_messages: Vec::new(),
             retained_history_revision: 0,
             user_store: project.read(cx).user_store(),
             running_turn: None,
@@ -2293,6 +2303,7 @@ impl Thread {
             pending_summary_generation: None,
             summary: db_thread.detailed_summary,
             messages: db_thread.messages,
+            interjected_messages: Vec::new(),
             retained_history_revision: 0,
             user_store: project.read(cx).user_store(),
             running_turn: None,
@@ -4006,6 +4017,55 @@ impl Thread {
         cx.notify();
     }
 
+    /// Queues a user message that arrived while a turn was running. It is
+    /// inserted into the conversation at the next loop boundary, after the
+    /// in-flight tool results, so the running turn is not cancelled.
+    pub(crate) fn interject_user_message(
+        &mut self,
+        id: ClientUserMessageId,
+        content: Arc<[UserMessageContent]>,
+        cx: &mut Context<Self>,
+    ) {
+        if content.is_empty() {
+            return;
+        }
+        if self
+            .messages
+            .iter()
+            .any(|message| matches!(message.as_ref(), Message::User(user) if user.id == id))
+        {
+            return;
+        }
+        if self.is_turn_complete() {
+            self.upsert_user_message(id, content, cx);
+            return;
+        }
+        if let Some(existing) = self
+            .interjected_messages
+            .iter_mut()
+            .find(|message| message.id == id)
+        {
+            existing.content = content;
+        } else {
+            self.interjected_messages
+                .push(InterjectedMessage { id, content });
+        }
+        cx.notify();
+    }
+
+    /// Inserts queued interjections into the conversation at a loop boundary.
+    /// Returns whether any message was inserted.
+    fn flush_interjected_messages(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.interjected_messages.is_empty() {
+            return false;
+        }
+        let interjected = std::mem::take(&mut self.interjected_messages);
+        for message in interjected {
+            self.upsert_user_message(message.id, message.content, cx);
+        }
+        true
+    }
+
     pub(crate) fn last_user_message_id(&self) -> Option<ClientUserMessageId> {
         self.last_user_message().map(|message| message.id.clone())
     }
@@ -4177,6 +4237,21 @@ impl Thread {
         Ok(())
     }
 
+    pub(crate) fn interject_user_block(
+        &mut self,
+        id: ClientUserMessageId,
+        blocks: impl IntoIterator<Item = acp_v2::ContentBlock>,
+        path_style: PathStyle,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let content = blocks
+            .into_iter()
+            .map(|block| UserMessageContent::from_content_block(block, path_style))
+            .collect::<Result<Arc<_>>>()?;
+        self.interject_user_message(id, content, cx);
+        Ok(())
+    }
+
     pub fn push_acp_agent_block(
         &mut self,
         block: acp_v2::ContentBlock,
@@ -4212,7 +4287,9 @@ impl Thread {
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
+        // Messages interjected into a previous turn belong to the history of
         // this one if they were never delivered.
+        self.flush_interjected_messages(cx);
         self.cancel(cx).detach();
         self.latency.start(turn_started_at);
         self.current_request_token_usage = TokenUsage::default();
@@ -4252,6 +4329,11 @@ impl Thread {
                 }
 
                 _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+                // A message interjected too late for a loop boundary still
+                // belongs to the conversation, even though this turn is over.
+                _ = this.update(cx, |this, cx| {
+                    this.flush_interjected_messages(cx);
+                });
 
                 this.read_with(cx, |thread, cx| thread.maintain_project_state(cx))
                     .log_err();
@@ -4409,6 +4491,16 @@ impl Thread {
         loop {
             if *cancellation_rx.borrow() {
                 return Ok(());
+            }
+            // Messages the user inserted while this turn was running are
+            // delivered at the next iteration, after the previous tool results,
+            // without cancelling the turn or starting a new one.
+            let interjected = this.update(cx, |this, cx| this.flush_interjected_messages(cx))?;
+            if interjected {
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
+                last_goal_response = None;
+                repeated_goal_responses = 0;
             }
             match Self::perform_compaction_if_needed(
                 this,
@@ -4811,6 +4903,17 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
+                // A message that arrived while the model was finishing is a new
+                // instruction, not a reason to end the turn.
+                let interjected =
+                    this.update(cx, |this, cx| this.flush_interjected_messages(cx))?;
+                if interjected {
+                    intent = CompletionIntent::UserPrompt;
+                    attempt = 0;
+                    last_goal_response = None;
+                    repeated_goal_responses = 0;
+                    continue;
+                }
                 let response = this.read_with(cx, |this, _| match this.last_message() {
                     Some(Message::Agent(message)) => message
                         .content
@@ -6858,6 +6961,9 @@ impl Thread {
             }
             _ => self.messages.len(),
         };
+        if insertion_ix <= latest_compaction_ix.map_or(0, |index| index + 1) {
+            return None;
+        }
         Some(insertion_ix)
     }
 
@@ -11248,6 +11354,9 @@ mod tests {
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.auto_compact.max_input_tokens = None;
+                AgentSettings::override_global(settings, cx);
                 thread.set_model(model.clone(), cx);
                 thread
                     .messages
@@ -11501,9 +11610,6 @@ mod tests {
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                let mut settings = AgentSettings::get_global(cx).clone();
-                settings.auto_compact.max_input_tokens = None;
-                AgentSettings::override_global(settings, cx);
                 thread.set_model(model.clone(), cx);
                 thread
                     .messages
