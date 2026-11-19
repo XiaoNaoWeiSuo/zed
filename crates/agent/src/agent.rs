@@ -6926,6 +6926,7 @@ mod internal_tests {
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.auto_compact = agent_settings::AutoCompactSettings {
+                max_input_tokens: None,
                 enabled: true,
                 threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
             };

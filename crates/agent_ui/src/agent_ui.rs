@@ -1148,6 +1148,7 @@ mod tests {
             single_file_review: false,
             model_parameters: vec![],
             auto_compact: agent_settings::AutoCompactSettings {
+                max_input_tokens: None,
                 enabled: false,
                 threshold: agent_settings::AutoCompactThreshold::DEFAULT,
             },

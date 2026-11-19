@@ -8830,7 +8830,8 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_subagent_compaction_respects_settings_and_context_window(cx: &mut TestAppContext) {
     for (enabled, max_tokens, max_output_tokens, input_tokens) in [
-        (true, 1_000_000, None, 899_999),
+        // Leave room for the tool result appended after the reported usage.
+        (true, 1_000_000, None, 899_990),
         (false, 1_000_000, None, 799_999),
         (true, 79_999, None, 63_999),
         (true, 100_000, Some(20_001), 79_999),
@@ -11195,6 +11196,8 @@ impl SubagentCompactionTest {
         cx.update(|cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
             settings.auto_compact.enabled = enabled;
+            // These cases isolate the capacity threshold from the latency cap.
+            settings.auto_compact.max_input_tokens = None;
             AgentSettings::override_global(settings, cx);
         });
         let model = self.fake.update_model("fake", |model| {

@@ -1532,12 +1532,13 @@ pub struct Thread {
     sandboxed_terminal_tool: Option<SandboxedTerminalTool>,
     subagent_tool: Option<SpawnAgentTool>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
+    usage_history_estimates: HashMap<ClientUserMessageId, u64>,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
-    request_started_at: Option<Instant>,
+    latency: crate::run_metrics::TurnLatency,
     throughput: TokenThroughput,
     last_metrics_publish: Option<Instant>,
     permission_tier: Rc<PermissionTierState>,
@@ -1655,6 +1656,7 @@ impl TokenThroughput {
         self.first_token_at
     }
 
+    #[cfg(test)]
     fn time_to_first_token(&self, request_started_at: Option<Instant>) -> Option<Duration> {
         let started_at = request_started_at.or(self.started_at)?;
         self.first_token_at?.checked_duration_since(started_at)
@@ -1854,9 +1856,10 @@ impl Thread {
             sandboxed_terminal_tool: None,
             subagent_tool: None,
             request_token_usage: HashMap::default(),
+            usage_history_estimates: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
-            request_started_at: None,
+            latency: crate::run_metrics::TurnLatency::default(),
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(Default::default())),
@@ -2300,9 +2303,10 @@ impl Thread {
             sandboxed_terminal_tool: None,
             subagent_tool: None,
             request_token_usage: db_thread.request_token_usage.clone(),
+            usage_history_estimates: HashMap::default(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
-            request_started_at: None,
+            latency: crate::run_metrics::TurnLatency::default(),
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(db_thread.permission_tier)),
@@ -3383,6 +3387,7 @@ impl Thread {
             return Task::ready(());
         };
 
+        self.publish_run_metrics(cx, false);
         let checkpoints = self.automatic_checkpoint_inputs(true, false, cx);
         let roots = checkpoints
             .iter()
@@ -3765,8 +3770,11 @@ impl Thread {
             return;
         };
 
-        self.request_token_usage
-            .insert(last_user_message.id.clone(), update);
+        let user_message_id = last_user_message.id.clone();
+        let history_estimate = self.estimated_history_tokens();
+        self.usage_history_estimates
+            .insert(user_message_id.clone(), history_estimate);
+        self.request_token_usage.insert(user_message_id, update);
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -4030,6 +4038,7 @@ impl Thread {
         id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        let turn_started_at = Instant::now();
         let model = self
             .compaction_model(cx)
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
@@ -4039,6 +4048,9 @@ impl Thread {
         // compaction we're about to perform.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.latency.start(turn_started_at);
+        self.throughput = TokenThroughput::default();
+        self.publish_run_metrics(cx, true);
 
         let accepted_marker_index = self.messages.iter().position(
             |message| matches!(message.as_ref(), Message::User(user) if user.id == id && user.content.is_empty()),
@@ -4123,7 +4135,12 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    if this.prompt_id == prompt_id {
+                        this.publish_run_metrics(cx, false);
+                        this.running_turn.take();
+                    }
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(
@@ -4190,11 +4207,17 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        let turn_started_at = Instant::now();
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
+        // this one if they were never delivered.
         self.cancel(cx).detach();
+        self.latency.start(turn_started_at);
+        self.current_request_token_usage = TokenUsage::default();
+        self.throughput = TokenThroughput::default();
+        self.publish_run_metrics(cx, true);
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
@@ -4299,7 +4322,12 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    if this.prompt_id == prompt_id {
+                        this.publish_run_metrics(cx, false);
+                        this.running_turn.take();
+                    }
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(
@@ -4486,9 +4514,10 @@ impl Thread {
                 let request = this.build_completion_request(intent, cx)?;
                 this.current_request_token_usage = TokenUsage::default();
                 let request_started_at = Instant::now();
-                this.request_started_at = Some(request_started_at);
+                this.latency.begin_request(request_started_at);
                 this.throughput.start(request_started_at);
                 this.last_metrics_publish = None;
+                this.publish_run_metrics(cx, true);
                 anyhow::Ok((model, provider, request))
             })??;
 
@@ -4507,9 +4536,25 @@ impl Thread {
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
             let events = match provider {
-                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Ok(provider) => {
+                    let Some(events) = completion_or_cancel(
+                        provider.stream_completion(&model, request, cx),
+                        &mut cancellation_rx,
+                    )
+                    .await
+                    else {
+                        return Ok(());
+                    };
+                    events
+                }
                 Err(error) => Err(error),
             };
+            if events.is_ok() {
+                this.update(cx, |this, cx| {
+                    this.latency.response_received(Instant::now());
+                    this.publish_run_metrics(cx, true);
+                })?;
+            }
             let (mut events, mut error) = match events {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
@@ -4858,6 +4903,11 @@ impl Thread {
             let user_store = this.user_store.read(cx);
             this.handle_completion_error(error, attempt, user_store.plan(), cx)
         })??;
+        this.update(cx, |this, cx| {
+            this.latency
+                .set_phase(crate::run_metrics::RequestPhase::Retrying);
+            this.publish_run_metrics(cx, true);
+        })?;
         let timer = cx.background_executor().timer(retry.duration);
         event_stream.send_retry(retry);
         futures::select! {
@@ -4920,6 +4970,12 @@ impl Thread {
             return Ok(ControlFlow::Break(()));
         }
 
+        this.update(cx, |this, cx| {
+            this.latency.begin_request(Instant::now());
+            this.latency
+                .set_phase(crate::run_metrics::RequestPhase::Compacting);
+            this.publish_run_metrics(cx, true);
+        })?;
         log::debug!("Running compaction");
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(
@@ -4940,6 +4996,11 @@ impl Thread {
                 result = provider.stream_completion(&model, request, cx).fuse() => result,
             };
             let mut stream = stream?;
+            this.update(cx, |this, cx| {
+                this.latency.response_received(Instant::now());
+                this.latency.set_phase(crate::run_metrics::RequestPhase::Compacting);
+                this.publish_run_metrics(cx, true);
+            })?;
 
             let mut summary = String::new();
             loop {
@@ -4961,7 +5022,12 @@ impl Thread {
                     break;
                 };
 
-                match event? {
+                let event = event?;
+                this.update(cx, |this, cx| {
+                    this.latency.note_activity(Instant::now());
+                    this.note_stream_activity(cx);
+                })?;
+                match event {
                     LanguageModelCompletionEvent::Text(text) => {
                         summary.push_str(&text);
                         event_stream.send_context_compaction_update(compaction_id.clone(), &text);
@@ -5206,11 +5272,6 @@ impl Thread {
         let cache_hit_rate =
             (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
         let tokens_per_second = self.throughput.rate();
-        let time_to_first_token_ms = self
-            .throughput
-            .time_to_first_token(self.request_started_at)
-            .map(|duration| duration.as_millis() as u64);
-
         let mut snapshot = crate::run_metrics::AgentMetricsSnapshot {
             version: crate::run_metrics::METRICS_VERSION,
             running,
@@ -5221,16 +5282,17 @@ impl Thread {
             time_to_first_token_ms: None,
             context_used_tokens: None,
             context_max_tokens: None,
+            ..Default::default()
         };
+        self.latency.populate(&mut snapshot);
         let session_id = self.id.to_string();
         if let Some(metrics) = crate::run_metrics::AgentRunMetrics::global(cx)
             .read(cx)
             .snapshot_for(&session_id)
         {
-            if metrics.provider == snapshot.provider {
+            if metrics.provider == snapshot.provider && metrics.model == snapshot.model {
                 snapshot.cache_hit_rate = metrics.cache_hit_rate;
                 snapshot.tokens_per_second = metrics.tokens_per_second;
-                snapshot.time_to_first_token_ms = metrics.time_to_first_token_ms;
             }
         }
         if let Some(cache_hit_rate) = cache_hit_rate {
@@ -5239,10 +5301,17 @@ impl Thread {
         if let Some(tokens_per_second) = tokens_per_second {
             snapshot.tokens_per_second = Some(tokens_per_second);
         }
-        if let Some(time_to_first_token_ms) = time_to_first_token_ms {
-            snapshot.time_to_first_token_ms = Some(time_to_first_token_ms);
-        }
 
+        if !running {
+            log::info!(
+                "Agent turn latency: preparation_ms={:?}, response_ms={:?}, first_activity_ms={:?}, first_text_ms={:?}, requests={}",
+                snapshot.preparation_ms,
+                snapshot.response_ms,
+                snapshot.first_activity_ms,
+                snapshot.time_to_first_token_ms,
+                snapshot.request_attempts,
+            );
+        }
         self.last_metrics_publish = Some(Instant::now());
         let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
         metrics.update(cx, |metrics, cx| {
@@ -5262,21 +5331,39 @@ impl Thread {
 
         match event {
             StartMessage { .. } => {
+                self.latency.note_activity(Instant::now());
                 self.flush_pending_message(cx);
                 self.pending_message = Some(AgentMessage::default());
             }
             Text(new_text) => {
+                if new_text.is_empty() {
+                    return Ok(None);
+                }
+                let first_text = self.latency.note_text(Instant::now());
                 self.note_token(cx);
-                self.note_stream_activity(cx);
+                if first_text {
+                    self.publish_run_metrics(cx, true);
+                } else {
+                    self.note_stream_activity(cx);
+                }
                 self.handle_text_event(new_text, event_stream)
             }
             Thinking { text, signature } => {
-                self.note_token(cx);
+                if !text.is_empty() {
+                    self.latency.note_activity(Instant::now());
+                    self.latency
+                        .set_phase(crate::run_metrics::RequestPhase::Thinking);
+                    self.note_token(cx);
+                }
                 self.note_stream_activity(cx);
                 self.handle_thinking_event(text, signature, event_stream)
             }
-            RedactedThinking { data } => self.handle_redacted_thinking_event(data),
+            RedactedThinking { data } => {
+                self.latency.note_activity(Instant::now());
+                self.handle_redacted_thinking_event(data)
+            }
             ReasoningDetails(details) => {
+                self.latency.note_activity(Instant::now());
                 let message_ix = self.messages.len();
                 let last_message = self.pending_message();
                 // Store the last non-empty reasoning_details (overwrites earlier ones)
@@ -5301,6 +5388,9 @@ impl Thread {
                 }
             }
             ToolUse(tool_use) => {
+                self.latency.note_activity(Instant::now());
+                self.latency
+                    .set_phase(crate::run_metrics::RequestPhase::Tools);
                 self.note_token(cx);
                 return Ok(self.handle_tool_use_event(tool_use, event_stream, cancellation_rx, cx));
             }
@@ -5354,14 +5444,18 @@ impl Thread {
                 self.publish_run_metrics(cx, false);
                 return Err(CompletionError::MaxTokens.into());
             }
-            Stop(StopReason::ToolUse | StopReason::EndTurn) => {
+            Stop(StopReason::ToolUse) => {
+                self.finalize_throughput();
+                self.latency
+                    .set_phase(crate::run_metrics::RequestPhase::Tools);
+                self.publish_run_metrics(cx, true);
+            }
+            Stop(StopReason::EndTurn) => {
                 self.finalize_throughput();
                 self.publish_run_metrics(cx, false);
             }
             Started => {
-                if self.request_started_at.is_none() {
-                    self.request_started_at = Some(Instant::now());
-                }
+                self.latency.note_activity(Instant::now());
                 self.publish_run_metrics(cx, true);
             }
             Queued { .. } | Compaction(_) => {}
@@ -6597,9 +6691,14 @@ impl Thread {
             tokens_before,
             auto_compact_enabled: auto_compact.enabled,
             auto_compact_threshold: auto_compact.threshold.to_string(),
-            auto_compact_threshold_tokens: auto_compact_threshold_token_count(
-                auto_compact.threshold,
-                max_input_tokens,
+            auto_compact_threshold_tokens: auto_compact.max_input_tokens.map_or_else(
+                || auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens),
+                |limit| {
+                    limit.min(auto_compact_threshold_token_count(
+                        auto_compact.threshold,
+                        max_input_tokens,
+                    ))
+                },
             ),
             retries: 0,
         })
@@ -6614,6 +6713,21 @@ impl Thread {
         }
     }
 
+    fn estimated_history_tokens(&self) -> u64 {
+        let start =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len()).unwrap_or(0);
+        self.messages
+            .iter()
+            .skip(start)
+            .map(|message| estimated_message_tokens(message))
+            .chain(
+                self.pending_message
+                    .as_ref()
+                    .map(|message| estimated_agent_message_bytes(message).div_ceil(4)),
+            )
+            .fold(0u64, u64::saturating_add)
+    }
+
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
         if !self.auto_compaction_enabled(cx) {
             return None;
@@ -6621,7 +6735,9 @@ impl Thread {
 
         let auto_compact = AgentSettings::get_global(cx).auto_compact;
         let max_input_tokens = self.input_token_capacity()?;
-        let (usage_ix, usage) = {
+        let latest_compaction_ix =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len());
+        let latest_usage = {
             let this = &self;
             this.messages
                 .iter()
@@ -6636,16 +6752,37 @@ impl Thread {
                         .copied()
                         .map(|usage| (ix, usage))
                 })
-        }?;
-        if latest_compaction_message_ix_before(&self.messages, self.messages.len())
-            .is_some_and(|compaction_ix| compaction_ix > usage_ix)
-        {
-            return None;
-        }
-
-        let active_tokens = total_input_tokens(usage).saturating_add(usage.output_tokens);
-        let compaction_threshold =
+        };
+        let reported_tokens = latest_usage
+            .filter(|(usage_ix, _)| {
+                latest_compaction_ix.is_none_or(|compaction_ix| compaction_ix <= *usage_ix)
+            })
+            .map(|(usage_ix, usage)| {
+                let growth = self
+                    .messages
+                    .get(usage_ix)
+                    .and_then(|message| match message.as_ref() {
+                        Message::User(user) => self.usage_history_estimates.get(&user.id),
+                        _ => None,
+                    })
+                    .map(|baseline| self.estimated_history_tokens().saturating_sub(*baseline))
+                    .unwrap_or(0);
+                total_input_tokens(usage)
+                    .saturating_add(usage.output_tokens)
+                    .saturating_add(growth)
+            });
+        let capacity_threshold =
             auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
+        let compaction_threshold = auto_compact
+            .max_input_tokens
+            .map_or(capacity_threshold, |limit| capacity_threshold.min(limit));
+        // Usage is absent on a restored branch or stale after a large tool result.
+        // Byte lengths provide a cheap text-only estimate without cloning history
+        // or making a separate token-counting request on the critical path.
+        let estimated_tokens = auto_compact
+            .max_input_tokens
+            .map(|_| self.estimated_history_tokens());
+        let active_tokens = reported_tokens.into_iter().chain(estimated_tokens).max()?;
         if active_tokens < compaction_threshold {
             return None;
         }
@@ -6761,6 +6898,20 @@ impl Thread {
                     },
                     None => RetryStrategy::ExponentialBackoff,
                 })
+            }
+            // A stalled request already spent its full idle budget. Replaying a
+            // large context automatically would multiply the wait without progress.
+            ApiReadResponseError { error, .. } if error.kind() == std::io::ErrorKind::TimedOut => {
+                None
+            }
+            HttpSend { error, .. } | Other(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                }) =>
+            {
+                None
             }
             ApiReadResponseError { .. } | HttpSend { .. } | DeserializeResponse { .. } => {
                 Some(RetryStrategy::FixedDelay {
@@ -6987,6 +7138,62 @@ impl CompactionTelemetry {
             retries = self.retries,
         );
     }
+}
+
+async fn completion_or_cancel<T>(
+    completion: impl std::future::Future<Output = T>,
+    cancellation_rx: &mut watch::Receiver<bool>,
+) -> Option<T> {
+    if *cancellation_rx.borrow() {
+        return None;
+    }
+    futures::select_biased! {
+        _ = cancellation_rx.changed().fuse() => None,
+        result = completion.fuse() => Some(result),
+    }
+}
+
+fn estimated_agent_message_bytes(message: &AgentMessage) -> u64 {
+    let content_bytes = message
+        .content
+        .iter()
+        .map(|content| match content {
+            AgentMessageContent::Text(text) | AgentMessageContent::Thinking { text, .. } => {
+                text.len() as u64
+            }
+            AgentMessageContent::RedactedThinking(_) => 0,
+            AgentMessageContent::ToolUse(tool) => tool.raw_input.len() as u64,
+        })
+        .fold(0u64, u64::saturating_add);
+    message
+        .tool_results
+        .values()
+        .flat_map(|result| &result.content)
+        .map(|content| match content {
+            LanguageModelToolResultContent::Text(text) => text.len() as u64,
+            LanguageModelToolResultContent::Image(_) => 0,
+        })
+        .fold(content_bytes, u64::saturating_add)
+}
+
+fn estimated_message_tokens(message: &Message) -> u64 {
+    let text_bytes = match message {
+        Message::User(message) => message
+            .content
+            .iter()
+            .map(|content| match content {
+                UserMessageContent::Text(text) => text.len() as u64,
+                UserMessageContent::Mention { content, .. } => content.len() as u64,
+                UserMessageContent::Image(_) => 0,
+            })
+            .fold(0u64, u64::saturating_add),
+        Message::Agent(message) => estimated_agent_message_bytes(message),
+        Message::UserDecision { content, .. } => content.len() as u64,
+        Message::Compaction(CompactionInfo::Summary(summary)) => summary.len() as u64,
+        Message::Compaction(CompactionInfo::ProviderNative { .. }) => 0,
+        Message::Resume => 0,
+    };
+    text_bytes.div_ceil(4)
 }
 
 fn user_message_byte_len(message: &LanguageModelRequestMessage) -> usize {
@@ -10607,6 +10814,305 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_cancel_while_waiting_for_completion_headers(cx: &mut TestAppContext) {
+        let (mut cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = cx.background_spawn({
+            let dropped = dropped.clone();
+            async move {
+                let completion = async move {
+                    let _guard = util::defer(move || {
+                        dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    started_tx.send(()).expect("completion started");
+                    futures::future::pending::<()>().await;
+                };
+                completion_or_cancel(completion, &mut cancellation_rx).await
+            }
+        });
+        started_rx.await.expect("request waiting for headers");
+        cancellation_tx.send(true).expect("cancel request");
+        assert_eq!(task.await, None);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "cancellation must drop the pending request and release its resources"
+        );
+    }
+
+    #[test]
+    fn test_retry_strategy_does_not_replay_timed_out_requests() {
+        let errors = [
+            LanguageModelCompletionError::HttpSend {
+                provider: "test".to_string().into(),
+                host: "example.invalid".into(),
+                error: anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "LLM response headers timed out",
+                ))
+                .context("HTTP request"),
+            },
+            LanguageModelCompletionError::ApiReadResponseError {
+                provider: "test".to_string().into(),
+                error: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "LLM response body idle timeout",
+                ),
+            },
+            LanguageModelCompletionError::Other(
+                anyhow::Error::new(LanguageModelCompletionError::HttpSend {
+                    provider: "test".to_string().into(),
+                    host: "example.invalid".into(),
+                    error: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "LLM response headers timed out",
+                    )
+                    .into(),
+                })
+                .context("compatible provider"),
+            ),
+        ];
+        for error in errors {
+            assert_eq!(Thread::retry_strategy_for(&error), None);
+        }
+        let reset = LanguageModelCompletionError::HttpSend {
+            provider: "test".to_string().into(),
+            host: "example.invalid".into(),
+            error: std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into(),
+        };
+        assert!(
+            Thread::retry_strategy_for(&reset).is_some(),
+            "transient connection failures still get their existing retry policy"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_compaction_latency_cap_bounds_large_context(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let user_message_id = ClientUserMessageId::new();
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                    max_input_tokens: Some(128_000),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread
+                    .messages
+                    .push(user_text_message(user_message_id.clone(), "history"));
+                thread.request_token_usage.insert(
+                    user_message_id.clone(),
+                    TokenUsage {
+                        input_tokens: 127_999,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+                thread.request_token_usage.insert(
+                    user_message_id,
+                    TokenUsage {
+                        input_tokens: 128_000,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(thread.compaction_message_target_ix(cx), Some(1));
+                let user_id = thread.last_user_message().expect("user message").id.clone();
+                thread.update_token_usage(
+                    TokenUsage {
+                        input_tokens: 120_000,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                assert!(thread.usage_history_estimates.contains_key(&user_id));
+                thread
+                    .messages
+                    .push(agent_text_message(&"x".repeat(60_000)));
+                assert_eq!(
+                    thread.compaction_message_target_ix(cx),
+                    Some(2),
+                    "measured input plus unreported growth must trigger the cap"
+                );
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.auto_compact.max_input_tokens = None;
+                AgentSettings::override_global(settings, cx);
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_estimates_unreported_tool_growth(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let user_message_id = ClientUserMessageId::new();
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                    max_input_tokens: Some(128_000),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread
+                    .messages
+                    .push(user_text_message(user_message_id.clone(), "history"));
+                thread.request_token_usage.insert(
+                    user_message_id,
+                    TokenUsage {
+                        input_tokens: 100,
+                        ..Default::default()
+                    },
+                );
+                let tool_use_id = LanguageModelToolUseId::from("large-output");
+                let mut message = AgentMessage::default();
+                message.tool_results.insert(
+                    tool_use_id.clone(),
+                    LanguageModelToolResult {
+                        tool_use_id,
+                        tool_name: "read_file".into(),
+                        is_error: false,
+                        content: vec!["x".repeat(512_000).into()],
+                        output: None,
+                    },
+                );
+                thread.messages.push(Arc::new(Message::Agent(message)));
+                assert_eq!(thread.compaction_message_target_ix(cx), Some(2));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "new request"));
+                assert_eq!(
+                    thread.compaction_message_target_ix(cx),
+                    Some(2),
+                    "compact the old history, not the unanswered user request"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_cap_does_not_repeat_without_new_history(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                    max_input_tokens: Some(128_000),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(fake.model("fake"), cx);
+                thread
+                    .messages
+                    .push(summary_compaction(&"x".repeat(512_000)));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "new request"));
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+                thread.messages.clear();
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    &"x".repeat(512_000),
+                ));
+                assert_eq!(
+                    thread.compaction_message_target_ix(cx),
+                    None,
+                    "a first user request has no older history to compact"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turn_metrics_distinguish_thinking_and_text(cx: &mut TestAppContext) {
+        let (thread, event_stream, fake) = setup_thread_for_test(cx).await;
+        let (_, cancellation_rx) = watch::channel(false);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(fake.model("fake"), cx);
+            thread
+                .latency
+                .start(Instant::now() - Duration::from_secs(2));
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::Thinking {
+                        text: "reasoning".into(),
+                        signature: None,
+                    },
+                    &event_stream,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .expect("thinking event");
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::Text(String::new()),
+                    &event_stream,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .expect("empty text");
+            let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
+            let snapshot = metrics
+                .read(cx)
+                .snapshot_for(&thread.id.to_string())
+                .expect("metrics");
+            assert_eq!(snapshot.time_to_first_token_ms, None);
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::Text("reply".into()),
+                    &event_stream,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .expect("text event");
+            thread.publish_run_metrics(cx, true);
+            let first_text = metrics
+                .read(cx)
+                .snapshot_for(&thread.id.to_string())
+                .and_then(|snapshot| snapshot.time_to_first_token_ms)
+                .expect("first text");
+            assert!(first_text >= 2_000);
+            thread.latency.begin_request(Instant::now());
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::Text("next request".into()),
+                    &event_stream,
+                    cancellation_rx,
+                    cx,
+                )
+                .expect("next request text");
+            thread.publish_run_metrics(cx, true);
+            assert_eq!(
+                metrics
+                    .read(cx)
+                    .snapshot_for(&thread.id.to_string())
+                    .and_then(|snapshot| snapshot.time_to_first_token_ms),
+                Some(first_text)
+            );
+            thread.latency.start(Instant::now());
+            thread.publish_run_metrics(cx, true);
+            assert_eq!(
+                metrics
+                    .read(cx)
+                    .snapshot_for(&thread.id.to_string())
+                    .and_then(|snapshot| snapshot.time_to_first_token_ms),
+                None,
+                "the next turn must not inherit the previous first-text timing"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_compaction_threshold_uses_percentage_setting(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let model = fake.model("fake");
@@ -10649,6 +11155,9 @@ mod tests {
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.auto_compact.max_input_tokens = None;
+                AgentSettings::override_global(settings, cx);
                 thread.set_model(model.clone(), cx);
                 thread.messages.push(user_text_message(
                     user_message_id.clone(),
@@ -10677,6 +11186,7 @@ mod tests {
                 set_auto_compact_settings(
                     cx,
                     agent_settings::AutoCompactSettings {
+                        max_input_tokens: None,
                         enabled: true,
                         threshold: AutoCompactThreshold::TokensRemaining(20_000),
                     },
@@ -10718,6 +11228,7 @@ mod tests {
             set_auto_compact_settings(
                 cx,
                 agent_settings::AutoCompactSettings {
+                    max_input_tokens: None,
                     enabled: true,
                     threshold: AutoCompactThreshold::Percentage(0.9),
                 },
@@ -10755,6 +11266,7 @@ mod tests {
             set_auto_compact_settings(
                 cx,
                 agent_settings::AutoCompactSettings {
+                    max_input_tokens: None,
                     enabled: false,
                     threshold: AutoCompactThreshold::Percentage(0.9),
                 },
@@ -10787,6 +11299,7 @@ mod tests {
             set_auto_compact_settings(
                 cx,
                 agent_settings::AutoCompactSettings {
+                    max_input_tokens: None,
                     enabled: true,
                     threshold: AutoCompactThreshold::TokensUsed(100_000),
                 },
@@ -10820,6 +11333,7 @@ mod tests {
                 set_auto_compact_settings(
                     cx,
                     agent_settings::AutoCompactSettings {
+                        max_input_tokens: None,
                         enabled: true,
                         threshold: AutoCompactThreshold::TokensRemaining(20_000),
                     },
@@ -10859,6 +11373,9 @@ mod tests {
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
+                let mut settings = AgentSettings::get_global(cx).clone();
+                settings.auto_compact.max_input_tokens = None;
+                AgentSettings::override_global(settings, cx);
                 thread.set_model(model.clone(), cx);
                 thread
                     .messages
@@ -10926,6 +11443,25 @@ mod tests {
         fake.end_stream(&model, &compaction_request);
         cx.run_until_parked();
 
+        cx.update(|cx| {
+            let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
+            let thread = thread.read(cx);
+            let snapshot = metrics
+                .read(cx)
+                .snapshot_for(&thread.id.to_string())
+                .expect("metrics");
+            assert_eq!(
+                snapshot.request_attempts, 2,
+                "compaction is a model request too"
+            );
+            assert!(snapshot.preparation_ms.is_some());
+            assert!(snapshot.response_ms.is_some());
+            assert!(snapshot.first_activity_ms.is_some());
+            assert_eq!(
+                snapshot.time_to_first_token_ms, None,
+                "internal summary text is not the first user-visible reply"
+            );
+        });
         let final_request = fake.pending_completions().pop().unwrap();
         assert_eq!(final_request.intent, Some(CompletionIntent::UserPrompt));
         assert_eq!(
@@ -11424,6 +11960,7 @@ mod tests {
             set_auto_compact_settings(
                 cx,
                 agent_settings::AutoCompactSettings {
+                    max_input_tokens: None,
                     enabled: true,
                     threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
                 },

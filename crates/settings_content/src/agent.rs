@@ -232,10 +232,21 @@ pub struct AutoCompactSettingsContent {
     ///   the context window. For example, `-20000` compacts once there are
     ///   fewer than 20,000 tokens of headroom left in the context window.
     ///
-    /// `0` is not a valid threshold.
+    /// `0` is not a valid threshold. Compaction also runs when
+    /// `max_input_tokens` is reached, even if this threshold has not been reached.
+    /// Set `max_input_tokens` to `0` to use only this threshold.
     ///
     /// Default: "90%"
     pub threshold: Option<AutoCompactThreshold>,
+    /// An independent input-token limit for auto-compaction, to keep long
+    /// conversations responsive even on models with large context windows.
+    /// Compaction runs when either this limit or `threshold` is reached.
+    ///
+    /// Set to `0` to disable this limit. Omitted or `null` values inherit the
+    /// default. `enabled: false` disables all automatic compaction.
+    ///
+    /// Default: 128000
+    pub max_input_tokens: Option<u64>,
 }
 
 #[with_fallible_options]

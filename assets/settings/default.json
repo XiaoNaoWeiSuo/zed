@@ -1294,8 +1294,15 @@
       //     (e.g. 100000 compacts after 100,000 tokens are used).
       //   - A negative integer: compact once that many tokens remain in the
       //     context window (e.g. -20000 compacts once fewer than 20,000 remain).
-      // 0 is not a valid threshold.
+      // 0 is not a valid threshold. The independent max_input_tokens limit
+      // can trigger compaction earlier; set it to 0 to use only this threshold.
       "threshold": "90%",
+      // Also compact once this many input tokens are used, to keep long
+      // conversations responsive on models with large context windows.
+      // Compaction runs when either this limit or threshold is reached.
+      // Set to 0 to disable this limit; null or omitted values inherit the default.
+      // enabled: false disables all automatic compaction.
+      "max_input_tokens": 128000,
     },
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,

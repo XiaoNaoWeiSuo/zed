@@ -14582,6 +14582,7 @@ impl ThreadView {
             time_to_first_token_ms,
             context_used_tokens: Some(usage.used_tokens),
             context_max_tokens: Some(usage.max_tokens),
+            ..Default::default()
         };
         let session_id = self.session_id.to_string();
         let metrics = agent::run_metrics::AgentRunMetrics::global(cx);

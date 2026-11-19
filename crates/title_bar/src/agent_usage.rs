@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use agent::run_metrics::AgentRunMetrics;
+use agent::run_metrics::{AgentMetricsSnapshot, AgentRunMetrics, RequestPhase};
 use chrono::TimeZone as _;
 use gpui::{
     Context, Entity, PathBuilder, Pixels, Render, Subscription, Task, Window, WindowId, canvas,
@@ -486,10 +486,25 @@ impl Render for AgentUsageIndicator {
                     .into_any_element(),
             );
         }
+        if let Some(phase) = snapshot.phase.filter(|_| snapshot.running) {
+            let phase = phase_label(phase);
+            children.push(
+                div()
+                    .id("agent-request-phase")
+                    .tooltip(Tooltip::text(latency_tooltip(&snapshot)))
+                    .child(Label::new(phase).size(LabelSize::XSmall))
+                    .into_any_element(),
+            );
+        }
         if let Some(time_to_first_token) = time_to_first_token {
             children.push(
-                Label::new(format!("{:.2}s TTFT", time_to_first_token.as_secs_f32()))
-                    .size(LabelSize::XSmall)
+                div()
+                    .id("agent-time-to-first-text")
+                    .tooltip(Tooltip::text(latency_tooltip(&snapshot)))
+                    .child(
+                        Label::new(format!("{:.2}s TTFT", time_to_first_token.as_secs_f32()))
+                            .size(LabelSize::XSmall),
+                    )
                     .into_any_element(),
             );
         }
@@ -541,6 +556,38 @@ impl Render for AgentUsageIndicator {
             .children(children)
             .into_any_element()
     }
+}
+
+fn phase_label(phase: RequestPhase) -> &'static str {
+    match phase {
+        RequestPhase::Preparing => "Preparing",
+        RequestPhase::Compacting => "Compacting",
+        RequestPhase::Connecting => "Connecting",
+        RequestPhase::AwaitingOutput => "Awaiting output",
+        RequestPhase::Thinking => "Thinking",
+        RequestPhase::Streaming => "Streaming",
+        RequestPhase::Retrying => "Retrying",
+        RequestPhase::Tools => "Running tools",
+    }
+}
+
+fn latency_tooltip(snapshot: &AgentMetricsSnapshot) -> String {
+    if snapshot.provider.is_none() {
+        return "External agent activity latency. ACP does not report token arrival timestamps; this value is the first entry update, not necessarily the first text.".to_string();
+    }
+    let elapsed = |milliseconds: Option<u64>| {
+        milliseconds
+            .map(|milliseconds| format!("{:.2}s", milliseconds as f64 / 1_000.0))
+            .unwrap_or_else(|| "Not recorded".to_string())
+    };
+    format!(
+        "Turn latency (all times measured from turn start):\nPreparation (first request started): {}\nResponse (first provider response received): {}\nFirst event (including lifecycle, reasoning or tools): {}\nTTFT (first nonempty text, not reasoning): {}\nRequest attempts (including retries): {}\nTTFT includes preparation, retries, and any thinking or tool work before the first text.",
+        elapsed(snapshot.preparation_ms),
+        elapsed(snapshot.response_ms),
+        elapsed(snapshot.first_activity_ms),
+        elapsed(snapshot.time_to_first_token_ms),
+        snapshot.request_attempts,
+    )
 }
 
 fn short_tokens(tokens: u64) -> String {

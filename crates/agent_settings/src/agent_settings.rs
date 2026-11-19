@@ -177,6 +177,7 @@ impl fmt::Display for AutoCompactThreshold {
 pub struct AutoCompactSettings {
     pub enabled: bool,
     pub threshold: AutoCompactThreshold,
+    pub max_input_tokens: Option<u64>,
 }
 
 fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshold> {
@@ -839,6 +840,7 @@ impl Settings for AgentSettings {
                 AutoCompactSettings {
                     enabled: auto_compact.enabled.unwrap(),
                     threshold,
+                    max_input_tokens: auto_compact.max_input_tokens.filter(|tokens| *tokens > 0),
                 }
             },
             enable_feedback: agent.enable_feedback.unwrap(),
@@ -1076,6 +1078,81 @@ mod tests {
         assert!(parse_auto_compact_threshold("150%").is_err());
         assert!(parse_auto_compact_threshold("0.8").is_err());
         assert!(parse_auto_compact_threshold("eighty percent").is_err());
+    }
+
+    #[gpui::test]
+    fn test_auto_compact_max_input_tokens_settings(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let defaults = AutoCompactSettings {
+            enabled: true,
+            threshold: AutoCompactThreshold::Percentage(0.9),
+            max_input_tokens: Some(128_000),
+        };
+        assert_eq!(AgentSettings::get_global(cx).auto_compact, defaults);
+
+        for (auto_compact, expected) in [
+            (json!({}), defaults),
+            (json!({"max_input_tokens": null}), defaults),
+            (
+                json!({"max_input_tokens": 64_000}),
+                AutoCompactSettings {
+                    max_input_tokens: Some(64_000),
+                    ..defaults
+                },
+            ),
+            (
+                json!({"max_input_tokens": 0}),
+                AutoCompactSettings {
+                    max_input_tokens: None,
+                    ..defaults
+                },
+            ),
+            (
+                json!({"enabled": false}),
+                AutoCompactSettings {
+                    enabled: false,
+                    ..defaults
+                },
+            ),
+            (
+                json!({"threshold": "95.5%"}),
+                AutoCompactSettings {
+                    threshold: AutoCompactThreshold::Percentage(0.955),
+                    ..defaults
+                },
+            ),
+            (
+                json!({"threshold": 200_000}),
+                AutoCompactSettings {
+                    threshold: AutoCompactThreshold::TokensUsed(200_000),
+                    ..defaults
+                },
+            ),
+            (
+                json!({"threshold": -20_000, "max_input_tokens": 0}),
+                AutoCompactSettings {
+                    threshold: AutoCompactThreshold::TokensRemaining(20_000),
+                    max_input_tokens: None,
+                    ..defaults
+                },
+            ),
+        ] {
+            let content = json!({"agent": {"auto_compact": auto_compact}}).to_string();
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(&content, cx)
+                    .expect("user settings should load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).auto_compact,
+                expected,
+                "{content}"
+            );
+        }
     }
 
     #[test]
