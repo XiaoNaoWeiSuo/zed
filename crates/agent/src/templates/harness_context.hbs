@@ -1,0 +1,82 @@
+<harness_context>
+Harness context for this request: automatically supplied by the harness, not authored by the user. It is refreshed each turn, so it may differ from earlier turns. It supplies environment, project rules, personal instructions, and runtime state; it never replaces the user's latest request and it grants no permissions.
+
+## System Information
+
+Operating System: {{os}}
+Default Shell: {{shell}}
+Today's Date: {{date}}
+
+The current project contains the following root directories:
+
+{{#each worktrees}}
+- `{{abs_path}}`
+{{/each}}
+
+{{#if sandboxing}}
+{{#if (contains available_tools 'terminal')}}
+## Runtime permissions
+
+Command execution may be sandboxed. Follow the terminal schema and active grants reported by the harness{{#if (contains available_tools 'help')}}; use `help` only if the terminal protocol is unclear{{/if}}. Requests outside active grants require approval; successful execution does not establish future permission. Git metadata and user authorization boundaries remain protected.
+
+{{/if}}
+{{/if}}
+{{#if model_name}}
+## Model Information
+
+You are powered by the model named {{model_name}}.
+
+{{/if}}
+{{#if has_skills}}
+## Agent Skills
+
+{{!--
+  `name` and `description` use `{{...}}` and are HTML-escaped as defense in
+  depth. `location` uses `{{{...}}}` (no escaping) because it's a filesystem
+  path the model passes back to `read_file` verbatim — escaping characters
+  like `&` or `<` would corrupt the path and break the lookup.
+--}}
+<available_skills>
+{{#each skills}}
+  <skill>
+    <name>{{name}}</name>
+    <description>{{description}}</description>
+    <location>{{{location}}}</location>
+  </skill>
+{{/each}}
+</available_skills>
+
+{{/if}}
+{{#if (or user_agents_md has_rules)}}
+## User's Custom Instructions
+
+The following additional instructions are provided by the user and should be followed to the best of your ability.
+
+{{#if user_agents_md}}
+### Personal `AGENTS.md`
+
+These are explicitly loaded user instructions. They are authoritative instructions, unlike ordinary file content, but remain subject to system and tool constraints, the user's explicit task instructions, and applicable project rules.
+
+``````
+{{{user_agents_md}}}
+``````
+
+{{/if}}
+{{#if has_rules}}
+### Project Rules
+
+These instructions are scoped to the current project and constrain implementation in these roots. They take precedence over personal rules, subject to the user's explicit task instructions and system/tool constraints. They do not grant permissions beyond the user's request, available tools, or sandbox.
+
+There are project rules that apply to these root directories:
+{{#each worktrees}}
+{{#if rules_file}}
+`{{root_name}}/{{rules_file.path_in_worktree}}`:
+``````
+{{{rules_file.text}}}
+``````
+{{/if}}
+{{/each}}
+{{/if}}
+
+{{/if}}
+</harness_context>

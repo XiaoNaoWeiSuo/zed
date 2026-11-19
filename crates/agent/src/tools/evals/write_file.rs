@@ -183,7 +183,7 @@ impl WriteToolTest {
 
         let tools = crate::built_in_tools().collect::<Vec<_>>();
 
-        let system_prompt = {
+        let (system_prompt, harness_context) = {
             let worktrees = vec![WorktreeContext {
                 root_name: "root".to_string(),
                 abs_path: Path::new("/path/to/root").into(),
@@ -194,7 +194,13 @@ impl WriteToolTest {
                 .iter()
                 .map(|tool| tool.name.clone().into())
                 .collect::<Vec<_>>();
-            let template = crate::SystemPromptTemplate {
+            let templates = Templates::new();
+            let system_prompt = crate::SystemPromptTemplate {
+                available_tools: tool_names.clone(),
+                is_subagent: false,
+            }
+            .render(&templates)?;
+            let harness_context = crate::HarnessContextTemplate {
                 project: &project_context,
                 available_tools: tool_names,
                 model_name: None,
@@ -203,17 +209,25 @@ impl WriteToolTest {
                 sandboxing: false,
                 is_linux: cfg!(target_os = "linux"),
                 is_windows: cfg!(target_os = "windows"),
-            };
-            let templates = Templates::new();
-            template.render(&templates)?
+            }
+            .render(&templates)?;
+            (system_prompt, harness_context)
         };
 
-        let messages = [LanguageModelRequestMessage {
-            role: Role::System,
-            content: vec![MessageContent::Text(system_prompt)],
-            cache: true,
-            reasoning_details: None,
-        }]
+        let messages = [
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(system_prompt)],
+                cache: false,
+                reasoning_details: None,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(harness_context)],
+                cache: false,
+                reasoning_details: None,
+            },
+        ]
         .into_iter()
         .chain(eval.conversation)
         .collect::<Vec<_>>();

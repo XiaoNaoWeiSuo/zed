@@ -36,8 +36,28 @@ pub trait Template: Sized {
     }
 }
 
+/// The system prompt carries instructions only. Everything that can change
+/// during a session (date, project roots, rules, skills, sandbox state, model,
+/// goals, terminal capabilities, runtime state) lives in
+/// [`HarnessContextTemplate`] and travels in its own per-request message, so the
+/// system prompt stays byte-identical and the provider's prefix cache keeps
+/// hitting.
 #[derive(Serialize)]
-pub struct SystemPromptTemplate<'a> {
+pub struct SystemPromptTemplate {
+    pub available_tools: Vec<SharedString>,
+    /// Whether this thread is a delegated subagent. Constant for the lifetime
+    /// of a thread, so it can stay in the system prompt.
+    pub is_subagent: bool,
+}
+
+impl Template for SystemPromptTemplate {
+    const TEMPLATE_NAME: &'static str = "system_prompt.hbs";
+}
+
+/// Per-request state rendered next to the current user message, outside the
+/// stable system-prompt prefix.
+#[derive(Serialize)]
+pub struct HarnessContextTemplate<'a> {
     #[serde(flatten)]
     pub project: &'a prompt_store::ProjectContext,
     pub available_tools: Vec<SharedString>,
@@ -48,10 +68,9 @@ pub struct SystemPromptTemplate<'a> {
     pub user_agents_md: Option<SharedString>,
     /// Whether agent-run terminal commands are wrapped in an OS-level
     /// sandbox for this thread. When `true` — and the `terminal` tool is
-    /// in `available_tools` — the rendered prompt describes the sandbox's
+    /// in `available_tools` — the rendered context describes the sandbox's
     /// read/write/network rules and the per-command flags the model can
-    /// request to relax them. Otherwise the prompt omits the sandbox
-    /// section entirely.
+    /// request to relax them. Otherwise the sandbox section is omitted.
     pub sandboxing: bool,
     /// Whether the host is Linux. The writable-temp story differs by
     /// platform (Linux exposes an ephemeral `tmpfs` over `/tmp`; other
@@ -63,8 +82,8 @@ pub struct SystemPromptTemplate<'a> {
     pub is_windows: bool,
 }
 
-impl Template for SystemPromptTemplate<'_> {
-    const TEMPLATE_NAME: &'static str = "system_prompt.hbs";
+impl Template for HarnessContextTemplate<'_> {
+    const TEMPLATE_NAME: &'static str = "harness_context.hbs";
 }
 
 /// Handlebars helper for checking if an item is in a list
@@ -95,28 +114,52 @@ fn contains(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prompt_store::{ProjectContext, RulesFileContext, WorktreeContext};
+    use util::rel_path::RelPath;
 
-    #[test]
-    fn test_system_prompt_template() {
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
+    fn tool_names(tools: &[&str]) -> Vec<SharedString> {
+        tools.iter().map(|tool| SharedString::from(*tool)).collect()
+    }
+
+    fn render_system_prompt(tools: &[&str], is_subagent: bool) -> String {
+        SystemPromptTemplate {
+            available_tools: tool_names(tools),
+            is_subagent,
+        }
+        .render(&Templates::new())
+        .expect("system prompt")
+    }
+
+    fn render_harness_context(
+        project: &ProjectContext,
+        tools: &[&str],
+        user_agents_md: Option<&str>,
+        sandboxing: bool,
+        is_linux: bool,
+        is_windows: bool,
+    ) -> String {
+        HarnessContextTemplate {
+            project,
+            available_tools: tool_names(tools),
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: false,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+            user_agents_md: user_agents_md.map(SharedString::from),
+            sandboxing,
+            is_linux,
+            is_windows,
+        }
+        .render(&Templates::new())
+        .expect("harness context")
+    }
+
+    #[test]
+    fn system_prompt_carries_only_stable_instructions() {
+        let rendered = render_system_prompt(&["echo"], false);
         assert!(rendered.contains("You are the Lin coding agent"));
-        assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Capabilities and help"));
-        assert!(
-            rendered.contains("Authority order: system and tool constraints, explicit user task")
-        );
+        assert!(rendered.contains(
+            "Authority order: system and tool constraints, the user's latest explicit task"
+        ));
         assert!(!rendered.contains("Use `help` only when uncertain about a capability"));
         assert!(
             rendered
@@ -133,211 +176,159 @@ mod tests {
         assert!(
             rendered.contains("Tool schemas and current authorization state are authoritative")
         );
+        assert!(rendered.contains("The newest user message is the current task"));
         assert!(!rendered.contains("ask_user"));
         assert!(!rendered.contains("manage_goal"));
         assert!(!rendered.contains("1-2 focused attempts"));
-        assert!(rendered.contains("test-model"));
+
+        // Volatile session state must never live in the system prompt, or the
+        // provider's prefix cache breaks whenever it changes.
+        assert!(!rendered.contains("Today's Date"));
+        assert!(!rendered.contains("Operating System"));
+        assert!(!rendered.contains("## System Information"));
+        assert!(!rendered.contains("test-model"));
+        assert!(!rendered.contains("## Model Information"));
+        assert!(!rendered.contains("## Runtime permissions"));
+        assert!(!rendered.contains("Terminal execution capabilities"));
+        assert!(!rendered.contains("Active user goal"));
+        assert!(!rendered.contains("Project checkpoint data"));
+        assert!(!rendered.contains("Harness runtime snapshot"));
+        assert!(!rendered.contains("/tmp/alpha"));
+    }
+
+    #[test]
+    fn prompt_variants_render_identical_static_instructions() {
+        let templates = Templates::new();
+        for tools in [
+            Vec::new(),
+            vec!["read_file".to_string()],
+            vec!["skill".to_string()],
+        ] {
+            let data = serde_json::json!({
+                "available_tools": tools,
+                "is_subagent": false,
+            });
+            let system = templates
+                .0
+                .render("system_prompt.hbs", &data)
+                .expect("system prompt");
+            let experimental = templates
+                .0
+                .render("experimental_system_prompt.hbs", &data)
+                .expect("experimental prompt");
+            assert_eq!(system, experimental);
+        }
+    }
+
+    #[test]
+    fn prompt_variants_stay_compact() {
+        let templates = Templates::new();
+        let data = serde_json::json!({
+            "available_tools": [
+                "read_file", "terminal", "ask_user", "manage_goal",
+                "project_checkpoint", "spawn_agent", "create_directory", "skill",
+            ],
+            "is_subagent": true,
+        });
+        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
+            let rendered = templates.0.render(name, &data).expect("render prompt");
+            assert!(
+                rendered.chars().count() <= 6000,
+                "{name} grew to {} chars",
+                rendered.chars().count()
+            );
+            for (tool, phrase) in [
+                ("ask_user", "Use `ask_user`"),
+                ("project_checkpoint", "Use `project_checkpoint`"),
+                ("spawn_agent", "Delegate only"),
+            ] {
+                assert!(!rendered.contains(phrase), "{name}: {tool}");
+            }
+            assert!(!rendered.contains("Use `help` only when uncertain"));
+            assert!(rendered.contains("## Subagent boundary"));
+            assert!(rendered.contains("## Agent Skills"));
+            assert!(rendered.contains(
+                "Create a goal only when the user explicitly requests a sustained target"
+            ));
+        }
     }
 
     #[test]
     fn prompt_variants_load_only_available_workflows() {
-        let templates = Templates::new();
-        let project = prompt_store::ProjectContext::default();
-        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
-            let mut template = SystemPromptTemplate {
-                project: &project,
-                available_tools: Vec::new(),
-                model_name: None,
-                date: "2026-10-29".into(),
-                user_agents_md: None,
-                sandboxing: false,
-                is_linux: false,
-                is_windows: false,
-            };
-            let rendered = templates.0.render(name, &template).expect("prompt");
-            assert!(rendered.contains("supplied conversation only"));
-            assert!(
-                rendered
-                    .contains("Authority order: system and tool constraints, explicit user task")
-            );
-            assert!(rendered.contains("For authorized implementation work"));
-            assert!(
-                rendered.contains(
-                    "Verification earns its cost only when it can change your conclusion"
-                )
-            );
-            assert!(!rendered.contains("For a greeting alone"));
-            assert!(!rendered.contains("Use `project_checkpoint`"));
-            assert!(!rendered.contains("## Capabilities and help"));
-            assert!(!rendered.contains("Runtime snapshots"));
-            template.available_tools = vec!["ask_user".into(), "manage_goal".into()];
-            let rendered = templates
-                .0
-                .render(name, &template)
-                .expect("prompt with tools");
-            assert!(!rendered.contains("Use `help` only when uncertain"));
-            assert!(rendered.contains("directly inspect, change, and check"));
-            assert!(rendered.contains(
+        let rendered = render_system_prompt(&[], false);
+        assert!(rendered.contains("supplied conversation only"));
+        assert!(rendered.contains(
+            "Authority order: system and tool constraints, the user's latest explicit task"
+        ));
+        assert!(rendered.contains("For authorized implementation work"));
+        assert!(
+            rendered
+                .contains("Verification earns its cost only when it can change your conclusion")
+        );
+        assert!(!rendered.contains("For a greeting alone"));
+        assert!(!rendered.contains("## Capabilities and help"));
+        assert!(!rendered.contains("## Agent Skills"));
+        assert!(!rendered.contains("## Subagent boundary"));
+
+        let rendered = render_system_prompt(&["ask_user", "manage_goal"], false);
+        assert!(rendered.contains("directly inspect, change, and check"));
+        assert!(
+            rendered.contains(
                 "Create a goal only when the user explicitly requests a sustained target"
-            ));
-            assert!(!rendered.contains("Use `ask_user` for blocking decisions"));
-            assert!(!rendered.contains("Never guess an answer"));
-            assert!(!rendered.contains("Keep the workflow proportional"));
-            assert!(
-                !rendered.contains("local changes need inspection, edits, and relevant checks")
-            );
-            assert!(!rendered.contains("Runtime snapshots refresh task handles"));
-            assert!(!rendered.contains("Use `project_checkpoint`"));
-            template.available_tools.push("project_checkpoint".into());
-            let rendered = templates
-                .0
-                .render(name, &template)
-                .expect("checkpoint workflow");
-            assert!(!rendered.contains("when saved history would resolve a gap"));
-            assert!(!rendered.contains("recheck changed inputs or missing coverage"));
-            assert!(!rendered.contains("Delegate only"));
-            assert!(!rendered.contains("1-2 focused attempts"));
-            assert!(!rendered.contains("let the user decide whether to rerun"));
-        }
+            )
+        );
+        assert!(!rendered.contains("Use `ask_user` for blocking decisions"));
+        assert!(!rendered.contains("Never guess an answer"));
+        assert!(!rendered.contains("Use `project_checkpoint`"));
+        assert!(!rendered.contains("Use `help` only when uncertain"));
+
+        let rendered = render_system_prompt(&["skill"], false);
+        assert!(rendered.contains("## Agent Skills"));
+        assert!(rendered.contains("use the `skill` tool to retrieve the full instructions"));
     }
 
     #[test]
-    fn prompt_variants_gate_individual_tool_workflows() {
-        let templates = Templates::new();
-        let project = prompt_store::ProjectContext::default();
-        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
-            for tool in ["ask_user", "project_checkpoint", "spawn_agent"] {
-                let template = SystemPromptTemplate {
-                    project: &project,
-                    available_tools: vec![tool.into()],
-                    model_name: None,
-                    date: "2026-01-01".into(),
-                    user_agents_md: None,
-                    sandboxing: false,
-                    is_linux: false,
-                    is_windows: false,
-                };
-                let rendered = templates.0.render(name, &template).expect("render prompt");
-                assert!(!rendered.contains("Use `help` only when uncertain"));
-                assert!(rendered.contains("directly inspect, change, and check"));
-            }
-        }
+    fn system_prompt_renders_subagent_boundary() {
+        let rendered = render_system_prompt(&["read_file"], true);
+        assert!(rendered.contains("## Subagent boundary"));
+        assert!(rendered.contains("You work for the parent agent"));
+        assert!(!render_system_prompt(&["read_file"], false).contains("## Subagent boundary"));
     }
 
     #[test]
-    fn prompt_variants_reduce_rendered_tool_protocols() {
-        let templates = Templates::new();
-        let cases: &[(&str, &[&str], bool, bool, bool, usize, usize)] = &[
-            (
-                "basic",
-                &["read_file", "terminal"],
-                false,
-                false,
-                false,
-                4013,
-                100,
-            ),
-            (
-                "all",
-                &[
-                    "read_file",
-                    "terminal",
-                    "ask_user",
-                    "manage_goal",
-                    "project_checkpoint",
-                    "spawn_agent",
-                    "create_directory",
-                ],
-                false,
-                false,
-                false,
-                5442,
-                600,
-            ),
-            (
-                "mac sandbox",
-                &[
-                    "terminal",
-                    "create_directory",
-                    "ask_user",
-                    "manage_goal",
-                    "project_checkpoint",
-                    "spawn_agent",
-                ],
-                true,
-                false,
-                false,
-                8933,
-                2000,
-            ),
-            (
-                "linux sandbox",
-                &["terminal"],
-                true,
-                true,
-                false,
-                7464,
-                1500,
-            ),
-            (
-                "windows sandbox",
-                &["terminal"],
-                true,
-                false,
-                true,
-                7242,
-                1000,
-            ),
-        ];
-        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
-            for &(case, tools, sandboxing, is_linux, is_windows, baseline, reduction) in cases {
-                let data = serde_json::json!({
-                    "available_tools": tools, "model_name": null, "date": "2026-01-01",
-                    "user_agents_md": null, "sandboxing": sandboxing, "is_linux": is_linux,
-                    "is_windows": is_windows, "os": "macos", "shell": "sh",
-                    "worktrees": [], "has_rules": false, "has_skills": false, "skills": [],
-                });
-                let rendered = templates.0.render(name, &data).expect("render prompt");
-                eprintln!("{name}: {case}: {} chars", rendered.chars().count());
-                let baseline = if name == "experimental_system_prompt.hbs" && sandboxing {
-                    if case == "mac sandbox" { 5442 } else { 4013 }
-                } else {
-                    baseline
-                };
-                let reduction = if name == "experimental_system_prompt.hbs" && sandboxing {
-                    if case == "mac sandbox" { 600 } else { 100 }
-                } else {
-                    reduction
-                };
-                assert!(
-                    rendered.chars().count() <= baseline - reduction,
-                    "{name}: {case}"
-                );
-                for (tool, phrase) in [
-                    ("ask_user", "Use `ask_user`"),
-                    ("project_checkpoint", "Use `project_checkpoint`"),
-                    ("spawn_agent", "Delegate only"),
-                ] {
-                    assert!(!rendered.contains(phrase), "{name}: {case}: {tool}");
-                }
-                assert!(rendered.contains(
-                    "Create a goal only when the user explicitly requests a sustained target"
-                ));
-                assert!(
-                    rendered
-                        .contains("Tool schemas and current authorization state are authoritative")
-                );
-                assert!(rendered.contains("report uncertainty, failures, and coverage honestly"));
-                assert!(!rendered.contains("Use `help` only when uncertain"));
-            }
-        }
+    fn harness_context_renders_environment_and_model() {
+        let worktrees = vec![WorktreeContext {
+            root_name: "alpha".to_string(),
+            abs_path: std::path::Path::new("/tmp/alpha").into(),
+            rules_file: None,
+        }];
+        let project = ProjectContext::new(worktrees);
+        let rendered = render_harness_context(&project, &["read_file"], None, false, false, false);
+
+        assert!(rendered.starts_with("<harness_context>"));
+        assert!(rendered.trim_end().ends_with("</harness_context>"));
+        assert!(rendered.contains("not authored by the user"));
+        assert!(rendered.contains("Today's Date: 2026-01-01"));
+        assert!(rendered.contains("`/tmp/alpha`"));
+        assert!(rendered.contains("You are powered by the model named test-model"));
+        assert!(!rendered.contains("## Runtime permissions"));
     }
 
     #[test]
-    fn test_system_prompt_renders_user_agents_md_before_project_rules() {
-        use prompt_store::{ProjectContext, RulesFileContext, WorktreeContext};
-        use util::rel_path::RelPath;
+    fn harness_context_renders_skills_catalog() {
+        let project = ProjectContext::default().with_skills(vec![agent_skills::SkillSummary {
+            name: "gpui-test".to_string(),
+            description: "Test GPUI code".to_string(),
+            location: "/tmp/skills/gpui-test/SKILL.md".to_string(),
+        }]);
+        let rendered = render_harness_context(&project, &["skill"], None, false, false, false);
+        assert!(rendered.contains("<available_skills>"));
+        assert!(rendered.contains("<name>gpui-test</name>"));
+        assert!(rendered.contains("/tmp/skills/gpui-test/SKILL.md"));
+    }
 
+    #[test]
+    fn harness_context_renders_user_agents_md_before_project_rules() {
         let worktrees = vec![WorktreeContext {
             root_name: "my-project".to_string(),
             abs_path: std::path::Path::new("/tmp/my-project").into(),
@@ -348,18 +339,14 @@ mod tests {
             }),
         }];
         let project = ProjectContext::new(worktrees);
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: Some("always be concise".into()),
-            sandboxing: false,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+        let rendered = render_harness_context(
+            &project,
+            &["echo"],
+            Some("always be concise"),
+            false,
+            false,
+            false,
+        );
 
         assert!(rendered.contains("### Personal `AGENTS.md`"));
         assert!(rendered.contains("always be concise"));
@@ -375,28 +362,24 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_omits_sandbox_section_when_sandboxing_disabled() {
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: false,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
-        assert!(!rendered.contains("## Terminal sandbox"));
+    fn harness_context_omits_custom_instructions_when_absent() {
+        let project = ProjectContext::default();
+        let rendered = render_harness_context(&project, &["echo"], None, false, false, false);
+        assert!(!rendered.contains("### Personal `AGENTS.md`"));
+        assert!(!rendered.contains("### Project Rules"));
+        assert!(!rendered.contains("## User's Custom Instructions"));
+    }
+
+    #[test]
+    fn harness_context_omits_sandbox_section_when_sandboxing_disabled() {
+        let project = ProjectContext::default();
+        let rendered = render_harness_context(&project, &["terminal"], None, false, false, false);
+        assert!(!rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("allow_hosts"));
     }
 
     #[test]
-    fn test_system_prompt_renders_sandbox_section_with_worktrees_when_enabled() {
-        use prompt_store::{ProjectContext, WorktreeContext};
-
+    fn harness_context_renders_sandbox_section_with_worktrees_when_enabled() {
         let worktrees = vec![
             WorktreeContext {
                 root_name: "alpha".to_string(),
@@ -410,18 +393,14 @@ mod tests {
             },
         ];
         let project = ProjectContext::new(worktrees);
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into(), "terminal".into(), "create_directory".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: true,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+        let rendered = render_harness_context(
+            &project,
+            &["echo", "terminal", "create_directory"],
+            None,
+            true,
+            false,
+            false,
+        );
 
         assert!(rendered.contains("## Runtime permissions"));
         assert!(rendered.contains("`/tmp/alpha`"));
@@ -437,27 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_linux_sandbox_section_omits_tmpdir() {
-        use prompt_store::{ProjectContext, WorktreeContext};
-
+    fn harness_context_linux_sandbox_section_omits_tmpdir() {
         let worktrees = vec![WorktreeContext {
             root_name: "alpha".to_string(),
             abs_path: std::path::Path::new("/tmp/alpha").into(),
             rules_file: None,
         }];
         let project = ProjectContext::new(worktrees);
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into(), "terminal".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: true,
-            is_linux: true,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+        let rendered =
+            render_harness_context(&project, &["echo", "terminal"], None, true, true, false);
 
         assert!(rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("$TMPDIR"));
@@ -466,27 +433,15 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_windows_sandbox_section_rejects_host_specific_network() {
-        use prompt_store::{ProjectContext, WorktreeContext};
-
+    fn harness_context_windows_sandbox_section_rejects_host_specific_network() {
         let worktrees = vec![WorktreeContext {
             root_name: "alpha".to_string(),
             abs_path: std::path::Path::new("C:/Users/me/project").into(),
             rules_file: None,
         }];
         let project = ProjectContext::new(worktrees);
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into(), "terminal".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: true,
-            is_linux: false,
-            is_windows: true,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+        let rendered =
+            render_harness_context(&project, &["echo", "terminal"], None, true, false, true);
 
         assert!(rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("commands run inside WSL"));
@@ -494,81 +449,29 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_sandbox_section_handles_zero_worktrees() {
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into(), "terminal".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: true,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
+    fn harness_context_sandbox_section_handles_zero_worktrees() {
+        let project = ProjectContext::default();
+        let rendered =
+            render_harness_context(&project, &["echo", "terminal"], None, true, false, false);
 
         assert!(rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("No project directories are currently writable"));
     }
 
     #[test]
-    fn test_system_prompt_omits_sandbox_section_when_terminal_tool_unavailable() {
-        // A profile can disable the terminal tool entirely; the prompt must not
-        // describe a sandboxed `terminal` tool the model doesn't have.
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: true,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
-
-        assert!(!rendered.contains("## Terminal sandbox"));
+    fn harness_context_omits_sandbox_section_when_terminal_tool_unavailable() {
+        // A profile can disable the terminal tool entirely; the context must
+        // not describe a sandboxed `terminal` tool the model doesn't have.
+        let project = ProjectContext::default();
+        let rendered = render_harness_context(&project, &["echo"], None, true, false, false);
+        assert!(!rendered.contains("## Runtime permissions"));
         assert!(!rendered.contains("allow_hosts"));
     }
 
     #[test]
-    fn test_system_prompt_omits_user_agents_md_section_when_absent() {
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: false,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
-        assert!(!rendered.contains("### Personal `AGENTS.md`"));
-    }
-
-    #[test]
-    fn test_system_prompt_does_not_render_legacy_zed_rules_section() {
-        let project = prompt_store::ProjectContext::default();
-        let template = SystemPromptTemplate {
-            project: &project,
-            available_tools: vec!["echo".into()],
-            model_name: Some("test-model".to_string()),
-            date: "2026-01-01".to_string(),
-            user_agents_md: None,
-            sandboxing: false,
-            is_linux: false,
-            is_windows: false,
-        };
-        let templates = Templates::new();
-        let rendered = template.render(&templates).unwrap();
-
+    fn prompt_variants_do_not_render_legacy_zed_rules_section() {
+        let project = ProjectContext::default();
+        let rendered = render_harness_context(&project, &["echo"], None, false, false, false);
         assert!(!rendered.contains("The user has specified the following rules"));
         assert!(!rendered.contains("Rules title:"));
     }

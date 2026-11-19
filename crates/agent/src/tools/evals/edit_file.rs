@@ -348,7 +348,7 @@ impl EditToolTest {
 
         let tools = crate::built_in_tools().collect::<Vec<_>>();
 
-        let system_prompt = {
+        let (system_prompt, harness_context) = {
             let worktrees = vec![WorktreeContext {
                 root_name: "root".to_string(),
                 abs_path: Path::new("/path/to/root").into(),
@@ -359,7 +359,13 @@ impl EditToolTest {
                 .iter()
                 .map(|tool| tool.name.clone().into())
                 .collect::<Vec<_>>();
-            let template = crate::SystemPromptTemplate {
+            let templates = Templates::new();
+            let system_prompt = crate::SystemPromptTemplate {
+                available_tools: tool_names.clone(),
+                is_subagent: false,
+            }
+            .render(&templates)?;
+            let harness_context = crate::HarnessContextTemplate {
                 project: &project_context,
                 available_tools: tool_names,
                 model_name: None,
@@ -368,9 +374,9 @@ impl EditToolTest {
                 sandboxing: false,
                 is_linux: cfg!(target_os = "linux"),
                 is_windows: cfg!(target_os = "windows"),
-            };
-            let templates = Templates::new();
-            template.render(&templates)?
+            }
+            .render(&templates)?;
+            (system_prompt, harness_context)
         };
 
         let has_system_prompt = eval
@@ -380,12 +386,20 @@ impl EditToolTest {
         let messages = if has_system_prompt {
             eval.conversation
         } else {
-            [LanguageModelRequestMessage {
-                role: Role::System,
-                content: vec![MessageContent::Text(system_prompt)],
-                cache: true,
-                reasoning_details: None,
-            }]
+            [
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text(system_prompt)],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(harness_context)],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ]
             .into_iter()
             .chain(eval.conversation)
             .collect::<Vec<_>>()

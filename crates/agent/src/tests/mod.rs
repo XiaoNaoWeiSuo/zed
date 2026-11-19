@@ -1474,8 +1474,13 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
         panic!("Expected text content");
     };
     assert!(
-        system_prompt.contains("test-shell"),
-        "unexpected system message: {:?}",
+        !system_prompt.contains("test-shell"),
+        "volatile state must stay out of the system prompt: {:?}",
+        system_message
+    );
+    assert!(
+        !system_prompt.contains("Today's Date"),
+        "volatile state must stay out of the system prompt: {:?}",
         system_message
     );
     assert!(
@@ -1484,6 +1489,26 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
         system_message
     );
     assert!(!system_prompt.contains("Use the `help` tool"));
+
+    let context_message = pending_completion
+        .messages
+        .get(1)
+        .expect("harness context message");
+    assert_eq!(context_message.role, Role::User);
+    let harness_context = context_message.string_contents();
+    assert!(harness_context.starts_with("<harness_context>"));
+    assert!(
+        harness_context.contains("test-shell"),
+        "unexpected harness context: {harness_context}"
+    );
+    assert!(harness_context.contains("Today's Date"));
+
+    let user_message = pending_completion.messages.last().expect("user message");
+    assert_eq!(
+        user_message.string_contents(),
+        "abc",
+        "the user request must remain the final message"
+    );
 }
 
 #[gpui::test]
@@ -1542,7 +1567,7 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
 
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
-        completion.messages[1..],
+        without_harness_context(&completion.messages[1..]),
         vec![LanguageModelRequestMessage {
             role: Role::User,
             content: vec!["Message 1".into()],
@@ -1567,7 +1592,7 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
 
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
-        completion.messages[1..],
+        without_harness_context(&completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -1629,7 +1654,7 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
         output: Some("test".into()),
     };
     assert_eq!(
-        completion.messages[1..],
+        without_harness_context(&completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -1897,7 +1922,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     assert_eq!(
         message.content,
         vec![
@@ -1951,7 +1976,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     assert_eq!(
         message.content,
         vec![language_model::MessageContent::ToolResult(
@@ -1980,7 +2005,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
     fake.end_last(&model);
     cx.run_until_parked();
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     assert_eq!(
         message.content,
         vec![language_model::MessageContent::ToolResult(
@@ -2818,7 +2843,7 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
     // Ensure the tool results were inserted with the correct names.
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
-        completion.messages.last().unwrap().content,
+        last_message_without_harness_context(&completion.messages).content,
         vec![
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tool_3".into(),
@@ -3033,10 +3058,7 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
 
     // Verify the tool result round-trips back to the model as a multi-part Vec.
     let completion = fake.pending_completions().pop().unwrap();
-    let tool_result = completion
-        .messages
-        .last()
-        .unwrap()
+    let tool_result = last_message_without_harness_context(&completion.messages)
         .content
         .iter()
         .find_map(|c| match c {
@@ -5261,7 +5283,7 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(
-        request.messages[1..],
+        without_harness_context(&request.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -5667,7 +5689,7 @@ async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
         )));
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
-        completion.messages[1..],
+        without_harness_context(&completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -5854,7 +5876,7 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
     let mut completed_tool_use = tool_use.clone();
     completed_tool_use.is_input_complete = true;
     assert_eq!(
-        completion.messages[1..],
+        without_harness_context(&completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -6199,6 +6221,28 @@ fn tool_names_for_completion(completion: &LanguageModelRequest) -> Vec<String> {
         .iter()
         .map(|tool| tool.name.clone())
         .collect()
+}
+
+/// The harness context is harness metadata, not conversation history. Tests that
+/// assert on the provider-visible transcript filter it out explicitly.
+fn without_harness_context(
+    messages: &[LanguageModelRequestMessage],
+) -> Vec<LanguageModelRequestMessage> {
+    messages
+        .iter()
+        .filter(|message| !message.string_contents().starts_with("<harness_context>"))
+        .cloned()
+        .collect()
+}
+
+fn last_message_without_harness_context(
+    messages: &[LanguageModelRequestMessage],
+) -> &LanguageModelRequestMessage {
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.string_contents().starts_with("<harness_context>"))
+        .expect("request without harness context")
 }
 
 fn setup_context_server(
@@ -8776,6 +8820,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
             .iter()
             .filter(|message| message.role != Role::System)
             .map(|message| message.string_contents())
+            .filter(|text| !text.starts_with("<harness_context>"))
             .collect::<Vec<_>>(),
         vec![
             "subagent task prompt",
@@ -10189,7 +10234,7 @@ async fn test_always_allow_resolves_pending_authorizations(cx: &mut TestAppConte
     );
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     let results: Vec<_> = message
         .content
         .iter()
@@ -10275,7 +10320,7 @@ async fn test_external_settings_edit_resolves_pending_authorization(cx: &mut Tes
     );
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     let result = message
         .content
         .iter()
@@ -10350,7 +10395,7 @@ async fn test_external_deny_rule_resolves_pending_authorization(cx: &mut TestApp
     );
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     let result = message
         .content
         .iter()
@@ -10422,7 +10467,7 @@ async fn test_unrelated_settings_change_does_not_resolve_pending_authorization(
     cx.run_until_parked();
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     let result = message
         .content
         .iter()
@@ -10517,7 +10562,7 @@ async fn test_always_allow_does_not_resolve_unrelated_tool_authorization(cx: &mu
     cx.run_until_parked();
 
     let completion = fake.pending_completions().pop().unwrap();
-    let message = completion.messages.last().unwrap();
+    let message = last_message_without_harness_context(&completion.messages);
     let results: Vec<_> = message
         .content
         .iter()
@@ -10758,7 +10803,7 @@ async fn test_streaming_tool_error_breaks_stream_loop_immediately(cx: &mut TestA
     let mut completed_tool_use = tool_use.clone();
     completed_tool_use.is_input_complete = true;
     assert_eq!(
-        last_completion.messages[1..],
+        without_harness_context(&last_completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,
@@ -10878,7 +10923,7 @@ async fn test_streaming_tool_error_waits_for_prior_tools_to_complete(cx: &mut Te
     completed_second_tool_use.is_input_complete = true;
 
     assert_eq!(
-        last_completion.messages[1..],
+        without_harness_context(&last_completion.messages[1..]),
         vec![
             LanguageModelRequestMessage {
                 role: Role::User,

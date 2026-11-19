@@ -5037,6 +5037,7 @@ mod internal_tests {
             .iter()
             .skip(1)
             .map(language_model::LanguageModelRequestMessage::string_contents)
+            .filter(|text| !text.starts_with("<harness_context>"))
             .collect()
     }
 
@@ -5917,6 +5918,7 @@ mod internal_tests {
                 .messages
                 .iter()
                 .skip(1)
+                .filter(|message| !message.string_contents().starts_with("<harness_context>"))
                 .map(|message| (message.role, message.string_contents()))
                 .collect::<Vec<_>>(),
             vec![
