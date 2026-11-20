@@ -2934,9 +2934,15 @@ impl NativeAgentConnection {
             }
             let message_id = ClientUserMessageId::new();
             let path_style = thread.read(cx).project().read(cx).path_style(cx);
-            thread.update(cx, |thread, cx| {
+            let queued = thread.update(cx, |thread, cx| {
                 thread.interject_user_block(message_id.clone(), content.to_vec(), path_style, cx)
             })?;
+            // The turn can finish between the execution check and this insertion.
+            // Report that nothing was queued so the caller starts a new turn
+            // instead of leaving the prompt in the history without a request.
+            if !queued {
+                return Ok(None);
+            }
             acp_thread.update(cx, |thread, cx| {
                 thread.upsert_local_user_message(message_id.clone(), content.to_vec(), cx)
             })?;

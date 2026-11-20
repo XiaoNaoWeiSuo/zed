@@ -4020,25 +4020,29 @@ impl Thread {
     /// Queues a user message that arrived while a turn was running. It is
     /// inserted into the conversation at the next loop boundary, after the
     /// in-flight tool results, so the running turn is not cancelled.
+    ///
+    /// Returns whether the message was queued. A message that arrives after the
+    /// turn already finished is not stored: a message in the history without a
+    /// request behind it never reaches the model, so the caller has to deliver
+    /// it by starting a new turn instead.
     pub(crate) fn interject_user_message(
         &mut self,
         id: ClientUserMessageId,
         content: Arc<[UserMessageContent]>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if content.is_empty() {
-            return;
+            return false;
         }
         if self
             .messages
             .iter()
             .any(|message| matches!(message.as_ref(), Message::User(user) if user.id == id))
         {
-            return;
+            return true;
         }
         if self.is_turn_complete() {
-            self.upsert_user_message(id, content, cx);
-            return;
+            return false;
         }
         if let Some(existing) = self
             .interjected_messages
@@ -4243,13 +4247,12 @@ impl Thread {
         blocks: impl IntoIterator<Item = acp_v2::ContentBlock>,
         path_style: PathStyle,
         cx: &mut Context<Self>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let content = blocks
             .into_iter()
             .map(|block| UserMessageContent::from_content_block(block, path_style))
             .collect::<Result<Arc<_>>>()?;
-        self.interject_user_message(id, content, cx);
-        Ok(())
+        Ok(self.interject_user_message(id, content, cx))
     }
 
     pub fn push_acp_agent_block(
