@@ -1541,7 +1541,7 @@ pub struct Thread {
     sandboxed_terminal_tool: Option<SandboxedTerminalTool>,
     subagent_tool: Option<SpawnAgentTool>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
-    usage_history_estimates: HashMap<ClientUserMessageId, u64>,
+    usage_history_estimates: HashMap<ClientUserMessageId, UsageHistoryEstimate>,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
@@ -3782,9 +3782,18 @@ impl Thread {
         };
 
         let user_message_id = last_user_message.id.clone();
-        let history_estimate = self.estimated_history_tokens();
-        self.usage_history_estimates
-            .insert(user_message_id.clone(), history_estimate);
+        // A tool can finish before the usage event arrives, but its result
+        // was not part of that request's input or model-generated output.
+        let compaction_ix =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len());
+        let tokens = self.estimated_history_tokens(compaction_ix, false);
+        self.usage_history_estimates.insert(
+            user_message_id.clone(),
+            UsageHistoryEstimate {
+                compaction_ix,
+                tokens,
+            },
+        );
         self.request_token_usage.insert(user_message_id, update);
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
@@ -3804,8 +3813,19 @@ impl Thread {
             return;
         };
 
+        let user_message_id = last_user_message.id.clone();
+        let compaction_ix =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len());
+        let history_tokens = self.estimated_history_tokens(compaction_ix, true);
+        self.usage_history_estimates.insert(
+            user_message_id.clone(),
+            UsageHistoryEstimate {
+                compaction_ix,
+                tokens: history_tokens,
+            },
+        );
         self.request_token_usage.insert(
-            last_user_message.id.clone(),
+            user_message_id,
             language_model::TokenUsage {
                 input_tokens,
                 ..Default::default()
@@ -4055,6 +4075,7 @@ impl Thread {
                 .push(InterjectedMessage { id, content });
         }
         cx.notify();
+        true
     }
 
     /// Inserts queued interjections into the conversation at a loop boundary.
@@ -5035,6 +5056,8 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
+            // Native views read the same budget as the gate, before the next usage update.
+            cx.notify();
             let insertion_ix = this.compaction_message_target_ix(cx)?;
             let model = this.compaction_model(cx)?;
             let request = this.build_compaction_request(insertion_ix, &model, cx);
@@ -6841,10 +6864,13 @@ impl Thread {
         let model = self.model()?;
         let auto_compact = AgentSettings::get_global(cx).auto_compact;
         let max_tokens = model.max_token_count();
-        let max_input_tokens = self.input_token_capacity()?;
-        let tokens_before = self
-            .latest_request_token_usage()
-            .map(|usage| total_input_tokens(usage).saturating_add(usage.output_tokens));
+        let context_usage = self.context_usage()?;
+        let tokens_before = if trigger == "auto" {
+            Some(context_usage.used_tokens)
+        } else {
+            self.latest_request_token_usage()
+                .map(|usage| usage.total_tokens())
+        };
         Some(CompactionTelemetry {
             trigger,
             thread_id: self.id.to_string(),
@@ -6857,15 +6883,7 @@ impl Thread {
             tokens_before,
             auto_compact_enabled: auto_compact.enabled,
             auto_compact_threshold: auto_compact.threshold.to_string(),
-            auto_compact_threshold_tokens: auto_compact.max_input_tokens.map_or_else(
-                || auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens),
-                |limit| {
-                    limit.min(auto_compact_threshold_token_count(
-                        auto_compact.threshold,
-                        max_input_tokens,
-                    ))
-                },
-            ),
+            auto_compact_threshold_tokens: context_usage.compaction_threshold(cx),
             retries: 0,
         })
     }
@@ -6879,80 +6897,75 @@ impl Thread {
         }
     }
 
-    fn estimated_history_tokens(&self) -> u64 {
-        let start =
-            latest_compaction_message_ix_before(&self.messages, self.messages.len()).unwrap_or(0);
+    fn estimated_history_tokens(
+        &self,
+        compaction_ix: Option<usize>,
+        include_pending_tool_results: bool,
+    ) -> u64 {
+        let start = compaction_ix.unwrap_or(0);
         self.messages
             .iter()
             .skip(start)
             .map(|message| estimated_message_tokens(message))
-            .chain(
-                self.pending_message
-                    .as_ref()
-                    .map(|message| estimated_agent_message_bytes(message).div_ceil(4)),
-            )
+            .chain(self.pending_message.as_ref().map(|message| {
+                estimated_agent_message_bytes(message, include_pending_tool_results).div_ceil(4)
+            }))
             .fold(0u64, u64::saturating_add)
     }
 
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        let input_capacity = self.input_token_capacity()?;
+        let compaction_ix =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len());
+        let latest_usage = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, message)| {
+                let Message::User(user) = message.as_ref() else {
+                    return None;
+                };
+                let usage = self.request_token_usage.get(&user.id)?;
+                // A tool loop keeps reporting under the same user ID even when
+                // compaction has inserted a summary after that user message.
+                let baseline = self.usage_history_estimates.get(&user.id);
+                let is_current = baseline.map_or_else(
+                    || compaction_ix.is_none_or(|compaction_ix| ix > compaction_ix),
+                    |baseline| baseline.compaction_ix == compaction_ix,
+                );
+                is_current.then_some((*usage, baseline))
+            });
+        let (used_tokens, estimated) = match latest_usage {
+            Some((usage, baseline)) => {
+                let growth = baseline.map_or(0, |baseline| {
+                    self.estimated_history_tokens(compaction_ix, true)
+                        .saturating_sub(baseline.tokens)
+                });
+                (
+                    total_input_tokens(usage)
+                        .saturating_add(usage.output_tokens)
+                        .saturating_add(growth),
+                    growth > 0,
+                )
+            }
+            None => (self.estimated_history_tokens(compaction_ix, true), true),
+        };
+        Some(ContextUsage {
+            used_tokens,
+            input_capacity,
+            estimated,
+        })
+    }
+
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
-        if !self.auto_compaction_enabled(cx) {
+        let usage = self.context_usage()?;
+        let threshold = usage.compaction_threshold(cx);
+        if !usage.auto_compaction_enabled(cx) || usage.used_tokens < threshold {
             return None;
         }
-
-        let auto_compact = AgentSettings::get_global(cx).auto_compact;
-        let max_input_tokens = self.input_token_capacity()?;
         let latest_compaction_ix =
             latest_compaction_message_ix_before(&self.messages, self.messages.len());
-        let latest_usage = {
-            let this = &self;
-            this.messages
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(ix, message)| {
-                    let Message::User(user_message) = &**message else {
-                        return None;
-                    };
-                    this.request_token_usage
-                        .get(&user_message.id)
-                        .copied()
-                        .map(|usage| (ix, usage))
-                })
-        };
-        let reported_tokens = latest_usage
-            .filter(|(usage_ix, _)| {
-                latest_compaction_ix.is_none_or(|compaction_ix| compaction_ix <= *usage_ix)
-            })
-            .map(|(usage_ix, usage)| {
-                let growth = self
-                    .messages
-                    .get(usage_ix)
-                    .and_then(|message| match message.as_ref() {
-                        Message::User(user) => self.usage_history_estimates.get(&user.id),
-                        _ => None,
-                    })
-                    .map(|baseline| self.estimated_history_tokens().saturating_sub(*baseline))
-                    .unwrap_or(0);
-                total_input_tokens(usage)
-                    .saturating_add(usage.output_tokens)
-                    .saturating_add(growth)
-            });
-        let capacity_threshold =
-            auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
-        let compaction_threshold = auto_compact
-            .max_input_tokens
-            .map_or(capacity_threshold, |limit| capacity_threshold.min(limit));
-        // Usage is absent on a restored branch or stale after a large tool result.
-        // Byte lengths provide a cheap text-only estimate without cloning history
-        // or making a separate token-counting request on the critical path.
-        let estimated_tokens = auto_compact
-            .max_input_tokens
-            .map(|_| self.estimated_history_tokens());
-        let active_tokens = reported_tokens.into_iter().chain(estimated_tokens).max()?;
-        if active_tokens < compaction_threshold {
-            return None;
-        }
-
         let insertion_ix = match self.messages.last() {
             Some(message)
                 if matches!(
@@ -6967,6 +6980,13 @@ impl Thread {
         if insertion_ix <= latest_compaction_ix.map_or(0, |index| index + 1) {
             return None;
         }
+        log::debug!(
+            "Automatic context compaction: {} tokens (estimated: {}), threshold {}, input capacity {}",
+            usage.used_tokens,
+            usage.estimated,
+            threshold,
+            usage.input_capacity,
+        );
         Some(insertion_ix)
     }
 
@@ -7271,6 +7291,33 @@ fn auto_compact_threshold_token_count(
     }
 }
 
+struct UsageHistoryEstimate {
+    compaction_ix: Option<usize>,
+    tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub input_capacity: u64,
+    pub estimated: bool,
+}
+
+impl ContextUsage {
+    pub fn auto_compaction_enabled(self, cx: &App) -> bool {
+        AgentSettings::get_global(cx).auto_compact.enabled
+            && self.input_capacity >= MIN_COMPACTION_CONTEXT_WINDOW
+    }
+
+    pub fn compaction_threshold(self, cx: &App) -> u64 {
+        let settings = AgentSettings::get_global(cx).auto_compact;
+        let threshold = auto_compact_threshold_token_count(settings.threshold, self.input_capacity);
+        settings
+            .max_input_tokens
+            .map_or(threshold, |cap| threshold.min(cap))
+    }
+}
+
 /// Snapshot of the data needed to report an `"Agent Compaction Completed"`
 /// telemetry event, captured when a compaction starts.
 struct CompactionTelemetry {
@@ -7330,7 +7377,7 @@ async fn completion_or_cancel<T>(
     }
 }
 
-fn estimated_agent_message_bytes(message: &AgentMessage) -> u64 {
+fn estimated_agent_message_bytes(message: &AgentMessage, include_tool_results: bool) -> u64 {
     let content_bytes = message
         .content
         .iter()
@@ -7342,6 +7389,9 @@ fn estimated_agent_message_bytes(message: &AgentMessage) -> u64 {
             AgentMessageContent::ToolUse(tool) => tool.raw_input.len() as u64,
         })
         .fold(0u64, u64::saturating_add);
+    if !include_tool_results {
+        return content_bytes;
+    }
     message
         .tool_results
         .values()
@@ -7364,7 +7414,7 @@ fn estimated_message_tokens(message: &Message) -> u64 {
                 UserMessageContent::Image(_) => 0,
             })
             .fold(0u64, u64::saturating_add),
-        Message::Agent(message) => estimated_agent_message_bytes(message),
+        Message::Agent(message) => estimated_agent_message_bytes(message, true),
         Message::UserDecision { content, .. } => content.len() as u64,
         Message::Compaction(CompactionInfo::Summary(summary)) => summary.len() as u64,
         Message::Compaction(CompactionInfo::ProviderNative { .. }) => 0,
@@ -11202,13 +11252,6 @@ mod tests {
                 thread
                     .messages
                     .push(user_text_message(user_message_id.clone(), "history"));
-                thread.request_token_usage.insert(
-                    user_message_id,
-                    TokenUsage {
-                        input_tokens: 100,
-                        ..Default::default()
-                    },
-                );
                 let tool_use_id = LanguageModelToolUseId::from("large-output");
                 let mut message = AgentMessage::default();
                 message.tool_results.insert(
@@ -11221,7 +11264,19 @@ mod tests {
                         output: None,
                     },
                 );
+                thread.pending_message = Some(message);
+                thread.update_token_usage(
+                    TokenUsage {
+                        input_tokens: 100,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                let message = thread.pending_message.take().expect("pending tool result");
                 thread.messages.push(Arc::new(Message::Agent(message)));
+                let usage = thread.context_usage().expect("context usage");
+                assert_eq!(usage.used_tokens, 128_100);
+                assert!(usage.estimated);
                 assert_eq!(thread.compaction_message_target_ix(cx), Some(2));
                 thread
                     .messages
@@ -11350,6 +11405,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_compaction_uses_full_history_estimate_only_without_usage(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::TokensUsed(100_000),
+                    max_input_tokens: None,
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(fake.model("fake"), cx);
+                let user_message_id = ClientUserMessageId::new();
+                thread
+                    .messages
+                    .push(user_text_message(user_message_id.clone(), "history"));
+                thread
+                    .messages
+                    .push(agent_text_message(&"x".repeat(512_000)));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "next"));
+                assert!(thread.context_usage().expect("context usage").estimated);
+                assert_eq!(thread.compaction_message_target_ix(cx), Some(2));
+
+                thread.request_token_usage.insert(
+                    user_message_id,
+                    TokenUsage {
+                        input_tokens: 16_000,
+                        ..Default::default()
+                    },
+                );
+                let usage = thread.context_usage().expect("context usage");
+                assert_eq!(usage.used_tokens, 16_000);
+                assert!(!usage.estimated);
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+
+                thread.messages.pop();
+                thread.messages.push(summary_compaction("short summary"));
+                assert!(thread.context_usage().expect("context usage").estimated);
+                thread.update_token_usage(
+                    TokenUsage {
+                        input_tokens: 1_234,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                let usage = thread.context_usage().expect("context usage");
+                assert_eq!(usage.used_tokens, 1_234);
+                assert!(!usage.estimated);
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn test_compaction_threshold_uses_percentage_setting(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let model = fake.model("fake");
@@ -11357,9 +11470,6 @@ mod tests {
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                let mut settings = AgentSettings::get_global(cx).clone();
-                settings.auto_compact.max_input_tokens = None;
-                AgentSettings::override_global(settings, cx);
                 thread.set_model(model.clone(), cx);
                 thread
                     .messages
@@ -11372,6 +11482,10 @@ mod tests {
                     },
                 );
 
+                let usage = thread.context_usage().expect("context usage");
+                assert_eq!(usage.input_capacity, 1_000_000);
+                assert_eq!(usage.compaction_threshold(cx), 900_000);
+                assert_eq!(usage.used_tokens, 899_999);
                 assert_eq!(thread.compaction_message_target_ix(cx), None);
 
                 thread.request_token_usage.insert(
@@ -12616,6 +12730,44 @@ mod tests {
             child.read_with(cx, |thread, _| thread.permission_tier()),
             crate::permission_tier::PermissionTier::FullAccess
         );
+    }
+
+    #[gpui::test]
+    async fn test_interject_requires_running_turn(cx: &mut TestAppContext) {
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
+        let content: Arc<[UserMessageContent]> =
+            vec![UserMessageContent::Text("queued".to_string())].into();
+
+        let finished_id = ClientUserMessageId::new();
+        thread.update(cx, |thread, cx| {
+            assert!(thread.is_turn_complete());
+            assert!(
+                !thread.interject_user_message(finished_id.clone(), content.clone(), cx),
+                "a prompt must not be queued when no turn is running"
+            );
+            assert!(
+                !thread.has_user_message(&finished_id),
+                "an unqueued prompt must not enter the history without a request"
+            );
+        });
+
+        let running_id = ClientUserMessageId::new();
+        thread.update(cx, |thread, cx| {
+            let (cancellation_tx, _) = watch::channel(false);
+            thread.running_turn = Some(RunningTurn::new(
+                thread.prompt_id.clone(),
+                event_stream,
+                BTreeMap::new(),
+                cancellation_tx,
+                Task::ready(()),
+            ));
+            assert!(thread.interject_user_message(running_id.clone(), content, cx));
+            assert!(
+                !thread.has_user_message(&running_id),
+                "a queued prompt waits for the next loop boundary"
+            );
+            thread.running_turn = None;
+        });
     }
 
     #[gpui::test]

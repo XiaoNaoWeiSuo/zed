@@ -159,7 +159,7 @@ pub enum AutoCompactThreshold {
 
 impl AutoCompactThreshold {
     /// The threshold used when none is configured, or when the configured value
-    /// is invalid (90% of the context window).
+    /// is invalid (90% of the available input budget).
     pub const DEFAULT: Self = Self::Percentage(0.9);
 }
 
@@ -1090,7 +1090,7 @@ mod tests {
         let defaults = AutoCompactSettings {
             enabled: true,
             threshold: AutoCompactThreshold::Percentage(0.9),
-            max_input_tokens: Some(128_000),
+            max_input_tokens: None,
         };
         assert_eq!(AgentSettings::get_global(cx).auto_compact, defaults);
 

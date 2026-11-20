@@ -225,7 +225,8 @@ pub struct AutoCompactSettingsContent {
     /// The threshold at which auto-compaction runs. This is one of:
     ///
     /// - A percentage string ending in `%`, e.g. `"90%"`, measured against the
-    ///   model's context window. `"90%"` compacts once the context is 90% full.
+    ///   model's input budget after reserving output. `"90%"` compacts once
+    ///   that budget is 90% full.
     /// - A positive integer: compaction runs once that many tokens have been
     ///   used. For example, `100000` compacts after 100,000 tokens are used.
     /// - A negative integer: compaction runs once that many tokens remain in
@@ -245,7 +246,7 @@ pub struct AutoCompactSettingsContent {
     /// Set to `0` to disable this limit. Omitted or `null` values inherit the
     /// default. `enabled: false` disables all automatic compaction.
     ///
-    /// Default: 128000
+    /// Default: 0 (no independent limit)
     pub max_input_tokens: Option<u64>,
 }
 
