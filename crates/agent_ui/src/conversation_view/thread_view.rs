@@ -3448,6 +3448,12 @@ impl ThreadView {
             _subscription: subscription,
         });
         self.sync_queue_flag_to_native_thread(cx);
+
+        // A native turn can finish between the generating check in `send` and
+        // this enqueue. In that case no later Stopped event will drive the queue.
+        if self.thread.read(cx).foreground_activity() == ForegroundActivity::Idle {
+            self.send_queued_message_after_generation_stopped(false, window, cx);
+        }
         cx.notify();
     }
 
