@@ -9132,7 +9132,11 @@ impl ThreadView {
                                     is_blank = is_blank && !block.visible_content(cx);
                                     let key = (entry_ix, chunk_ix);
                                     let expanded =
-                                        self.entry_view_state.read(cx).is_activity_expanded(key);
+                                        self.entry_view_state.read(cx).is_activity_expanded(key)
+                                            || matches!(
+                                                self.thread.read(cx).status(),
+                                                ThreadStatus::Generating
+                                            );
                                     return Some(
                                         v_flex()
                                             .id(("activity-block", chunk_ix))
@@ -13137,6 +13141,22 @@ impl ThreadView {
         }
     }
 
+    fn tool_call_status_presentation(status: ToolCallStatus) -> (IconName, Color, &'static str) {
+        match status {
+            ToolCallStatus::Pending => (IconName::Circle, Color::Muted, "Queued"),
+            ToolCallStatus::InProgress => (IconName::TodoProgress, Color::Accent, "Running"),
+            ToolCallStatus::WaitingForConfirmation => (
+                IconName::Warning,
+                Color::Warning,
+                "Waiting for confirmation",
+            ),
+            ToolCallStatus::Completed => (IconName::Check, Color::Success, "Completed"),
+            ToolCallStatus::Rejected => (IconName::Close, Color::Error, "Rejected"),
+            ToolCallStatus::Canceled => (IconName::Close, Color::Muted, "Canceled"),
+            ToolCallStatus::Failed => (IconName::Close, Color::Error, "Failed"),
+        }
+    }
+
     fn render_tool_call_label(
         &self,
         entry_ix: usize,
@@ -13203,6 +13223,14 @@ impl ThreadView {
             .color(Color::Muted)
             .into_any_element()
         };
+
+        let (status_icon, status_color, _status_label) =
+            Self::tool_call_status_presentation(tool_call.status());
+        let status = div().flex_none().child(
+            Icon::new(status_icon)
+                .size(IconSize::Small)
+                .color(status_color),
+        );
 
         let gradient_overlay = {
             div()
@@ -13294,6 +13322,7 @@ impl ThreadView {
                     ))
                     .into_any()
             })
+            .child(status)
             .when(!is_edit, |this| this.child(gradient_overlay))
     }
 
