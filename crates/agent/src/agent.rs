@@ -5600,6 +5600,58 @@ mod internal_tests {
     }
 
     #[gpui::test]
+    async fn test_native_prompt_after_completed_turn_starts_new_request(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+
+        let (first_receipt, first_completion) = cx.update(|cx| {
+            connection.submit_native(session_id.clone(), Some(vec!["first".into()]), cx)
+        });
+        first_receipt.await.expect("first accepted");
+        cx.run_until_parked();
+        let first_request = fake
+            .pending_completions_for(&model)
+            .pop()
+            .expect("first reaches model");
+        fake.send_text(&model, &first_request, "first answer");
+        fake.end_stream(&model, &first_request);
+        assert_eq!(
+            first_completion
+                .await
+                .expect("first driver completed")
+                .expect("end turn"),
+            acp_v2::StopReason::EndTurn
+        );
+
+        let (second_receipt, second_completion) = cx.update(|cx| {
+            connection.submit_native(session_id.clone(), Some(vec!["second".into()]), cx)
+        });
+        second_receipt.await.expect("second accepted");
+        cx.run_until_parked();
+        let second_request = fake.pending_completions_for(&model).pop().expect(
+            "a prompt sent after the turn ended must reach the model instead of only entering the history",
+        );
+        assert!(
+            request_texts_after_system(&second_request.messages)
+                .iter()
+                .any(|text| text == "second")
+        );
+        fake.send_text(&model, &second_request, "second answer");
+        fake.end_stream(&model, &second_request);
+        assert_eq!(
+            second_completion
+                .await
+                .expect("second driver completed")
+                .expect("end turn"),
+            acp_v2::StopReason::EndTurn
+        );
+    }
+
+    #[gpui::test]
     async fn test_native_compact_empty_and_repeated_markers_are_noops(cx: &mut TestAppContext) {
         let fake = init_test(cx);
         let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
