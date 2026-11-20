@@ -7347,8 +7347,18 @@ impl ThreadView {
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
-        let usage = thread.token_usage()?;
-        let show_split = self.supports_split_token_display(cx);
+        let usage = thread.token_usage();
+        let native_thread = self.as_native_thread(cx);
+        let context_usage = native_thread
+            .as_ref()
+            .and_then(|thread| thread.read(cx).context_usage());
+        let (used_tokens, max_tokens) = context_usage
+            .map(|usage| (usage.used_tokens, usage.input_capacity))
+            .or_else(|| usage.map(|usage| (usage.used_tokens, usage.max_tokens)))?;
+        let show_split = usage.is_some() && self.supports_split_token_display(cx);
+        let compaction_threshold = context_usage
+            .filter(|usage| usage.auto_compaction_enabled(cx))
+            .map(|usage| usage.compaction_threshold(cx));
 
         let cost_label = thread.cost().map(|cost| {
             let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
@@ -7367,16 +7377,23 @@ impl ThreadView {
             }
         };
 
-        let used = crate::humanize_token_count(usage.used_tokens);
-        let max = crate::humanize_token_count(usage.max_tokens);
-        let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
-        let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
-
-        let progress_ratio = if usage.max_tokens > 0 {
-            usage.used_tokens as f32 / usage.max_tokens as f32
-        } else {
-            0.0
-        };
+        let reported_input = usage.map_or(0, |usage| usage.input_tokens);
+        let reported_output = usage.map_or(0, |usage| usage.output_tokens);
+        let used = crate::humanize_token_count(used_tokens);
+        let max = crate::humanize_token_count(max_tokens);
+        let input_tokens_label = crate::humanize_token_count(reported_input);
+        let output_tokens_label = crate::humanize_token_count(reported_output);
+        let progress_ratio = used_tokens as f32 / max_tokens.max(1) as f32;
+        let context_color =
+            progress_color(compaction_threshold.map_or(progress_ratio, |threshold| {
+                used_tokens as f32 / threshold.max(1) as f32
+            }));
+        let compaction_label = compaction_threshold.map(|threshold| {
+            format!(
+                "Auto-compacts at {}",
+                crate::humanize_token_count(threshold)
+            )
+        });
 
         let ring_size = px(16.0);
         let stroke_width = px(2.);
@@ -7385,8 +7402,8 @@ impl ThreadView {
 
         let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
 
-        let (project_rules_count, project_entry_ids) = self
-            .as_native_thread(cx)
+        let (project_rules_count, project_entry_ids) = native_thread
+            .as_ref()
             .map(|thread| {
                 let project_context = thread.read(cx).project_context().read(cx);
                 let project_entry_ids = project_context
@@ -7406,19 +7423,19 @@ impl ThreadView {
 
         let workspace = self.workspace.clone();
 
-        let (max_input_tokens, max_output_tokens) = self
-            .as_native_thread(cx)
+        let (max_input_tokens, max_output_tokens) = native_thread
+            .as_ref()
             .map(|thread| {
                 let thread = thread.read(cx);
                 (
-                    thread.input_token_capacity().unwrap_or(usage.max_tokens),
+                    max_tokens,
                     thread
                         .model()
                         .and_then(|model| model.max_output_tokens())
                         .unwrap_or(0),
                 )
             })
-            .unwrap_or((usage.max_tokens, 0));
+            .unwrap_or((max_tokens, 0));
         let input_max_label = crate::humanize_token_count(max_input_tokens);
         let output_max_label = crate::humanize_token_count(max_output_tokens);
 
@@ -7434,6 +7451,7 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let compaction_label = compaction_label.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -7443,6 +7461,9 @@ impl ThreadView {
                     input_max: input_max_label,
                     output_max: output_max_label,
                     show_split,
+                    show_context: !show_split || context_usage.is_some(),
+                    estimated: context_usage.is_some_and(|usage| usage.estimated),
+                    compaction_label,
                     cost_label,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
@@ -7456,15 +7477,16 @@ impl ThreadView {
 
         if show_split {
             let input_max_raw = max_input_tokens;
+            let input_used = context_usage.map_or(reported_input, |usage| usage.used_tokens);
             let output_max_raw = max_output_tokens;
 
             let input_ratio = if input_max_raw > 0 {
-                usage.input_tokens as f32 / input_max_raw as f32
+                input_used as f32 / input_max_raw as f32
             } else {
                 0.0
             };
             let output_ratio = if output_max_raw > 0 {
-                usage.output_tokens as f32 / output_max_raw as f32
+                reported_output as f32 / output_max_raw as f32
             } else {
                 0.0
             };
@@ -7485,13 +7507,19 @@ impl ThreadView {
                             )
                             .child(
                                 CircularProgress::new(
-                                    usage.input_tokens as f32,
+                                    input_used as f32,
                                     input_max_raw as f32,
                                     ring_size,
                                     cx,
                                 )
                                 .stroke_width(stroke_width)
-                                .progress_color(progress_color(input_ratio)),
+                                .progress_color(
+                                    if context_usage.is_some() {
+                                        context_color
+                                    } else {
+                                        progress_color(input_ratio)
+                                    },
+                                ),
                             ),
                     )
                     .child(
@@ -7504,7 +7532,7 @@ impl ThreadView {
                             )
                             .child(
                                 CircularProgress::new(
-                                    usage.output_tokens as f32,
+                                    reported_output as f32,
                                     output_max_raw as f32,
                                     ring_size,
                                     cx,
@@ -7523,14 +7551,9 @@ impl ThreadView {
                     .mt_px()
                     .mr_1()
                     .child(
-                        CircularProgress::new(
-                            usage.used_tokens as f32,
-                            usage.max_tokens as f32,
-                            ring_size,
-                            cx,
-                        )
-                        .stroke_width(stroke_width)
-                        .progress_color(progress_color(progress_ratio)),
+                        CircularProgress::new(used_tokens as f32, max_tokens as f32, ring_size, cx)
+                            .stroke_width(stroke_width)
+                            .progress_color(context_color),
                     )
                     .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
@@ -8414,6 +8437,9 @@ struct TokenUsageTooltip {
     input_max: String,
     output_max: String,
     show_split: bool,
+    show_context: bool,
+    estimated: bool,
+    compaction_label: Option<String>,
     cost_label: Option<String>,
     separator_color: Color,
     global_agents_md_loaded: bool,
@@ -8433,6 +8459,9 @@ impl Render for TokenUsageTooltip {
         let input_max = self.input_max.clone();
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
+        let show_context = self.show_context;
+        let estimated = self.estimated;
+        let compaction_label = self.compaction_label.clone();
         let cost_label = self.cost_label.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
@@ -8443,11 +8472,15 @@ impl Render for TokenUsageTooltip {
             container
                 .min_w_40()
                 .child(
-                    Label::new("Context")
-                        .color(Color::Muted)
-                        .size(LabelSize::Small),
+                    Label::new(if estimated {
+                        "Context (estimated)"
+                    } else {
+                        "Context"
+                    })
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
                 )
-                .when(!show_split, |this| {
+                .when(show_context, |this| {
                     this.child(
                         h_flex()
                             .gap_0p5()
@@ -8457,6 +8490,9 @@ impl Render for TokenUsageTooltip {
                             .child(Label::new("/").color(separator_color))
                             .child(Label::new(max.clone()).color(Color::Muted)),
                     )
+                })
+                .when_some(compaction_label, |this, label| {
+                    this.child(Label::new(label).color(Color::Muted).size(LabelSize::Small))
                 })
                 .when(show_split, |this| {
                     this.child(
