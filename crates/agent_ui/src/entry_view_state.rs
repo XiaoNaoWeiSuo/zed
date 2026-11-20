@@ -112,12 +112,7 @@ impl EntryViewState {
     }
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
-        self.is_tool_call_expanded(&tool_call.id)
-            || tool_call.authorization_id().is_some()
-            || matches!(
-                tool_call.status(),
-                acp_thread::ToolCallStatus::Pending | acp_thread::ToolCallStatus::InProgress
-            )
+        self.is_tool_call_expanded(&tool_call.id) || tool_call.authorization_id().is_some()
     }
 
     pub(crate) fn is_activity_expanded(&self, key: (usize, usize)) -> bool {

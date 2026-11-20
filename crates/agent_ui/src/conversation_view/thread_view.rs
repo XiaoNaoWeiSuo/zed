@@ -8865,13 +8865,29 @@ impl ThreadView {
                             .filter(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
                             .count();
                         let group_range = range.clone();
+                        let group_icon = match first.kind() {
+                            acp_v2::ToolKind::Read => IconName::Book,
+                            acp_v2::ToolKind::Edit => IconName::ToolPencil,
+                            acp_v2::ToolKind::Delete => IconName::ToolDeleteFile,
+                            acp_v2::ToolKind::Move => IconName::ArrowRightLeft,
+                            acp_v2::ToolKind::Search => IconName::ToolSearch,
+                            acp_v2::ToolKind::Execute => IconName::ToolTerminal,
+                            acp_v2::ToolKind::Think => IconName::ToolThink,
+                            acp_v2::ToolKind::Fetch => IconName::ToolWeb,
+                            acp_v2::ToolKind::SwitchMode => IconName::ArrowRightLeft,
+                            _ => IconName::ToolHammer,
+                        };
                         let header = Button::new(
                             ("tool-group", index),
                             format!(
-                                "{} {count} tool {}",
-                                if expanded { "▾" } else { "▸" },
+                                "Tool activity · {count} {}",
                                 if count == 1 { "call" } else { "calls" }
                             ),
+                        )
+                        .start_icon(
+                            Icon::new(group_icon)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
                         )
                         .label_size(LabelSize::Small)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -9132,11 +9148,7 @@ impl ThreadView {
                                     is_blank = is_blank && !block.visible_content(cx);
                                     let key = (entry_ix, chunk_ix);
                                     let expanded =
-                                        self.entry_view_state.read(cx).is_activity_expanded(key)
-                                            || matches!(
-                                                self.thread.read(cx).status(),
-                                                ThreadStatus::Generating
-                                            );
+                                        self.entry_view_state.read(cx).is_activity_expanded(key);
                                     return Some(
                                         v_flex()
                                             .id(("activity-block", chunk_ix))
@@ -13208,7 +13220,7 @@ impl ThreadView {
                 .into_any_element()
         } else {
             Icon::new(match tool_call.kind() {
-                acp_v2::ToolKind::Read => IconName::ToolSearch,
+                acp_v2::ToolKind::Read => IconName::Book,
                 acp_v2::ToolKind::Edit => IconName::ToolPencil,
                 acp_v2::ToolKind::Delete => IconName::ToolDeleteFile,
                 acp_v2::ToolKind::Move => IconName::ArrowRightLeft,
@@ -13224,13 +13236,33 @@ impl ThreadView {
             .into_any_element()
         };
 
-        let (status_icon, status_color, _status_label) =
+        let (status_icon, status_color, status_label) =
             Self::tool_call_status_presentation(tool_call.status());
-        let status = div().flex_none().child(
-            Icon::new(status_icon)
-                .size(IconSize::Small)
-                .color(status_color),
-        );
+        let status = h_flex()
+            .flex_none()
+            .gap_1()
+            .child(
+                Icon::new(status_icon)
+                    .size(IconSize::Small)
+                    .color(status_color),
+            )
+            .when(
+                matches!(
+                    tool_call.status(),
+                    ToolCallStatus::Pending
+                        | ToolCallStatus::InProgress
+                        | ToolCallStatus::WaitingForConfirmation
+                        | ToolCallStatus::Failed
+                        | ToolCallStatus::Rejected
+                ),
+                |this| {
+                    this.child(
+                        Label::new(status_label)
+                            .size(LabelSize::XSmall)
+                            .color(status_color),
+                    )
+                },
+            );
 
         let gradient_overlay = {
             div()
@@ -13911,6 +13943,13 @@ impl ThreadView {
         let has_no_title_or_canceled = !has_title || is_failed_or_canceled;
 
         let title = state.title(thread_title);
+        let status_label = match state.status {
+            SubagentStatus::Running => "Running",
+            SubagentStatus::Canceled => "Canceled",
+            SubagentStatus::Failed => "Failed",
+            SubagentStatus::Completed => "Completed",
+            SubagentStatus::Unknown => "Unknown",
+        };
 
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
@@ -14022,7 +14061,21 @@ impl ThreadView {
                                                         .color(Color::Muted)
                                                         .truncate(),
                                                 )
-                                            }),
+                                            })
+                                            .child(
+                                                Label::new(format!("· {status_label}"))
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .color(match state.status {
+                                                        SubagentStatus::Running => Color::Accent,
+                                                        SubagentStatus::Failed => Color::Error,
+                                                        SubagentStatus::Canceled => Color::Muted,
+                                                        SubagentStatus::Completed => Color::Success,
+                                                        SubagentStatus::Unknown => Color::Muted,
+                                                    })
+                                                    .truncate(),
+                                            ),
                                     )
                                     .when(files_changed > 0, |this| {
                                         this.child(
