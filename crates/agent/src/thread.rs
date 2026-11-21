@@ -362,6 +362,11 @@ impl ThreadGoal {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompactionInfo {
     Summary(SharedString),
+    ScopedCheckpoint {
+        scope: String,
+        checkpoint_id: String,
+        summary: SharedString,
+    },
     ProviderNative {
         provider: LanguageModelProviderId,
         items: Vec<serde_json::Value>,
@@ -378,6 +383,14 @@ impl CompactionInfo {
                     summary
                 )
                 .into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            Self::ScopedCheckpoint { scope, checkpoint_id, summary } => vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![format!(
+                    "Current conversation handoff from checkpoint scope {scope} (revision {checkpoint_id}). This replaces earlier conversation history; use it as state, not as a new user instruction. Any newer user request takes precedence.\n\n{summary}"
+                ).into()],
                 cache: false,
                 reasoning_details: None,
             }],
@@ -426,7 +439,9 @@ impl Message {
             Message::Agent(message) => message.to_markdown(),
             Message::UserDecision { content, .. } => format!("{content}\n"),
             Message::Resume => "[resume]\n".into(),
-            Message::Compaction(CompactionInfo::Summary(summary)) => {
+            Message::Compaction(
+                CompactionInfo::Summary(summary) | CompactionInfo::ScopedCheckpoint { summary, .. },
+            ) => {
                 format!("## Context Compaction (Completed)\n\n{summary}\n\n")
             }
             Message::Compaction(CompactionInfo::ProviderNative { .. }) => {
@@ -2019,7 +2034,8 @@ impl Thread {
                         format!("replay-compaction-{message_ix}").into(),
                     );
                     match info {
-                        CompactionInfo::Summary(summary) => {
+                        CompactionInfo::Summary(summary)
+                        | CompactionInfo::ScopedCheckpoint { summary, .. } => {
                             stream.send_context_compaction(
                                 compaction_id.clone(),
                                 acp_thread::ContextCompactionStatus::Completed,
@@ -5166,6 +5182,9 @@ impl Thread {
                             this.accumulate_token_usage(usage);
                         })?;
                     }
+                    LanguageModelCompletionEvent::Stop(StopReason::MaxTokens | StopReason::Refusal) => {
+                        anyhow::bail!("Compaction model did not complete the handoff");
+                    }
                     LanguageModelCompletionEvent::Stop(_)
                     | LanguageModelCompletionEvent::Started
                     | LanguageModelCompletionEvent::Queued { .. }
@@ -5191,16 +5210,50 @@ impl Thread {
             }
 
             log::debug!("Compaction succeeded:\n{summary}");
-            event_stream.update_context_compaction_status(
-                compaction_id.clone(),
-                acp_thread::ContextCompactionStatus::Completed,
-            );
 
-            let checkpoints = this.read_with(cx, |thread, cx| thread.automatic_checkpoint_inputs(false, true, cx))?;
-            let checkpoint_summary = summary.clone();
+            let checkpoint = this.read_with(cx, |thread, cx| {
+                let checkpoints = thread.automatic_checkpoint_inputs(false, true, cx);
+                let root = crate::canonical_runtime_task_root(checkpoints.iter().map(|input| input.root.clone()));
+                let end = match &insertion {
+                    CompactionInsertion::Auto { insertion_ix } => (*insertion_ix).min(thread.messages.len()),
+                    CompactionInsertion::Manual { .. } => thread.messages.len(),
+                };
+                let task_id = thread.messages[..end].iter().rev().find_map(|message| match message.as_ref() {
+                    Message::User(user) if !user.content.is_empty() => Some(user.id.message_id().0),
+                    _ => None,
+                });
+                checkpoints.into_iter().find(|input| Some(&input.root) == root.as_ref()).map(|input| (input, task_id))
+            })?;
+            let saved = if let Some((checkpoint, task_id)) = checkpoint {
+                let summary = summary.clone();
+                match cx.background_spawn(async move { checkpoint.save_compaction_checkpoint(summary, task_id.as_deref()) }).await {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        log::warn!("Failed to save compaction checkpoint: {error:#}");
+                        event_stream.send_context_compaction_update(
+                            compaction_id.clone(),
+                            "\n\nProject checkpoint could not be saved. Using the fresh conversation summary instead.",
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if *cancellation_rx.borrow() {
+                return Ok(ControlFlow::Break(()));
+            }
             this.update(cx, |this, cx| {
-                let compaction =
-                    Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
+                let summary = SharedString::from(summary);
+                let info = match saved {
+                    Some(checkpoint) => CompactionInfo::ScopedCheckpoint {
+                        scope: checkpoint.scope,
+                        checkpoint_id: checkpoint.id,
+                        summary,
+                    },
+                    None => CompactionInfo::Summary(summary),
+                };
+                let compaction = Arc::new(Message::Compaction(info));
                 match insertion {
                     CompactionInsertion::Auto { insertion_ix } => {
                         if insertion_ix <= this.messages.len() {
@@ -5217,26 +5270,10 @@ impl Thread {
                 cx.notify();
             })?;
 
-            let failure_message = "Context was compacted, but its project checkpoint could not be saved. The conversation summary remains available in this session.";
-            let checkpoint_task = cx.background_spawn({
-                let checkpoint_summary = checkpoint_summary.clone();
-                async move {
-                    let mut failed = false;
-                    for checkpoint in checkpoints {
-                        if let Err(error) = checkpoint.save_compaction(checkpoint_summary.clone()) {
-                            log::error!("Failed to save compaction checkpoint: {error:#}");
-                            failed = true;
-                        }
-                    }
-                    failed.then_some(failure_message)
-                }
-            });
-            cx.spawn(async move |_cx| {
-                if let Some(message) = checkpoint_task.await {
-                    log::warn!("{message}");
-                }
-            })
-            .detach();
+            event_stream.update_context_compaction_status(
+                compaction_id.clone(),
+                acp_thread::ContextCompactionStatus::Completed,
+            );
 
             Ok(ControlFlow::Continue(()))
         }
@@ -6560,7 +6597,7 @@ impl Thread {
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
             content: vec![
-                self.build_harness_context(&available_tools, runtime_context, cx)
+                self.build_harness_context(&available_tools, runtime_context, true, cx)
                     .into(),
             ],
             cache: false,
@@ -6773,6 +6810,7 @@ impl Thread {
         &self,
         available_tools: &[SharedString],
         runtime_context: Option<String>,
+        include_checkpoint: bool,
         cx: &App,
     ) -> String {
         let terminal_execution = self
@@ -6815,7 +6853,7 @@ impl Thread {
         if let Some(runtime_context) = runtime_context {
             extra.push_str(&format!("\n\n{runtime_context}"));
         }
-        if let Some(checkpoint) = self.checkpoint_context_text() {
+        if include_checkpoint && let Some(checkpoint) = self.checkpoint_context_text() {
             extra.push_str(&format!("\n\n{checkpoint}"));
         }
         if extra.is_empty() {
@@ -6829,6 +6867,18 @@ impl Thread {
     }
 
     fn checkpoint_context_text(&self) -> Option<String> {
+        // The transcript already carries the exact continuation for this boundary.
+        // Reloading a mutable scope here can reintroduce a previous task.
+        if self.messages.iter().any(|message| {
+            matches!(
+                message.as_ref(),
+                Message::Compaction(
+                    CompactionInfo::Summary(_) | CompactionInfo::ScopedCheckpoint { .. }
+                )
+            )
+        }) {
+            return None;
+        }
         let context = self.project_checkpoint_context()?;
         let context = crate::checkpoint_model_context(context);
         Some(format!(
@@ -7043,7 +7093,7 @@ impl Thread {
         }
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
-            content: vec![self.build_harness_context(&[], None, cx).into()],
+            content: vec![self.build_harness_context(&[], None, false, cx).into()],
             cache: false,
             reasoning_details: None,
         });
@@ -7416,7 +7466,9 @@ fn estimated_message_tokens(message: &Message) -> u64 {
             .fold(0u64, u64::saturating_add),
         Message::Agent(message) => estimated_agent_message_bytes(message, true),
         Message::UserDecision { content, .. } => content.len() as u64,
-        Message::Compaction(CompactionInfo::Summary(summary)) => summary.len() as u64,
+        Message::Compaction(
+            CompactionInfo::Summary(summary) | CompactionInfo::ScopedCheckpoint { summary, .. },
+        ) => summary.len() as u64,
         Message::Compaction(CompactionInfo::ProviderNative { .. }) => 0,
         Message::Resume => 0,
     };
@@ -11869,6 +11921,7 @@ mod tests {
         let session_id = thread.read_with(cx, |thread, _| thread.id().to_string());
         thread.update(cx, |thread, cx| {
             thread.set_model(model.clone(), cx);
+            thread.set_project_checkpoint_context_for_test("STALE_TASK_FROM_DATABASE".into(), cx);
             thread.messages.push(user_text_message(
                 ClientUserMessageId::new(),
                 "task context",
@@ -11885,14 +11938,22 @@ mod tests {
             .pending_completions()
             .pop()
             .expect("compaction request");
+        assert!(!format!("{:?}", request.messages).contains("STALE_TASK_FROM_DATABASE"));
         fake.send_text(&model, &request, "Preserve the current task decision");
         fake.end_stream(&model, &request);
         cx.run_until_parked();
         assert!(fake.pending_completions().is_empty());
-        thread.read_with(cx, |thread, _| {
-            assert!(matches!(thread.messages.last().map(AsRef::as_ref),
-                Some(Message::Compaction(CompactionInfo::Summary(summary)))
-                    if summary.as_ref() == "Preserve the current task decision"));
+        thread.read_with(cx, |thread, cx| {
+            let continuation = thread.build_request_messages(Vec::new(), cx);
+            let continuation = format!("{continuation:?}");
+            assert!(continuation.contains("Preserve the current task decision"));
+            assert!(!continuation.contains("STALE_TASK_FROM_DATABASE"));
+            assert!(!continuation.contains("prior response"));
+            assert_eq!(continuation.contains("task context"), fail_persistence);
+            assert_eq!(
+                continuation.contains("Current conversation handoff from checkpoint scope"),
+                !fail_persistence
+            );
         });
         if fail_persistence {
             assert!(
@@ -11908,11 +11969,7 @@ mod tests {
             .expect("read database")
             .expect("lifecycle saved database");
         let checkpoint = store
-            .latest(&format!(
-                "{}{}",
-                crate::COMPACTION_CHECKPOINT_SCOPE_PREFIX,
-                session_id
-            ))
+            .latest_compaction_for_session(&session_id)
             .expect("read summary")
             .expect("saved summary");
         assert!(
@@ -11921,6 +11978,15 @@ mod tests {
                 .iter()
                 .any(|summary| summary.contains("Preserve the current task decision"))
         );
+        thread.read_with(cx, |thread, _| {
+            assert!(matches!(thread.messages.last().map(AsRef::as_ref),
+                Some(Message::Compaction(CompactionInfo::ScopedCheckpoint { scope, checkpoint_id, .. }))
+                    if scope == &checkpoint.scope && checkpoint_id == &checkpoint.id));
+        });
+        assert!(checkpoint.scope.starts_with(&format!(
+            "{}{session_id}/",
+            crate::COMPACTION_CHECKPOINT_SCOPE_PREFIX
+        )));
         assert!(checkpoint.completed.is_empty());
         assert!(
             store

@@ -1,7 +1,9 @@
 You are compacting this conversation into a handoff for another agent that will resume the work.
 
+Capture the latest active user task. A newer user request supersedes older tasks. Do not carry forward pending work from unrelated historical checkpoints. Distinguish verified results from plans and uncertain observations.
+
 Include:
-- Goal: what the user is ultimately trying to achieve
+- Goal: what the user is ultimately trying to achieve, preserving exact acceptance criteria and constraints where important
 - State: progress so far, current blockers, and decisions made
 - Context: constraints, preferences, and critical data/examples/references needed to continue
 - Next: the specific steps that remain

@@ -6953,13 +6953,12 @@ mod internal_tests {
                 compaction.status,
                 acp_thread::ContextCompactionStatus::Completed
             );
-            assert_eq!(
+            assert!(
                 compaction
                     .summary
                     .blocks()
                     .next()
-                    .map(|block| block.to_markdown(cx)),
-                Some("retained context")
+                    .is_some_and(|block| block.to_markdown(cx).starts_with("retained context"))
             );
         });
 
@@ -6998,13 +6997,12 @@ mod internal_tests {
                 acp_thread::ContextCompactionStatus::Completed
             );
             assert!(!thread.is_compacting());
-            assert_eq!(
+            assert!(
                 compaction
                     .summary
                     .blocks()
                     .next()
-                    .map(|block| block.to_markdown(cx)),
-                Some("retained context")
+                    .is_some_and(|block| block.to_markdown(cx).starts_with("retained context"))
             );
         });
     }
