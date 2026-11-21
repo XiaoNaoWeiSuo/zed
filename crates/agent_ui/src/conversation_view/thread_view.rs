@@ -5550,6 +5550,14 @@ impl ThreadView {
         let id = format!("context-compaction-{entry_ix}");
         let header_label = match &compaction.status {
             acp_thread::ContextCompactionStatus::InProgress => "Compacting Context…",
+            acp_thread::ContextCompactionStatus::Completed
+                if AgentSettings::get_global(cx).message_detail
+                    == settings::AgentMessageDetail::Compact
+                    && self.as_native_thread(cx).is_some()
+                    && has_details =>
+            {
+                "Compacted History"
+            }
             acp_thread::ContextCompactionStatus::Completed => "Context Compacted",
             acp_thread::ContextCompactionStatus::Failed => "Compaction Failed",
             acp_thread::ContextCompactionStatus::Canceled => "Compaction Canceled",
@@ -5651,6 +5659,8 @@ impl ThreadView {
                                                             state.collapse_compaction(entry_ix);
                                                         },
                                                     );
+                                                    this.list_state
+                                                        .remeasure_items(0..entry_ix + 1);
                                                     this.refresh_thread_search(window, cx);
                                                     cx.notify();
                                                 },
@@ -5686,7 +5696,7 @@ impl ThreadView {
         self.entry_view_state.update(cx, |state, _cx| {
             state.toggle_compaction_expansion(entry_ix);
         });
-        self.list_state.remeasure_items(entry_ix..entry_ix + 1);
+        self.list_state.remeasure_items(0..entry_ix + 1);
         self.refresh_thread_search(window, cx);
         cx.notify();
     }
@@ -8862,9 +8872,37 @@ impl ThreadView {
             )
         };
 
+        let compacted_history = (AgentSettings::get_global(cx).message_detail
+            == settings::AgentMessageDetail::Compact
+            && !self.thread_search_visible
+            && self.as_native_thread(cx).is_some()
+            && self
+                .conversation
+                .read(cx)
+                .permission_requests
+                .get(&self.session_id)
+                .is_none_or(|requests| requests.is_empty()))
+        .then(|| {
+            self.thread.read(cx).entries().iter().rposition(|entry| {
+                matches!(entry, AgentThreadEntry::ContextCompaction(compaction)
+                    if compaction.status == acp_thread::ContextCompactionStatus::Completed
+                        && compaction.summary.blocks().len() > 0)
+            })
+        })
+        .flatten()
+        .filter(|index| {
+            !self
+                .entry_view_state
+                .read(cx)
+                .is_compaction_expanded(*index)
+        });
+
         list(
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
+                if compacted_history.is_some_and(|boundary| index < boundary) {
+                    return Empty.into_any_element();
+                }
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
                     let grouping = AgentSettings::get_global(cx).message_detail
