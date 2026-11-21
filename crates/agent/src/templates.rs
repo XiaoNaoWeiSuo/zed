@@ -197,6 +197,16 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_asks_to_keep_used_checkpoint_scopes_fresh() {
+        let rendered = render_system_prompt(&["project_checkpoint"], false);
+        assert!(rendered.contains("## Project memory"));
+        assert!(rendered.contains("keep that scope current"));
+        assert!(rendered.contains("the user's latest request decides what you do next"));
+        let without_checkpoints = render_system_prompt(&["echo"], false);
+        assert!(!without_checkpoints.contains("## Project memory"));
+    }
+
+    #[test]
     fn prompt_variants_render_identical_static_instructions() {
         let templates = Templates::new();
         for tools in [

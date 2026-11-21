@@ -21,20 +21,27 @@ use crate::{
 /// The editor records changed buffers and the latest available Git status snapshot.
 /// Git scanning can lag and unsaved buffers require verification. Summaries are
 /// assessments, not proof of completion. Use prune to apply retention limits and
-/// delete to drop every checkpoint in one scope.
+/// delete to drop every checkpoint in one exact scope without deleting children.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectCheckpointInput {
-    /// "save", "read", "list", or "runtime" for paginated session-owned task metadata.
-    /// "prune" applies retention limits; "delete" removes every checkpoint in one scope.
-    /// Runtime records are historical observations, not proof tasks are still running.
+    /// "create" saves the first checkpoint in a scope; "update" appends a new version
+    /// to an existing scope. "save" does either for compatibility. "read" gets the
+    /// latest exact checkpoint; "delete" removes all versions in that exact scope.
+    /// "list" returns child metadata; "prune" applies handoff history retention.
+    /// "runtime" lists historical session-owned task metadata, not proof of live tasks.
     pub action: String,
     /// Read detail: "summary" (default) or "full" for saved file and evidence records.
     #[serde(default)]
     pub detail: CheckpointReadDetail,
-    /// Stable work area, such as "agent.async_questions"; omitted for list.
-    /// Lowercase letters, digits, '.', '_', and '-' only, without repeated separators.
+    /// Exact work area, such as "agent/tools/checkpoints". Only '/' separates levels;
+    /// legacy dotted names remain flat. Each segment starts with a lowercase letter
+    /// or digit and can also contain '.', '_', and '-' without repeated separators.
     #[serde(default)]
     pub scope: String,
+    /// For list, the parent whose immediate children to show; omit for the project
+    /// root. A parent does not need to have a checkpoint of its own.
+    #[serde(default)]
+    pub parent: Option<String>,
     /// Page offset for list.
     #[serde(default)]
     pub offset: usize,
@@ -77,21 +84,21 @@ fn validate_scope(scope: &str) -> anyhow::Result<()> {
         "Checkpoint scopes must be at most 200 characters"
     );
     anyhow::ensure!(
-        !scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX),
-        "This checkpoint scope is reserved for automatic interruption records"
-    );
-    let mut characters = scope.chars();
-    anyhow::ensure!(
-        characters
-            .next()
-            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit()),
-        "Checkpoint scopes must start with a lowercase letter or digit"
+        !ProjectCheckpointStore::is_internal_scope(scope),
+        "This checkpoint scope is internal"
     );
     anyhow::ensure!(
-        scope.chars().all(|character| character.is_ascii_lowercase()
+        scope.split('/').all(|segment| segment
+            .as_bytes()
+            .first()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())),
+        "Each slash-separated checkpoint scope segment must start with a lowercase letter or digit"
+    );
+    anyhow::ensure!(
+        scope.bytes().all(|character| character.is_ascii_lowercase()
             || character.is_ascii_digit()
-            || matches!(character, '.' | '_' | '-')),
-        "Checkpoint scopes may only contain lowercase letters, digits, '.', '_', and '-'"
+            || matches!(character, b'.' | b'_' | b'-' | b'/')),
+        "Checkpoint scopes may only contain lowercase letters, digits, '.', '_', '-', and '/'"
     );
     anyhow::ensure!(
         !scope.contains("..") && !scope.contains("__") && !scope.contains("--"),
@@ -183,10 +190,18 @@ pub struct CheckpointSaveReceipt {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointTreeEntry {
+    pub scope: String,
+    /// None for an implicit folder without a checkpoint of its own.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub has_children: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProjectCheckpointOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved: Option<CheckpointSaveReceipt>,
-    pub scopes: Vec<crate::CheckpointScopeSummary>,
+    pub scopes: Vec<CheckpointTreeEntry>,
     pub next_offset: Option<usize>,
     pub checkpoint: Option<serde_json::Value>,
     pub changed_since_checkpoint: Vec<PathBuf>,
@@ -248,25 +263,26 @@ impl AgentTool for ProjectCheckpointTool {
         cx.spawn(async move |cx| {
             let result = async {
                 let input = input.recv().await?;
-                anyhow::ensure!(matches!(input.action.as_str(), "save" | "read" | "list" | "runtime" | "prune" | "delete"), "Unknown checkpoint action");
-                if input.action == "save" {
-                    validate_scope(&input.scope)?;
+                match input.action.as_str() {
+                    "create" | "update" | "save" => validate_scope(&input.scope)?,
+                    "read" | "delete" => {
+                        anyhow::ensure!(!input.scope.trim().is_empty(), "A checkpoint scope is required");
+                        anyhow::ensure!(
+                            input.action != "delete" || !ProjectCheckpointStore::is_internal_scope(&input.scope),
+                            "This checkpoint scope is internal"
+                        );
+                    }
+                    "prune" => anyhow::ensure!(input.scope.trim().is_empty(), "`prune` does not accept `scope`; it applies to all handoff scopes"),
+                    "list" => {
+                        anyhow::ensure!(input.scope.trim().is_empty(), "`list` uses `parent`, not `scope`");
+                        if let Some(parent) = input.parent.as_deref() {
+                            validate_scope(parent)?;
+                        }
+                    }
+                    "runtime" => {}
+                    _ => anyhow::bail!("Unknown checkpoint action"),
                 }
-                if input.action == "read" {
-                    anyhow::ensure!(!input.scope.trim().is_empty(), "A checkpoint scope is required");
-                    anyhow::ensure!(!input.scope.starts_with(crate::AUTOMATIC_CHECKPOINT_SCOPE_PREFIX), "This checkpoint scope is reserved for automatic interruption records");
-                }
-                if input.action == "delete" {
-                    anyhow::ensure!(!input.scope.trim().is_empty(), "`delete` requires the scope to remove");
-                }
-                anyhow::ensure!(
-                    !(input.action == "prune" && !input.scope.trim().is_empty()),
-                    "`prune` does not accept `scope`; it applies retention limits to every scope"
-                );
-                anyhow::ensure!(
-                    !(input.action == "list" && !input.scope.trim().is_empty()),
-                    "`list` does not accept `scope`; omit it to list all scopes, or use `read` with that scope"
-                );
+                anyhow::ensure!(input.parent.is_none() || input.action == "list", "Only `list` accepts `parent`");
                 let (root, session_id, files, git, evidence) = self.thread.read_with(cx, |thread, cx| -> anyhow::Result<_> {
                     let project = thread.project().read(cx);
                     anyhow::ensure!(project.is_local(), "Project checkpoints currently require a local project");
@@ -296,6 +312,10 @@ impl AgentTool for ProjectCheckpointTool {
                         for path in &git.dirty_files { files.entry(path.clone()).or_insert(false); }
                     }
                     let session_id = thread.id().0.to_string();
+                    if input.action == "read" {
+                        ProjectCheckpointStore::ensure_scope_readable(&input.scope, &session_id)?;
+                        return Ok((root, session_id, files, git, Vec::new()));
+                    }
                     let observations = thread.retained_tool_results()
                         .filter(|(_, result, _)| result.tool_name.as_ref() != Self::NAME)
                         .map(|(id, result, tool_use)| CheckpointEvidence {
@@ -309,13 +329,20 @@ impl AgentTool for ProjectCheckpointTool {
                     Ok((root, session_id, files, git, evidence))
                 })??;
                 cx.background_spawn(async move {
-                    let store = if input.action == "save" {
+                    let store = if matches!(input.action.as_str(), "create" | "save") {
                         Some(ProjectCheckpointStore::open(&root)?)
                     } else {
                         ProjectCheckpointStore::open_existing(&root)?
                     };
                     let Some(store) = store else {
-                        return Ok(ProjectCheckpointOutput { saved: None, scopes: Vec::new(), next_offset: None, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger: RuntimeLedgerSnapshot::default(), error: None });
+                        anyhow::ensure!(input.action != "update", "Checkpoint scope does not exist: {}", input.scope);
+                        return Ok(ProjectCheckpointOutput {
+                            checkpoint: (input.action == "delete").then(|| serde_json::json!({
+                                "deleted_scope": input.scope,
+                                "reclaimed_checkpoints": 0
+                            })),
+                            ..Default::default()
+                        });
                     };
                     if input.action == "runtime" {
                         let records = store.query_runtime_task_records(&session_id)?;
@@ -339,13 +366,13 @@ impl AgentTool for ProjectCheckpointTool {
                         });
                     }
                     if input.action == "prune" {
-                        let removed = store.maintain_checkpoints()?;
+                        let removed = store.prune_handoff_checkpoints()?;
                         return Ok(ProjectCheckpointOutput {
                             saved: None, scopes: Vec::new(), next_offset: None,
                             checkpoint: Some(serde_json::json!({
                                 "reclaimed_checkpoints": removed,
                                 "retention_per_scope": crate::CHECKPOINT_RETENTION_PER_SCOPE,
-                                "internal_scope_retention": crate::INTERNAL_SCOPE_RETENTION,
+                                "internal_scopes": "maintained automatically",
                                 "runtime_tasks": "maintained automatically after each turn"
                             })),
                             changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(),
@@ -370,15 +397,15 @@ impl AgentTool for ProjectCheckpointTool {
                     }
                     if input.action == "list" {
                         let limit = input.limit.unwrap_or(10).clamp(1, 20);
-                        let mut scopes = store.list_scopes(input.offset, limit + 1)?;
-                        let next_offset = if scopes.len() > limit {
-                            scopes.truncate(limit);
-                            Some(input.offset.saturating_add(scopes.len()))
-                        } else { None };
-                        return Ok(ProjectCheckpointOutput { saved: None, scopes, next_offset, checkpoint: None, changed_since_checkpoint: Vec::new(), files_not_checked: Vec::new(), current_revision_changed: None, current_branch_changed: None, new_dirty_files: None, new_dirty_files_truncated: false, runtime_ledger: RuntimeLedgerSnapshot::default(), error: None });
+                        let children = store.list_scope_children(input.parent.as_deref(), input.offset, limit + 1)?;
+                        let next_offset = (children.len() > limit).then_some(input.offset.saturating_add(limit));
+                        let scopes = children.into_iter().take(limit)
+                            .map(|(scope, created_at, has_children)| CheckpointTreeEntry { scope, created_at, has_children })
+                            .collect();
+                        return Ok(ProjectCheckpointOutput { scopes, next_offset, ..Default::default() });
                     }
                     if input.action == "read" {
-                        let checkpoint = store.latest(&input.scope)?;
+                        let checkpoint = store.read_scope(&input.scope, &session_id)?;
                         let mut changed = Vec::new();
                         let mut unknown = Vec::new();
                         if let Some(checkpoint) = &checkpoint {
@@ -420,7 +447,12 @@ impl AgentTool for ProjectCheckpointTool {
                         completed: input.completed, remaining: input.remaining, decisions: input.decisions,
                         next_steps: input.next_steps, changed_files, evidence, interrupted: false,
                     };
-                    store.save(&checkpoint)?;
+                    match input.action.as_str() {
+                        "create" => store.create(&checkpoint)?,
+                        "update" => store.update(&checkpoint)?,
+                        "save" => store.save(&checkpoint)?,
+                        _ => anyhow::bail!("Unknown checkpoint write action"),
+                    }
                     let runtime_ledger = RuntimeLedgerSnapshot::from_records(None, Some(&checkpoint), &[]);
                     let saved = CheckpointSaveReceipt {
                         id: checkpoint.id,
@@ -448,6 +480,8 @@ mod tests {
             "agent.async_questions",
             "harness.abcd_followthrough",
             "task-1",
+            "agent/tools/checkpoints",
+            "agent.async_questions/task-1",
             "a",
         ] {
             assert!(validate_scope(scope).is_ok(), "{scope} should be valid");
@@ -461,8 +495,14 @@ mod tests {
             "agent__x",
             "agent--x",
             "-agent",
-            "agent/x",
+            "/agent",
+            "agent/",
+            "agent//x",
+            "agent/../x",
+            "agent/_x",
+            "agent/X",
             "@automatic/x",
+            "@compaction/x",
         ] {
             assert!(validate_scope(scope).is_err(), "{scope} should be rejected");
         }
