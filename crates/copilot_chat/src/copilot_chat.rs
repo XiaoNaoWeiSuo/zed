@@ -475,12 +475,7 @@ pub struct ResponseEvent {
     pub usage: Option<Usage>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Usage {
-    pub completion_tokens: u64,
-    pub prompt_tokens: u64,
-    pub total_tokens: u64,
-}
+pub use language_model::chat_completion::Usage;
 
 #[derive(Debug, Deserialize)]
 pub struct ResponseChoice {

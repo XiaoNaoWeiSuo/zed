@@ -21,7 +21,7 @@ pub use language_model_core::chat_completion::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::{convert::TryFrom, future::Future, io};
+use std::{convert::TryFrom, future::Future, io, sync::Arc};
 use strum::EnumIter;
 use thiserror::Error;
 
@@ -33,6 +33,7 @@ pub enum Role {
     User,
     Assistant,
     System,
+    Developer,
     Tool,
 }
 
@@ -44,6 +45,7 @@ impl TryFrom<String> for Role {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
             "system" => Ok(Self::System),
+            "developer" => Ok(Self::Developer),
             "tool" => Ok(Self::Tool),
             _ => anyhow::bail!("invalid role '{value}'"),
         }
@@ -56,6 +58,7 @@ impl From<Role> for String {
             Role::User => "user".to_owned(),
             Role::Assistant => "assistant".to_owned(),
             Role::System => "system".to_owned(),
+            Role::Developer => "developer".to_owned(),
             Role::Tool => "tool".to_owned(),
         }
     }
@@ -1156,9 +1159,11 @@ pub async fn stream_completion(
     .await?;
     let provider_name =
         language_model_core::LanguageModelProviderName::from(provider_name.to_string());
+    let requested_model: Arc<str> = request.model.into();
     Ok(events
         .filter_map(move |event| {
             let provider_name = provider_name.clone();
+            let requested_model = requested_model.clone();
             async move {
                 let value = match event {
                     Ok(ChatCompletionStreamEvent::Data(value)) => value,
@@ -1166,7 +1171,36 @@ pub async fn stream_completion(
                     Err(error) => return Some(Err(error.into())),
                 };
                 match serde_json::from_str::<ResponseStreamResult>(value.get()) {
-                    Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                    Ok(ResponseStreamResult::Ok(response)) => {
+                        if let Some(usage) = response.usage.as_ref()
+                            && log::log_enabled!(target: "open_ai::prompt_cache", log::Level::Debug)
+                        {
+                            #[derive(Deserialize)]
+                            struct ResponseMetadata<'a> {
+                                id: Option<&'a str>,
+                                model: Option<&'a str>,
+                                service_tier: Option<&'a str>,
+                                system_fingerprint: Option<&'a str>,
+                            }
+
+                            let metadata = serde_json::from_str::<ResponseMetadata<'_>>(value.get()).ok();
+                            let details = usage.prompt_tokens_details.as_ref();
+                            log::debug!(
+                                target: "open_ai::prompt_cache",
+                                "Chat Completions cache usage: provider={}, requested_model={}, returned_model={:?}, response_id={:?}, returned_service_tier={:?}, system_fingerprint={:?}, input_tokens={:?}, cached_tokens={:?}, cache_write_tokens={:?}",
+                                provider_name.0,
+                                requested_model,
+                                metadata.as_ref().and_then(|metadata| metadata.model),
+                                metadata.as_ref().and_then(|metadata| metadata.id),
+                                metadata.as_ref().and_then(|metadata| metadata.service_tier),
+                                metadata.as_ref().and_then(|metadata| metadata.system_fingerprint),
+                                usage.prompt_tokens,
+                                details.and_then(|details| details.cached_tokens),
+                                details.and_then(|details| details.cache_write_tokens),
+                            );
+                        }
+                        Some(Ok(response))
+                    }
                     Ok(ResponseStreamResult::Err { error }) => {
                         let category = completion::response_error_category(
                             error.code.as_deref(),

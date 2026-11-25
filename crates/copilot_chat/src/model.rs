@@ -22,7 +22,7 @@ use language_model::{
     LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolChoice,
     LanguageModelToolChoiceSupport, LanguageModelToolResultContent, LanguageModelToolUse,
-    MessageContent, ProviderErrorCategory, RateLimiter, Role, StopReason, TokenUsage,
+    MessageContent, ProviderErrorCategory, RateLimiter, Role, StopReason,
 };
 use util::debug_panic;
 
@@ -304,7 +304,14 @@ pub fn map_to_language_model_completion_events(
             if let Some(event) = state.events.next().await {
                 match event {
                     Ok(event) => {
+                        let usage = event.usage.as_ref().and_then(crate::Usage::token_usage);
                         let Some(choice) = event.choices.first() else {
+                            if let Some(usage) = usage {
+                                return Some((
+                                    vec![Ok(LanguageModelCompletionEvent::UsageUpdate(usage))],
+                                    state,
+                                ));
+                            }
                             return Some((
                                 vec![Err(anyhow!("Response contained no choices").into())],
                                 state,
@@ -380,15 +387,8 @@ pub fn map_to_language_model_completion_events(
                             }
                         }
 
-                        if let Some(usage) = event.usage {
-                            events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
-                                TokenUsage {
-                                    input_tokens: usage.prompt_tokens,
-                                    output_tokens: usage.completion_tokens,
-                                    cache_creation_input_tokens: 0,
-                                    cache_read_input_tokens: 0,
-                                },
-                            )));
+                        if let Some(usage) = usage {
+                            events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(usage)));
                         }
 
                         match choice.finish_reason.as_deref() {
@@ -594,12 +594,9 @@ impl CopilotResponsesEventMapper {
             copilot_responses::StreamEvent::Completed { response } => {
                 let mut events = Vec::new();
                 if let Some(usage) = response.usage {
-                    events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                        input_tokens: usage.input_tokens.unwrap_or(0),
-                        output_tokens: usage.output_tokens.unwrap_or(0),
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    })));
+                    events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
+                        usage.token_usage(),
+                    )));
                 }
                 if self.pending_stop_reason.take() != Some(StopReason::ToolUse) {
                     events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
@@ -625,12 +622,9 @@ impl CopilotResponsesEventMapper {
 
                 let mut events = Vec::new();
                 if let Some(usage) = response.usage {
-                    events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                        input_tokens: usage.input_tokens.unwrap_or(0),
-                        output_tokens: usage.output_tokens.unwrap_or(0),
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    })));
+                    events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
+                        usage.token_usage(),
+                    )));
                 }
                 events.push(Ok(LanguageModelCompletionEvent::Stop(stop_reason)));
                 events
@@ -781,11 +775,14 @@ fn into_copilot_chat(
     let temperature = request.temperature;
     let tool_choice = request.tool_choice;
     let thinking_allowed = request.thinking_allowed;
+    let preserve_user_boundaries = model.vendor() == crate::ModelVendor::OpenAI;
 
     let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::new();
     for message in request.messages {
         if let Some(last_message) = request_messages.last_mut() {
-            if last_message.role == message.role {
+            if last_message.role == message.role
+                && (!preserve_user_boundaries || message.role != Role::User)
+            {
                 last_message.content.extend(message.content);
             } else {
                 request_messages.push(message);
@@ -1254,7 +1251,7 @@ mod tests {
     use super::*;
     use crate::responses;
     use futures::StreamExt;
-    use language_model::ProviderErrorCategory;
+    use language_model::{ProviderErrorCategory, TokenUsage};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1362,6 +1359,12 @@ mod tests {
                         input_tokens: Some(5),
                         output_tokens: Some(3),
                         total_tokens: Some(8),
+                        input_tokens_details: Some(
+                            language_model::chat_completion::PromptTokensDetails {
+                                cached_tokens: Some(2),
+                                cache_write_tokens: None,
+                            },
+                        ),
                     }),
                     ..Default::default()
                 },
@@ -1380,8 +1383,9 @@ mod tests {
         assert!(matches!(
             mapped[2],
             LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                input_tokens: 5,
+                input_tokens: 3,
                 output_tokens: 3,
+                cache_read_input_tokens: 2,
                 ..
             })
         ));
@@ -1650,6 +1654,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(0),
                     total_tokens: Some(10),
+                    input_tokens_details: None,
                 }),
                 incomplete_details: Some(responses::IncompleteDetails {
                     reason: Some(responses::IncompleteReason::MaxOutputTokens),
@@ -1760,6 +1765,37 @@ mod tests {
             }
             other => panic!("expected RateLimit ProviderRejection, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn chat_completions_stream_maps_cache_usage_without_choices() {
+        let event: ResponseEvent = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-usage",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1100,
+                "completion_tokens": 10,
+                "total_tokens": 1110,
+                "prompt_tokens_details": { "cached_tokens": 1024 }
+            }
+        }))
+        .expect("usage event");
+        let mapped = futures::executor::block_on(
+            map_to_language_model_completion_events(
+                Box::pin(futures::stream::iter([Ok(event)])),
+                true,
+            )
+            .collect::<Vec<_>>(),
+        );
+        assert!(matches!(
+            mapped.as_slice(),
+            [Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                input_tokens: 76,
+                output_tokens: 10,
+                cache_read_input_tokens: 1024,
+                ..
+            }))]
+        ));
     }
 
     #[test]

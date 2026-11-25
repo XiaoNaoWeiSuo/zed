@@ -200,6 +200,7 @@ fn validate_compaction_items(items: &[Value]) -> Result<()> {
 
 #[derive(Debug, Default)]
 pub struct ResponseInput {
+    leading_instructions: Option<ResponseInputItem>,
     provider_items: Vec<Value>,
     generated_items: Vec<ResponseInputItem>,
 }
@@ -207,13 +208,24 @@ pub struct ResponseInput {
 impl ResponseInput {
     pub fn new(provider_items: Vec<Value>, generated_items: Vec<ResponseInputItem>) -> Self {
         Self {
+            leading_instructions: None,
             provider_items,
             generated_items,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.provider_items.is_empty() && self.generated_items.is_empty()
+        self.leading_instructions.is_none()
+            && self.provider_items.is_empty()
+            && self.generated_items.is_empty()
+    }
+
+    pub(crate) fn set_developer_instructions(&mut self, text: String) {
+        self.leading_instructions = Some(ResponseInputItem::Message(ResponseMessageItem {
+            role: Role::Developer,
+            content: vec![ResponseInputContent::Text { text }],
+            phase: None,
+        }));
     }
 
     /// Filters only the items this crate generated from the request.
@@ -224,6 +236,14 @@ impl ResponseInput {
     /// tolerate arbitrary items inside a replayed window) should not accept
     /// provider-native compaction state in the first place.
     pub fn retain(&mut self, predicate: impl FnMut(&ResponseInputItem) -> bool) {
+        let mut predicate = predicate;
+        if self
+            .leading_instructions
+            .as_ref()
+            .is_some_and(|item| !predicate(item))
+        {
+            self.leading_instructions = None;
+        }
         self.generated_items.retain(predicate);
     }
 
@@ -237,8 +257,14 @@ impl Serialize for ResponseInput {
     where
         S: serde::Serializer,
     {
-        let mut sequence = serializer
-            .serialize_seq(Some(self.provider_items.len() + self.generated_items.len()))?;
+        let mut sequence = serializer.serialize_seq(Some(
+            usize::from(self.leading_instructions.is_some())
+                + self.provider_items.len()
+                + self.generated_items.len(),
+        ))?;
+        if let Some(instructions) = &self.leading_instructions {
+            sequence.serialize_element(instructions)?;
+        }
         for item in &self.provider_items {
             sequence.serialize_element(item)?;
         }
@@ -685,6 +711,8 @@ pub struct ResponseUsage {
 pub struct ResponseInputTokensDetails {
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]

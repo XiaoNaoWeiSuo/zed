@@ -244,6 +244,25 @@ pub struct ResponseUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub input_tokens_details: Option<language_model::chat_completion::PromptTokensDetails>,
+}
+
+impl ResponseUsage {
+    pub(crate) fn token_usage(self) -> language_model::TokenUsage {
+        let details = self.input_tokens_details.unwrap_or_default();
+        let cache_read_input_tokens = details.cached_tokens.unwrap_or_default();
+        let cache_creation_input_tokens = details.cache_write_tokens.unwrap_or_default();
+        language_model::TokenUsage {
+            input_tokens: self
+                .input_tokens
+                .unwrap_or_default()
+                .saturating_sub(cache_read_input_tokens)
+                .saturating_sub(cache_creation_input_tokens),
+            output_tokens: self.output_tokens.unwrap_or_default(),
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -83,10 +83,16 @@ pub fn into_open_ai(
 
     let stream = !model_id.starts_with("o1-");
     let service_tier = service_tier_for(request.speed);
+    let model_name = model_id.rsplit('/').next().unwrap_or(model_id);
+    let preserve_user_boundaries = matches!(
+        model_name.split('-').next(),
+        Some("gpt" | "chatgpt" | "o1" | "o3" | "o4")
+    );
 
     let mut messages = Vec::new();
     let mut current_reasoning: Option<String> = None;
     for message in request.messages {
+        let message_start = messages.len();
         let reasoning_details = interleaved_reasoning
             .then(|| message.reasoning_details.clone())
             .flatten();
@@ -104,11 +110,14 @@ pub fn into_open_ai(
                         !text.is_empty()
                     };
                     if should_add {
+                        let merge_user =
+                            !preserve_user_boundaries || messages.len() > message_start;
                         add_message_content_part(
                             MessagePart::Text { text },
                             message.role,
                             &mut messages,
                             reasoning_details.clone(),
+                            merge_user,
                         );
                         if let Some(reasoning) = current_reasoning.take() {
                             if let Some(crate::RequestMessage::Assistant {
@@ -123,6 +132,7 @@ pub fn into_open_ai(
                 }
                 MessageContent::RedactedThinking(_) | MessageContent::Compaction(_) => {}
                 MessageContent::Image(image) => {
+                    let merge_user = !preserve_user_boundaries || messages.len() > message_start;
                     add_message_content_part(
                         MessagePart::Image {
                             image_url: ImageUrl {
@@ -133,6 +143,7 @@ pub fn into_open_ai(
                         message.role,
                         &mut messages,
                         reasoning_details.clone(),
+                        merge_user,
                     );
                 }
                 MessageContent::ToolUse(tool_use) => {
@@ -390,14 +401,27 @@ pub fn into_open_ai_response(
         Vec::new()
     };
 
+    let window_has_instructions = provider_items.iter().any(|item| {
+        item.get("role")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|role| matches!(role, "developer" | "system"))
+    });
+    let mut input = crate::responses::ResponseInput::new(provider_items, input_items);
+    let mut instructions =
+        (!system_instructions.is_empty()).then(|| system_instructions.join("\n\n"));
+    // The current instructions must follow any developer messages retained
+    // by native compaction, whose canonical window is replayed verbatim.
+    if !window_has_instructions
+        && uses_cacheable_developer_instructions(model_id)
+        && let Some(instructions) = instructions.take()
+    {
+        input.set_developer_instructions(instructions);
+    }
+
     Ok(ResponseRequest {
         model: model_id.into(),
-        instructions: if system_instructions.is_empty() {
-            None
-        } else {
-            Some(system_instructions.join("\n\n"))
-        },
-        input: crate::responses::ResponseInput::new(provider_items, input_items),
+        instructions,
+        input,
         store: Some(false),
         include,
         stream,
@@ -425,6 +449,18 @@ pub fn into_open_ai_response(
         context_management: compact_at_tokens
             .map(|compact_threshold| vec![ContextManagement::Compaction { compact_threshold }]),
     })
+}
+
+fn uses_cacheable_developer_instructions(model_id: &str) -> bool {
+    let model_name = model_id.rsplit('/').next().unwrap_or(model_id);
+    let Some(version) = model_name.strip_prefix("gpt-") else {
+        return false;
+    };
+    let version = version.split('-').next().unwrap_or(version);
+    let mut components = version.split('.');
+    let major = components.next().and_then(|part| part.parse::<u16>().ok());
+    let minor = components.next().and_then(|part| part.parse::<u16>().ok());
+    major.is_some_and(|major| major > 6 || (major == 6 && minor.is_some_and(|minor| minor >= 2)))
 }
 
 fn append_message_to_response_items(
@@ -714,10 +750,14 @@ fn add_message_content_part(
     role: Role,
     messages: &mut Vec<crate::RequestMessage>,
     reasoning_details: Option<Arc<serde_json::Value>>,
+    merge_user: bool,
 ) {
     match (role, messages.last_mut()) {
-        (Role::User, Some(crate::RequestMessage::User { content }))
-        | (Role::System, Some(crate::RequestMessage::System { content, .. })) => {
+        // Appending another user message must preserve the former end of the cached input.
+        (Role::User, Some(crate::RequestMessage::User { content })) if merge_user => {
+            content.push_part(new_part);
+        }
+        (Role::System, Some(crate::RequestMessage::System { content, .. })) => {
             content.push_part(new_part);
         }
         (
@@ -1488,14 +1528,19 @@ fn response_content_is_refusal(content: &serde_json::Value) -> bool {
 
 pub fn token_usage_from_response_usage(usage: &ResponsesUsage) -> TokenUsage {
     let cache_read_input_tokens = usage.input_tokens_details.cached_tokens;
+    let cache_creation_input_tokens = usage
+        .input_tokens_details
+        .cache_write_tokens
+        .unwrap_or_default();
 
     TokenUsage {
         input_tokens: usage
             .input_tokens
             .unwrap_or_default()
-            .saturating_sub(cache_read_input_tokens),
+            .saturating_sub(cache_read_input_tokens)
+            .saturating_sub(cache_creation_input_tokens),
         output_tokens: usage.output_tokens.unwrap_or_default(),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens,
         cache_read_input_tokens,
     }
 }
@@ -1755,7 +1800,10 @@ mod tests {
                 response: ResponseSummary {
                     usage: Some(ResponseUsage {
                         input_tokens: Some(5),
-                        input_tokens_details: ResponseInputTokensDetails { cached_tokens: 2 },
+                        input_tokens_details: ResponseInputTokensDetails {
+                            cached_tokens: 2,
+                            ..Default::default()
+                        },
                         output_tokens: Some(3),
                         total_tokens: Some(8),
                         ..Default::default()
@@ -1806,11 +1854,12 @@ mod tests {
     }
 
     #[test]
-    fn response_usage_deserializes_cached_tokens() -> Result<()> {
+    fn response_usage_deserializes_cache_reads_and_writes() -> Result<()> {
         let usage: ResponseUsage = serde_json::from_value(json!({
             "input_tokens": 5,
             "input_tokens_details": {
                 "cached_tokens": 2,
+                "cache_write_tokens": 1,
             },
             "output_tokens": 3,
             "output_tokens_details": {
@@ -1823,9 +1872,9 @@ mod tests {
         assert_eq!(
             token_usage_from_response_usage(&usage),
             TokenUsage {
-                input_tokens: 3,
+                input_tokens: 2,
                 output_tokens: 3,
-                cache_creation_input_tokens: 0,
+                cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 2,
             }
         );
@@ -4652,6 +4701,28 @@ mod tests {
             ..Default::default()
         };
 
+        let modern_response = into_open_ai_response(
+            request.clone(),
+            "gpt-6.2-sol",
+            true,
+            true,
+            None,
+            None,
+            false,
+            &OPEN_AI_PROVIDER_ID,
+        )
+        .expect("modern Responses payload");
+        let modern = serde_json::to_value(&modern_response).expect("serialize modern payload");
+        assert!(modern.get("instructions").is_none());
+        assert_eq!(
+            modern["input"][0],
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "You are a coding assistant.\n\nPrefer terse answers." }]
+            })
+        );
+
         let response = into_open_ai_response(
             request,
             "gpt-5.1",
@@ -4762,6 +4833,56 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn into_open_ai_response_preserves_native_developer_messages() -> Result<()> {
+        let retained_items = vec![
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "Previous instructions." }]
+            }),
+            json!({ "type": "compaction", "encrypted_content": "encrypted-blob" }),
+        ];
+        let state =
+            provider_compaction_state_from_items(OPEN_AI_PROVIDER_ID, retained_items.clone())?;
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec!["Current instructions.".into()],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::Compaction(CompactedContext::ProviderState(
+                        state,
+                    ))],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let response = into_open_ai_response(
+            request,
+            "gpt-6.2-sol",
+            true,
+            true,
+            None,
+            None,
+            false,
+            &OPEN_AI_PROVIDER_ID,
+        )?;
+        let serialized = serde_json::to_value(&response)?;
+        assert_eq!(serialized["instructions"], "Current instructions.");
+        assert_eq!(
+            serialized["input"],
+            serde_json::Value::Array(retained_items)
+        );
+        Ok(())
     }
 
     #[test]

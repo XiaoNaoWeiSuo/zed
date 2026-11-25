@@ -63,7 +63,7 @@ use std::{
     ops::RangeInclusive,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
@@ -1525,6 +1525,19 @@ struct InterjectedMessage {
     content: Arc<[UserMessageContent]>,
 }
 
+#[derive(Default)]
+struct HarnessRequestContext {
+    environment: String,
+    tools: Vec<SharedString>,
+    restricted: bool,
+    history_revision: usize,
+    compaction_index: Option<usize>,
+    last_message: Option<(usize, Weak<Message>)>,
+    // Request-only state can be replayed at its original boundary without
+    // becoming part of the saved transcript or the compaction summary.
+    snapshots: Vec<(usize, SharedString)>,
+}
+
 pub struct Thread {
     id: acp_v2::SessionId,
     prompt_id: PromptId,
@@ -1562,6 +1575,7 @@ pub struct Thread {
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    current_request_input_usage: Option<TokenUsage>,
     latency: crate::run_metrics::TurnLatency,
     throughput: TokenThroughput,
     last_metrics_publish: Option<Instant>,
@@ -1569,6 +1583,7 @@ pub struct Thread {
     goal: Option<ThreadGoal>,
     deferred_questions: IndexMap<String, DeferredQuestion>,
     checkpoint_context: Option<String>,
+    harness_request_context: HarnessRequestContext,
     deferred_question_updates: watch::Sender<()>,
     _deferred_question_updates_rx: watch::Receiver<()>,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
@@ -1884,6 +1899,7 @@ impl Thread {
             usage_history_estimates: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
+            current_request_input_usage: None,
             latency: crate::run_metrics::TurnLatency::default(),
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
@@ -1891,6 +1907,7 @@ impl Thread {
             goal: None,
             deferred_questions: IndexMap::default(),
             checkpoint_context: None,
+            harness_request_context: HarnessRequestContext::default(),
             deferred_question_updates,
             _deferred_question_updates_rx: deferred_question_updates_rx,
             pending_compaction_telemetry: None,
@@ -2333,12 +2350,14 @@ impl Thread {
             usage_history_estimates: HashMap::default(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
+            current_request_input_usage: None,
             latency: crate::run_metrics::TurnLatency::default(),
             throughput: TokenThroughput::default(),
             last_metrics_publish: None,
             permission_tier: Rc::new(PermissionTierState::new(db_thread.permission_tier)),
             deferred_questions: db_thread.deferred_questions,
             checkpoint_context: None,
+            harness_request_context: HarnessRequestContext::default(),
             deferred_question_updates,
             _deferred_question_updates_rx: deferred_question_updates_rx,
             goal: db_thread.goal.map(|mut goal| {
@@ -3072,6 +3091,11 @@ impl Thread {
 
     pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
+        if self.model().is_none_or(|previous| {
+            previous.provider_id() != model.provider_id() || previous.id() != model.id()
+        }) {
+            self.harness_request_context = HarnessRequestContext::default();
+        }
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model());
         let new_usage = self.latest_token_usage();
@@ -3756,7 +3780,17 @@ impl Thread {
         self.end_turn_at_next_boundary
     }
 
+    fn reset_request_token_usage(&mut self) {
+        self.current_request_token_usage = TokenUsage::default();
+        self.current_request_input_usage = None;
+    }
+
     fn accumulate_token_usage(&mut self, update: language_model::TokenUsage) {
+        if total_input_tokens(update) > 0 {
+            // Some gateways revise the classification of the same prompt tokens
+            // during streaming. A cache ratio must use one coherent snapshot.
+            self.current_request_input_usage = Some(update);
+        }
         let previous_accounted_usage = self.current_request_token_usage;
         let current_accounted_usage = TokenUsage {
             input_tokens: previous_accounted_usage
@@ -3810,7 +3844,13 @@ impl Thread {
                 tokens,
             },
         );
-        self.request_token_usage.insert(user_message_id, update);
+        self.request_token_usage.insert(
+            user_message_id,
+            TokenUsage {
+                output_tokens: self.current_request_token_usage.output_tokens,
+                ..self.current_request_input_usage.unwrap_or_default()
+            },
+        );
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -3867,6 +3907,7 @@ impl Thread {
             return Err(anyhow!("Message not found"));
         };
 
+        self.harness_request_context = HarnessRequestContext::default();
         for message in self.messages.drain(position..) {
             match &*message {
                 Message::User(message) => {
@@ -4045,6 +4086,9 @@ impl Thread {
             .iter_mut()
             .find(|message| matches!(message.as_ref(), Message::User(user) if user.id == id))
         {
+            if existing.as_ref() == message.as_ref() {
+                return;
+            }
             *existing = message;
             self.retained_history_revision += 1;
         } else {
@@ -4172,7 +4216,7 @@ impl Thread {
         let compaction = target.map(|request_end_ix| {
             self.advance_prompt_id();
             let request = self.build_compaction_request(request_end_ix, &model, cx);
-            self.current_request_token_usage = TokenUsage::default();
+            self.reset_request_token_usage();
             (model.clone(), request)
         });
 
@@ -4332,7 +4376,7 @@ impl Thread {
         self.flush_interjected_messages(cx);
         self.cancel(cx).detach();
         self.latency.start(turn_started_at);
-        self.current_request_token_usage = TokenUsage::default();
+        self.reset_request_token_usage();
         self.throughput = TokenThroughput::default();
         self.publish_run_metrics(cx, true);
 
@@ -4644,7 +4688,7 @@ impl Thread {
                     this.deliver_deferred_responses(cx);
                 }
                 let request = this.build_completion_request(intent, cx)?;
-                this.current_request_token_usage = TokenUsage::default();
+                this.reset_request_token_usage();
                 let request_started_at = Instant::now();
                 this.latency.begin_request(request_started_at);
                 this.throughput.start(request_started_at);
@@ -5077,7 +5121,7 @@ impl Thread {
             let insertion_ix = this.compaction_message_target_ix(cx)?;
             let model = this.compaction_model(cx)?;
             let request = this.build_compaction_request(insertion_ix, &model, cx);
-            this.current_request_token_usage = TokenUsage::default();
+            this.reset_request_token_usage();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
             if this.pending_compaction_telemetry.is_none() {
@@ -5432,11 +5476,9 @@ impl Thread {
     }
 
     fn publish_run_metrics(&mut self, cx: &mut Context<Self>, running: bool) {
-        let usage = self.current_request_token_usage;
-        let input_tokens =
-            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-        let cache_hit_rate =
-            (input_tokens > 0).then(|| usage.cache_read_input_tokens as f32 / input_tokens as f32);
+        let cache_hit_rate = self
+            .current_request_input_usage
+            .map(|usage| usage.cache_read_input_tokens as f32 / total_input_tokens(usage) as f32);
         let tokens_per_second = self.throughput.rate();
         let mut snapshot = crate::run_metrics::AgentMetricsSnapshot {
             version: crate::run_metrics::METRICS_VERSION,
@@ -5470,12 +5512,17 @@ impl Thread {
 
         if !running {
             log::info!(
-                "Agent turn latency: preparation_ms={:?}, response_ms={:?}, first_activity_ms={:?}, first_text_ms={:?}, requests={}",
+                "Agent turn latency: preparation_ms={:?}, response_ms={:?}, first_activity_ms={:?}, first_text_ms={:?}, requests={}, last_prompt_tokens={:?}, last_cache_read_tokens={:?}, last_cache_write_tokens={:?}",
                 snapshot.preparation_ms,
                 snapshot.response_ms,
                 snapshot.first_activity_ms,
                 snapshot.time_to_first_token_ms,
                 snapshot.request_attempts,
+                self.current_request_input_usage.map(total_input_tokens),
+                self.current_request_input_usage
+                    .map(|usage| usage.cache_read_input_tokens),
+                self.current_request_input_usage
+                    .map(|usage| usage.cache_creation_input_tokens),
             );
         }
         self.last_metrics_publish = Some(Instant::now());
@@ -6272,7 +6319,7 @@ impl Thread {
     }
 
     pub(crate) fn build_completion_request(
-        &self,
+        &mut self,
         completion_intent: CompletionIntent,
         cx: &App,
     ) -> Result<LanguageModelRequest> {
@@ -6352,6 +6399,10 @@ impl Thread {
             .unwrap_or_default();
 
         log::debug!("Request includes {} tools", available_tools.len());
+        let temperature = AgentSettings::temperature_for_model(model, cx);
+        // A model that requires reasoning ignores the toggle from a previous model.
+        let thinking_allowed = self.thinking_enabled
+            || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref());
         let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
 
@@ -6364,12 +6415,8 @@ impl Thread {
             tools,
             tool_choice: None,
             stop: Vec::new(),
-            temperature: AgentSettings::temperature_for_model(model, cx),
-            // Models that can't run with thinking disabled ignore the
-            // toggle state, which may be stale from a previously selected
-            // model that could.
-            thinking_allowed: self.thinking_enabled
-                || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
+            temperature,
+            thinking_allowed,
             thinking_effort: self.thinking_effort.clone(),
             speed: self.speed(),
             compact_at_tokens: None,
@@ -6575,50 +6622,93 @@ impl Thread {
     }
 
     fn build_request_messages(
-        &self,
+        &mut self,
         available_tools: Vec<SharedString>,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
-        let runtime_context = self.runtime_context(&available_tools, cx);
-        // Split the newest user message out of the history so the harness
-        // context can sit directly before it. The user's request stays the last
-        // message, and the harness context stays outside the cached prefix.
-        let split_ix = match self.messages.last() {
-            Some(message) if matches!(&**message, Message::User(user) if !user.content.is_empty()) => {
-                self.messages.len() - 1
+        let environment = self.build_harness_environment(&available_tools, cx);
+        let runtime = self.harness_runtime_text(self.runtime_context(&available_tools, cx), true);
+        let restricted =
+            TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx);
+        let compaction_index =
+            latest_compaction_message_ix_before(&self.messages, self.messages.len());
+        let context = &mut self.harness_request_context;
+        if context.environment != environment
+            || context.tools != available_tools
+            || context.restricted != restricted
+            || context.history_revision != self.retained_history_revision
+            || context.compaction_index != compaction_index
+            || context
+                .last_message
+                .as_ref()
+                .is_some_and(|(index, previous)| {
+                    self.messages
+                        .get(*index)
+                        .is_none_or(|message| previous.as_ptr() != Arc::as_ptr(message))
+                })
+        {
+            log::debug!(target: "agent::prompt_cache", "Rebuilding harness context: environment_changed={}, tools_changed={}, trust_changed={}, history_revision_changed={}, compaction_boundary_changed={}",
+                context.environment != environment, context.tools != available_tools,
+                context.restricted != restricted, context.history_revision != self.retained_history_revision,
+                context.compaction_index != compaction_index);
+            *context = HarnessRequestContext {
+                environment,
+                tools: available_tools.clone(),
+                restricted,
+                history_revision: self.retained_history_revision,
+                compaction_index,
+                ..Default::default()
+            };
+        }
+        if !runtime.is_empty() || !context.snapshots.is_empty() {
+            let state = if runtime.is_empty() {
+                "No active harness runtime state."
+            } else {
+                runtime.trim_start()
+            };
+            let snapshot = format!(
+                "<harness_context>\nCurrent harness runtime state. This supersedes earlier runtime snapshots.\n\n{state}\n</harness_context>"
+            );
+            if context
+                .snapshots
+                .last()
+                .is_none_or(|(_, previous)| previous.as_ref() != snapshot)
+            {
+                let mut boundary = self.messages.len();
+                // Put updates before an unsent user prompt. A retry can only
+                // append to a prefix whose final user message was already sent.
+                if self.messages.last().is_some_and(
+                    |message| matches!(message.as_ref(), Message::User(user) if !user.content.is_empty()),
+                ) && context.last_message.as_ref().is_none_or(|(index, _)| *index + 1 < boundary)
+                {
+                    boundary -= 1;
+                }
+                log::debug!(target: "agent::prompt_cache", "Appending harness runtime snapshot: transcript_boundary={boundary}, bytes={}", snapshot.len());
+                context.snapshots.push((boundary, snapshot.into()));
             }
-            _ => self.messages.len(),
-        };
-        let mut messages = self.build_request_messages_until(available_tools.clone(), split_ix);
-
-        if let Some(last_message) = messages.last_mut() {
-            last_message.cache = false;
         }
-        messages.push(LanguageModelRequestMessage {
-            role: Role::User,
-            content: vec![
-                self.build_harness_context(&available_tools, runtime_context, true, cx)
-                    .into(),
-            ],
-            cache: false,
-            reasoning_details: None,
-        });
-        for message in &self.messages[split_ix..] {
-            messages.extend(message.to_request());
-        }
-
-        // Keep the cache breakpoint on the newest conversation message and leave
-        // the volatile harness context outside it, so the stable prefix
-        // (system prompt plus history) is what providers reuse. A partial
-        // assistant message is not part of that stable prefix.
-        let cache_ix = messages
+        context.last_message = self
+            .messages
             .iter()
-            .rposition(|message| !message.string_contents().starts_with("<harness_context>"));
+            .enumerate()
+            .next_back()
+            .map(|(index, message)| (index, Arc::downgrade(message)));
+        let mut messages = vec![
+            self.system_request_message(available_tools),
+            harness_request_message(self.harness_request_context.environment.clone()),
+        ];
+        let last_history_message = extend_request_history_with_context(
+            &self.messages,
+            &mut messages,
+            self.messages.len(),
+            &self.harness_request_context.snapshots,
+        );
+
+        if let Some(message) = messages.get_mut(last_history_message.unwrap_or(0)) {
+            message.cache = true;
+        }
         if let Some(message) = self.pending_message.as_ref() {
             messages.extend(message.to_request());
-        }
-        if let Some(cache_ix) = cache_ix {
-            messages[cache_ix].cache = true;
         }
 
         messages
@@ -6778,22 +6868,7 @@ impl Thread {
         let end_ix = end_ix.min(self.messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
-        // The system prompt carries instructions only. Volatile session state is
-        // rendered by `build_harness_context` so this prefix stays stable and
-        // providers can keep hitting their prompt cache.
-        let system_prompt = SystemPromptTemplate {
-            available_tools,
-            is_subagent: self.is_subagent(),
-        }
-        .render(&self.templates)
-        .context("failed to build system prompt")
-        .expect("Invalid template");
-        let mut messages = vec![LanguageModelRequestMessage {
-            role: Role::System,
-            content: vec![system_prompt.into()],
-            cache: false,
-            reasoning_details: None,
-        }];
+        let mut messages = vec![self.system_request_message(available_tools)];
         self.extend_request_history_until(&mut messages, end_ix);
 
         if let Some(last_message) = messages.last_mut() {
@@ -6803,16 +6878,26 @@ impl Thread {
         messages
     }
 
-    /// Renders the per-request state that must not live in the system prompt:
-    /// environment, project roots, rules, skills, sandboxing, model, goal,
-    /// terminal capabilities, runtime snapshot, and checkpoint background.
-    fn build_harness_context(
+    fn system_request_message(
         &self,
-        available_tools: &[SharedString],
-        runtime_context: Option<String>,
-        include_checkpoint: bool,
-        cx: &App,
-    ) -> String {
+        available_tools: Vec<SharedString>,
+    ) -> LanguageModelRequestMessage {
+        let system_prompt = SystemPromptTemplate {
+            available_tools,
+            is_subagent: self.is_subagent(),
+        }
+        .render(&self.templates)
+        .context("failed to build system prompt")
+        .expect("Invalid template");
+        LanguageModelRequestMessage {
+            role: Role::System,
+            content: vec![system_prompt.into()],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn build_harness_environment(&self, available_tools: &[SharedString], cx: &App) -> String {
         let terminal_execution = self
             .runtime_tool_available(available_tools, TerminalTool::NAME)
             .then(|| self.terminal_execution_context(cx));
@@ -6833,10 +6918,24 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build harness context")
         .expect("Invalid template");
-        let mut extra = String::new();
         if let Some(execution) = terminal_execution {
-            extra.push_str(&format!("\n\nTerminal execution capabilities (harness-reported configuration, not task authorization; per-command grants and permission checks still apply):\n{execution}"));
+            append_harness_context_text(
+                rendered,
+                &format!(
+                    "\n\nTerminal execution capabilities (harness-reported configuration, not task authorization; per-command grants and permission checks still apply):\n{execution}"
+                ),
+            )
+        } else {
+            rendered
         }
+    }
+
+    fn harness_runtime_text(
+        &self,
+        runtime_context: Option<String>,
+        include_checkpoint: bool,
+    ) -> String {
+        let mut extra = String::new();
         if let Some(goal) = self
             .goal
             .as_ref()
@@ -6856,14 +6955,7 @@ impl Thread {
         if include_checkpoint && let Some(checkpoint) = self.checkpoint_context_text() {
             extra.push_str(&format!("\n\n{checkpoint}"));
         }
-        if extra.is_empty() {
-            rendered
-        } else {
-            rendered.replace(
-                "</harness_context>",
-                &format!("{extra}\n</harness_context>"),
-            )
-        }
+        extra
     }
 
     fn checkpoint_context_text(&self) -> Option<String> {
@@ -6960,6 +7052,13 @@ impl Thread {
             .chain(self.pending_message.as_ref().map(|message| {
                 estimated_agent_message_bytes(message, include_pending_tool_results).div_ceil(4)
             }))
+            .chain(
+                self.harness_request_context
+                    .snapshots
+                    .iter()
+                    .filter(|(index, _)| *index >= start && *index <= self.messages.len())
+                    .map(|(_, snapshot)| (snapshot.len() as u64).div_ceil(4)),
+            )
             .fold(0u64, u64::saturating_add)
     }
 
@@ -7091,12 +7190,12 @@ impl Thread {
         if let Some(last_message) = request.messages.last_mut() {
             last_message.cache = false;
         }
-        request.messages.push(LanguageModelRequestMessage {
-            role: Role::User,
-            content: vec![self.build_harness_context(&[], None, false, cx).into()],
-            cache: false,
-            reasoning_details: None,
-        });
+        request
+            .messages
+            .push(harness_request_message(append_harness_context_text(
+                self.build_harness_environment(&[], cx),
+                &self.harness_runtime_text(None, false),
+            )));
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -7631,27 +7730,71 @@ fn extend_request_history_until(
     request_messages: &mut Vec<LanguageModelRequestMessage>,
     end_ix: usize,
 ) {
-    let end_ix = end_ix.min(messages.len());
-    let Some(compaction_ix) = latest_compaction_message_ix_before(messages, end_ix) else {
-        for message in &messages[..end_ix] {
-            request_messages.extend(message.to_request());
-        }
-        return;
-    };
+    extend_request_history_with_context(messages, request_messages, end_ix, &[]);
+}
 
-    if matches!(
-        &*messages[compaction_ix],
-        Message::Compaction(CompactionInfo::Summary(_))
-    ) {
+fn harness_request_message(text: impl Into<MessageContent>) -> LanguageModelRequestMessage {
+    LanguageModelRequestMessage {
+        role: Role::User,
+        content: vec![text.into()],
+        cache: false,
+        reasoning_details: None,
+    }
+}
+
+fn append_harness_context_text(mut context: String, text: &str) -> String {
+    if !text.is_empty()
+        && let Some(end) = context.rfind("</harness_context>")
+    {
+        context.insert(end, '\n');
+        context.insert_str(end, text);
+    }
+    context
+}
+
+fn extend_request_history_with_context(
+    messages: &[Arc<Message>],
+    request_messages: &mut Vec<LanguageModelRequestMessage>,
+    end_ix: usize,
+    snapshots: &[(usize, SharedString)],
+) -> Option<usize> {
+    let end_ix = end_ix.min(messages.len());
+    let compaction_index = latest_compaction_message_ix_before(messages, end_ix);
+    let start = compaction_index.unwrap_or(0);
+    let original_length = request_messages.len();
+    if let Some(compaction_index) = compaction_index
+        && matches!(
+            messages[compaction_index].as_ref(),
+            Message::Compaction(CompactionInfo::Summary(_))
+        )
+    {
         request_messages.extend(retained_user_request_messages_before(
             messages,
-            compaction_ix,
+            compaction_index,
         ));
     }
-
-    for message in &messages[compaction_ix..end_ix] {
+    let mut last_history_message =
+        (request_messages.len() > original_length).then(|| request_messages.len() - 1);
+    let mut snapshots = snapshots
+        .iter()
+        .skip_while(|(boundary, _)| *boundary < start)
+        .peekable();
+    for (index, message) in messages[..end_ix].iter().enumerate().skip(start) {
+        while let Some((_, snapshot)) = snapshots.next_if(|(boundary, _)| *boundary == index) {
+            request_messages.push(harness_request_message(snapshot.to_string()));
+        }
+        let previous_length = request_messages.len();
         request_messages.extend(message.to_request());
+        if request_messages.len() > previous_length {
+            last_history_message = Some(request_messages.len() - 1);
+        }
     }
+    request_messages.extend(
+        snapshots
+            .take_while(|(boundary, _)| *boundary == end_ix)
+            .map(|(_, snapshot)| harness_request_message(snapshot.to_string())),
+    );
+    last_history_message
 }
 
 fn latest_compaction_message_ix_before(messages: &[Arc<Message>], end_ix: usize) -> Option<usize> {
@@ -10379,12 +10522,16 @@ mod tests {
             );
             let snapshot = requests
                 .iter()
-                .find(|message| message.string_contents().starts_with("<harness_context>"))
+                .find(|message| {
+                    message
+                        .string_contents()
+                        .contains("Harness runtime snapshot:")
+                })
                 .expect("harness context");
             assert_eq!(snapshot.role, Role::User);
             assert!(
                 !snapshot.cache,
-                "volatile data must not extend the cached prefix"
+                "a runtime snapshot must not request its own explicit cache breakpoint"
             );
             assert_eq!(
                 requests[0].string_contents(),
@@ -11103,19 +11250,289 @@ mod tests {
 
             assert_eq!(before[0].role, Role::System);
             assert_eq!(before[0].string_contents(), after[0].string_contents());
-            let context_ix = after
-                .iter()
-                .position(|message| message.string_contents().starts_with("<harness_context>"))
-                .expect("harness context");
-            assert_eq!(
-                context_ix,
-                after.len() - 2,
-                "harness context must sit directly before the user request"
-            );
-            assert!(after[context_ix].string_contents().contains("zsh"));
+            let environment = after.get(1).expect("harness environment").string_contents();
+            assert!(environment.starts_with("<harness_context>"));
+            assert!(environment.contains("zsh"));
             assert_eq!(
                 after.last().expect("user request").string_contents(),
                 "second request"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_ai_requests_preserve_the_sent_prefix(cx: &mut TestAppContext) {
+        use language_models::provider::open_ai::{
+            ChatCompletionMaxTokensParameter, into_open_ai, into_open_ai_response,
+        };
+
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+            let tools = vec![AskUserTool::NAME.into()];
+            let request = |thread: &mut Thread, cx: &App| LanguageModelRequest {
+                thread_id: Some(thread.id.to_string()),
+                messages: thread.build_request_messages(tools.clone(), cx),
+                ..Default::default()
+            };
+            thread.messages.push(user_text_message(
+                ClientUserMessageId::new(),
+                "first user request",
+            ));
+            let first = request(thread, cx);
+            let call_id = LanguageModelToolUseId::from("call_first");
+            let name: Arc<str> = AskUserTool::NAME.into();
+            thread.messages.push(Arc::new(Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::ToolUse(LanguageModelToolUse {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                    raw_input: "{}".into(),
+                    is_input_complete: true,
+                    thought_signature: None,
+                })],
+                tool_results: IndexMap::from_iter([(
+                    call_id.clone(),
+                    LanguageModelToolResult {
+                        tool_use_id: call_id,
+                        tool_name: name,
+                        is_error: false,
+                        content: vec!["question registered".into()],
+                        output: None,
+                    },
+                )]),
+                reasoning_details: None,
+            })));
+            thread
+                .register_deferred_question(
+                    "pending-decision".into(),
+                    acp_v2::ToolCallId::new("1:question"),
+                    "Choose a direction".into(),
+                    &acp_v2::ElicitationSchema::new().string("direction", true),
+                    cx,
+                )
+                .expect("register question");
+            let tool_round = request(thread, cx);
+            assert!(
+                tool_round
+                    .messages
+                    .last()
+                    .expect("runtime snapshot")
+                    .string_contents()
+                    .contains("pending-decision")
+            );
+            assert_eq!(tool_round.messages, request(thread, cx).messages);
+
+            thread
+                .withdraw_deferred_question("pending-decision", cx)
+                .expect("withdraw");
+            thread.messages.push(user_text_message(
+                ClientUserMessageId::new(),
+                "next user request",
+            ));
+            let follow_up = request(thread, cx);
+            assert!(follow_up.messages.iter().any(|message| {
+                message
+                    .string_contents()
+                    .contains("No active harness runtime state")
+            }));
+            assert_eq!(
+                follow_up
+                    .messages
+                    .last()
+                    .expect("latest user")
+                    .string_contents(),
+                "next user request"
+            );
+
+            let chat = |request| {
+                serde_json::to_value(
+                    into_open_ai(
+                        request,
+                        "gpt-4o",
+                        true,
+                        true,
+                        None,
+                        ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                        None,
+                        false,
+                    )
+                    .expect("Chat Completions request"),
+                )
+                .expect("Chat Completions JSON")
+            };
+            let responses = |request| {
+                serde_json::to_value(
+                    into_open_ai_response(
+                        request,
+                        "gpt-6.2-sol",
+                        true,
+                        true,
+                        None,
+                        None,
+                        true,
+                        &LanguageModelProviderId::new("openai"),
+                    )
+                    .expect("Responses request"),
+                )
+                .expect("Responses JSON")
+            };
+            for (field, requests) in [
+                (
+                    "messages",
+                    [
+                        chat(first.clone()),
+                        chat(tool_round.clone()),
+                        chat(follow_up.clone()),
+                    ],
+                ),
+                (
+                    "input",
+                    [
+                        responses(first),
+                        responses(tool_round),
+                        responses(follow_up),
+                    ],
+                ),
+            ] {
+                for pair in requests.windows(2) {
+                    let previous = pair[0][field].as_array().expect("previous input");
+                    let next = pair[1][field].as_array().expect("next input");
+                    assert!(
+                        next.starts_with(previous),
+                        "{field} changed its earlier message boundaries"
+                    );
+                    assert_eq!(pair[0]["prompt_cache_key"], pair[1]["prompt_cache_key"]);
+                }
+            }
+            thread
+                .messages
+                .push(summary_compaction("new context window"));
+            let compacted = request(thread, cx);
+            assert!(
+                !compacted
+                    .messages
+                    .iter()
+                    .any(|message| message.string_contents().contains("pending-decision"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_six_short_turns_keep_chat_completion_prefix_and_request_settings(
+        cx: &mut TestAppContext,
+    ) {
+        use language_models::provider::open_ai::{ChatCompletionMaxTokensParameter, into_open_ai};
+
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+        });
+
+        let mut previous = None;
+        for _ in 0..6 {
+            let events = thread
+                .update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), ["只回复OK"], cx)
+                })
+                .expect("send prompt");
+            cx.run_until_parked();
+            let request = fake.pending_completions().pop().expect("chat request");
+            let mut wire = serde_json::to_value(
+                into_open_ai(
+                    request.clone(),
+                    "gpt-6.2-sol",
+                    true,
+                    true,
+                    Some(32_000),
+                    ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                    Some("medium".parse().expect("valid reasoning effort")),
+                    false,
+                )
+                .expect("Chat Completions request"),
+            )
+            .expect("request JSON");
+            assert!(
+                !wire["tools"]
+                    .as_array()
+                    .expect("tool definitions")
+                    .is_empty()
+            );
+            let messages = wire
+                .as_object_mut()
+                .expect("request object")
+                .remove("messages")
+                .expect("request messages");
+            if let Some((previous_messages, previous_settings)) = previous.as_ref() {
+                let previous_messages: &serde_json::Value = previous_messages;
+                assert!(
+                    messages
+                        .as_array()
+                        .expect("messages")
+                        .starts_with(previous_messages.as_array().expect("previous messages"))
+                );
+                assert_eq!(
+                    serde_json::to_vec(&wire).expect("serialize current settings"),
+                    serde_json::to_vec(previous_settings).expect("serialize previous settings"),
+                );
+            }
+            previous = Some((messages, wire));
+            fake.send_text(&model, &request, "OK");
+            fake.end_stream(&model, &request);
+            cx.run_until_parked();
+            drop(events);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cache_rate_uses_one_prompt_usage_snapshot(cx: &mut TestAppContext) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "prompt"));
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 2_000,
+                    ..Default::default()
+                },
+                cx,
+            );
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 150,
+                    cache_creation_input_tokens: 50,
+                    cache_read_input_tokens: 1_800,
+                    ..Default::default()
+                },
+                cx,
+            );
+            thread.update_token_usage(
+                TokenUsage {
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                thread.latest_request_token_usage(),
+                Some(TokenUsage {
+                    input_tokens: 150,
+                    cache_creation_input_tokens: 50,
+                    cache_read_input_tokens: 1_800,
+                    output_tokens: 5,
+                })
+            );
+            thread.publish_run_metrics(cx, true);
+            let metrics = crate::run_metrics::AgentRunMetrics::global(cx);
+            assert_eq!(
+                metrics
+                    .read(cx)
+                    .snapshot_for(&thread.id.to_string())
+                    .and_then(|snapshot| snapshot.cache_hit_rate),
+                Some(0.9)
             );
         });
     }
@@ -11943,7 +12360,7 @@ mod tests {
         fake.end_stream(&model, &request);
         cx.run_until_parked();
         assert!(fake.pending_completions().is_empty());
-        thread.read_with(cx, |thread, cx| {
+        thread.update(cx, |thread, cx| {
             let continuation = thread.build_request_messages(Vec::new(), cx);
             let continuation = format!("{continuation:?}");
             assert!(continuation.contains("Preserve the current task decision"));

@@ -465,6 +465,7 @@ pub fn into_open_router(
     // If we ever have a more formal distionction between the models in the future,
     // we should revise this to use that instead.
     let is_anthropic_model = model.id().starts_with("anthropic/");
+    let preserve_user_boundaries = model.id().starts_with("openai/");
     let session_id = open_router_session_id(request.thread_id);
 
     let mut messages = Vec::new();
@@ -472,6 +473,7 @@ pub fn into_open_router(
     let mut last_cache_boundary: Option<(usize, usize)> = None;
 
     for message in request.messages {
+        let message_start = messages.len();
         let mut message_added_content = false;
         let reasoning_details_for_message = if is_anthropic_model {
             None
@@ -487,6 +489,7 @@ pub fn into_open_router(
         for content in message.content {
             match content {
                 MessageContent::Text(text) => {
+                    let merge_user = !preserve_user_boundaries || messages.len() > message_start;
                     add_message_content_part(
                         open_router::MessagePart::Text {
                             text,
@@ -495,6 +498,7 @@ pub fn into_open_router(
                         message.role,
                         &mut messages,
                         reasoning_details_for_message.clone(),
+                        merge_user,
                     );
                     message_added_content = true;
                 }
@@ -502,6 +506,7 @@ pub fn into_open_router(
                 MessageContent::RedactedThinking(_) => {}
                 MessageContent::Compaction(_) => {}
                 MessageContent::Image(image) => {
+                    let merge_user = !preserve_user_boundaries || messages.len() > message_start;
                     add_message_content_part(
                         open_router::MessagePart::Image {
                             image_url: image.to_base64_url(),
@@ -509,6 +514,7 @@ pub fn into_open_router(
                         message.role,
                         &mut messages,
                         reasoning_details_for_message.clone(),
+                        merge_user,
                     );
                     message_added_content = true;
                 }
@@ -747,10 +753,13 @@ fn add_message_content_part(
     role: Role,
     messages: &mut Vec<open_router::RequestMessage>,
     reasoning_details: Option<Arc<serde_json::Value>>,
+    merge_user: bool,
 ) {
     match (role, messages.last_mut()) {
-        (Role::User, Some(open_router::RequestMessage::User { content }))
-        | (Role::System, Some(open_router::RequestMessage::System { content })) => {
+        (Role::User, Some(open_router::RequestMessage::User { content })) if merge_user => {
+            content.push_part(new_part);
+        }
+        (Role::System, Some(open_router::RequestMessage::System { content })) => {
             content.push_part(new_part);
         }
         (
@@ -810,6 +819,26 @@ mod tests {
             }],
             ..Default::default()
         };
+
+        let previous = into_open_router(request(None), &model, None).expect("first request");
+        let mut follow_up = request(None);
+        follow_up
+            .messages
+            .push(language_model::LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec!["Follow-up".into()],
+                cache: false,
+                reasoning_details: None,
+            });
+        let follow_up = into_open_router(follow_up, &model, None).expect("follow-up request");
+        let previous = serde_json::to_value(previous).expect("serialize first request");
+        let follow_up = serde_json::to_value(follow_up).expect("serialize follow-up");
+        assert!(
+            follow_up["messages"]
+                .as_array()
+                .expect("follow-up messages")
+                .starts_with(previous["messages"].as_array().expect("first messages"))
+        );
 
         for (requested, maximum, expected) in [
             (None, None, None),
