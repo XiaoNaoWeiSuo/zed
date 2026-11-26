@@ -71,6 +71,8 @@ pub struct Model {
     reasoning_effort_levels: Option<Vec<ReasoningEffort>>,
     custom_model_api_url: Option<String>,
     interleaved_reasoning: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_api_url: Option<String>,
 }
 
 impl Model {
@@ -93,6 +95,7 @@ impl Model {
             reasoning_effort_levels,
             custom_model_api_url,
             interleaved_reasoning,
+            catalog_api_url: None,
         }
     }
 
@@ -128,6 +131,10 @@ impl Model {
         self.reasoning_effort_levels.as_deref()
     }
 
+    pub fn catalog_api_url(&self) -> Option<&str> {
+        self.catalog_api_url.as_deref()
+    }
+
     pub fn custom_model_api_url(&self) -> Option<&str> {
         self.custom_model_api_url.as_deref()
     }
@@ -145,7 +152,13 @@ pub async fn stream_generate_content(
 > {
     let api_key = api_key.trim();
     let model_id = &request.model.model_id;
-    let uri = format!("{api_url}/v1/models/{model_id}:streamGenerateContent?alt=sse");
+    let api_url = api_url.trim_end_matches('/');
+    let version_suffix = if api_url.ends_with("/v1beta") || api_url.ends_with("/v1") {
+        ""
+    } else {
+        "/v1"
+    };
+    let uri = format!("{api_url}{version_suffix}/models/{model_id}:streamGenerateContent?alt=sse");
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)

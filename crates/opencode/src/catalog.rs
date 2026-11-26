@@ -105,18 +105,30 @@ pub fn parse_model_catalog(
                         .collect::<Vec<_>>()
                 })
                 .filter(|levels| !levels.is_empty());
+            let mut model = Model::new(
+                metadata.id,
+                Some(metadata.name),
+                metadata.limit.context,
+                metadata.limit.output,
+                protocol,
+                reasoning_effort_levels,
+                None,
+                metadata.interleaved == serde_json::Value::Bool(true)
+                    || metadata.interleaved.is_object(),
+            );
+            if protocol == ApiProtocol::Google {
+                // The public catalog must not be able to redirect API keys to another origin.
+                let expected_url = match subscription {
+                    OpenCodeSubscription::Zen => "https://opencode.ai/inference/google/v1beta",
+                    OpenCodeSubscription::Go => "https://opencode.ai/inference/go/google/v1beta",
+                };
+                model.catalog_api_url = metadata
+                    .provider
+                    .and_then(|provider| provider.api)
+                    .filter(|url| url.trim_end_matches('/') == expected_url);
+            }
             Some(DiscoveredModel {
-                model: Model::new(
-                    metadata.id,
-                    Some(metadata.name),
-                    metadata.limit.context,
-                    metadata.limit.output,
-                    protocol,
-                    reasoning_effort_levels,
-                    None,
-                    metadata.interleaved == serde_json::Value::Bool(true)
-                        || metadata.interleaved.is_object(),
-                ),
+                model,
                 supports_images: metadata
                     .modalities
                     .input
@@ -193,6 +205,7 @@ struct ModelLimits {
 #[derive(Deserialize)]
 struct ModelTransport {
     npm: Option<String>,
+    api: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -201,4 +214,44 @@ struct ReasoningOption {
     kind: String,
     #[serde(default)]
     values: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context as _;
+
+    #[test]
+    fn gemini_catalog_routes_are_scoped_to_the_subscription() -> Result<()> {
+        for (subscription, provider, endpoint) in [
+            (
+                OpenCodeSubscription::Zen,
+                "opencode",
+                "https://opencode.ai/inference/google/v1beta",
+            ),
+            (
+                OpenCodeSubscription::Go,
+                "opencode-go",
+                "https://opencode.ai/inference/go/google/v1beta",
+            ),
+        ] {
+            for (api, expected) in [
+                (endpoint, Some(endpoint)),
+                ("https://example.com/v1beta", None),
+            ] {
+                let catalog = serde_json::json!({
+                    (provider): {"models": {"gemini-4-argon": {
+                        "id": "gemini-4-argon", "name": "Gemini 4 Argon", "tool_call": true,
+                        "modalities": {"output": ["text"]}, "limit": {"context": 1_048_576},
+                        "provider": {"npm": "@ai-sdk/google", "api": api},
+                    }}}
+                });
+                let models = parse_model_catalog(&catalog.to_string(), subscription, None)?;
+                let model = &models.first().context("Missing Argon model")?.model;
+                assert_eq!(model.protocol(), ApiProtocol::Google);
+                assert_eq!(model.catalog_api_url(), expected);
+            }
+        }
+        Ok(())
+    }
 }

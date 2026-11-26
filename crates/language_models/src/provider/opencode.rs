@@ -8,16 +8,17 @@ use gpui::{
 };
 use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request, http};
 use language_model::{
-    ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, InlineDescription, LanguageModel,
-    LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionStream,
-    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoiceSupport, ModelRateLimiters, ProviderSettingsView,
-    ProviderUsage, ProviderUsageWindow, ReasoningEffort, SubPageProviderSettings, env_var,
+    AuthenticateError, EnvVar, IconOrSvg, InlineDescription, LanguageModel, LanguageModelClient,
+    LanguageModelCompletionError, LanguageModelCompletionStream, LanguageModelEffortLevel,
+    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
+    LanguageModelToolChoiceSupport, ModelRateLimiters, ProviderSettingsView, ProviderUsage,
+    ProviderUsageWindow, ReasoningEffort, SubPageProviderSettings, env_var, read_credentials,
     unavailable_error,
 };
 use opencode::catalog::{DiscoveredModel, MODEL_CATALOG_URL as RICH_MODEL_CATALOG_URL};
 use opencode::{ApiProtocol, OPENCODE_API_URL, OpenCodeSubscription};
+use serde::{Deserialize, Serialize};
 pub use settings::OpenCodeApiProtocol;
 pub use settings::OpenCodeAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore, update_settings_file};
@@ -27,8 +28,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use ui::{
-    Banner, ButtonLink, ConfiguredApiCard, Divider, List, ListBulletItem, Severity, Switch,
-    SwitchLabelPosition, ToggleState, prelude::*,
+    Banner, ButtonLink, Divider, List, ListBulletItem, Severity, Switch, SwitchLabelPosition,
+    ToggleState, prelude::*,
 };
 use ui_input::InputField;
 use util::ResultExt;
@@ -79,7 +80,8 @@ pub struct OpenCodeLanguageModelProvider {
 }
 
 pub struct State {
-    api_key_state: ApiKeyState,
+    saved_keys: Option<(SharedString, SavedKeys)>,
+    credential_lock: Arc<futures::lock::Mutex<()>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     discovered_models: HashMap<OpenCodeSubscription, Vec<DiscoveredModel>>,
@@ -90,52 +92,174 @@ pub struct State {
     fs: Arc<dyn Fs>,
 }
 
-impl State {
-    fn is_authenticated(&self) -> bool {
-        self.api_key_state.has_key()
+const SAVED_KEYS_PREFIX: &[u8] = b"lin-opencode-keys-v1\n";
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct SavedKeys {
+    keys: Vec<SavedKey>,
+    active: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct SavedKey {
+    id: u64,
+    secret: String,
+}
+
+enum KeyChange {
+    Add(String),
+    Activate(u64),
+    Remove(u64),
+}
+
+impl SavedKeys {
+    async fn load(provider: &dyn CredentialsProvider, url: &str, cx: &AsyncApp) -> Result<Self> {
+        let Some((_, bytes)) = read_credentials(provider, url, cx).await? else {
+            return Ok(Self::default());
+        };
+        if let Some(bytes) = bytes.strip_prefix(SAVED_KEYS_PREFIX) {
+            return serde_json::from_slice(bytes)
+                .map_err(|_| anyhow!("Could not decode saved OpenCode API keys"));
+        }
+
+        let secret =
+            String::from_utf8(bytes).context("Invalid legacy OpenCode API key encoding")?;
+        Ok(Self {
+            keys: vec![SavedKey { id: 0, secret }],
+            active: Some(0),
+        })
     }
 
-    fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = self.credentials_provider.clone();
-        let api_url = OpenCodeLanguageModelProvider::api_url(cx);
-        self.fetch_models_task = None;
-        self.refresh_models_task = None;
-        self.discovered_models.clear();
-        self.fetch_models_errors.clear();
-        let task = self.api_key_state.store(
-            api_url,
-            api_key,
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if result.is_ok() {
-                this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
-                    .ok();
+    fn active_secret(&self) -> Option<&str> {
+        let active = self.active?;
+        self.keys
+            .iter()
+            .find(|key| key.id == active)
+            .map(|key| key.secret.as_str())
+    }
+
+    fn apply(&mut self, change: KeyChange) -> Result<()> {
+        match change {
+            KeyChange::Add(secret) => {
+                if !self.keys.iter().any(|key| key.secret == secret) {
+                    let id = std::iter::repeat_with(rand::random::<u64>)
+                        .find(|id| self.keys.iter().all(|key| key.id != *id))
+                        .context("Could not allocate an OpenCode key ID")?;
+                    self.keys.push(SavedKey { id, secret });
+                    self.active.get_or_insert(id);
+                }
             }
-            result
+            KeyChange::Activate(id) => {
+                if !self.keys.iter().any(|key| key.id == id) {
+                    bail!("This OpenCode API key no longer exists");
+                }
+                self.active = Some(id);
+            }
+            KeyChange::Remove(id) => {
+                if self.active == Some(id) {
+                    if self.keys.len() > 1 {
+                        bail!("Activate another OpenCode API key before removing this one");
+                    }
+                    self.active = None;
+                }
+                self.keys.retain(|key| key.id != id);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl State {
+    fn environment_key() -> Option<&'static str> {
+        API_KEY_ENV_VAR
+            .value
+            .as_deref()
+            .filter(|key| !key.is_empty())
+    }
+
+    fn keys_for_url(&self, url: &str) -> Option<&SavedKeys> {
+        self.saved_keys
+            .as_ref()
+            .and_then(|(saved_url, keys)| (saved_url.as_str() == url).then_some(keys))
+    }
+
+    fn api_key(&self, url: &str) -> Option<&str> {
+        Self::environment_key().or_else(|| self.keys_for_url(url)?.active_secret())
+    }
+
+    fn change_key(&mut self, change: KeyChange, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let credential_lock = self.credential_lock.clone();
+        let api_url = OpenCodeLanguageModelProvider::api_url(cx);
+        cx.spawn(async move |this, cx| {
+            let _guard = credential_lock.lock().await;
+            let cached = this.update(cx, |state, _| state.keys_for_url(&api_url).cloned())?;
+            let mut keys = match cached {
+                Some(keys) => keys,
+                None => SavedKeys::load(credentials_provider.as_ref(), &api_url, cx).await?,
+            };
+            keys.apply(change)?;
+            if keys.keys.is_empty() {
+                credentials_provider
+                    .delete_credentials(&api_url, cx)
+                    .await?;
+            } else {
+                let mut bytes = SAVED_KEYS_PREFIX.to_vec();
+                serde_json::to_writer(&mut bytes, &keys)?;
+                credentials_provider
+                    .write_credentials(&api_url, "Bearer", &bytes, cx)
+                    .await?;
+            }
+            this.update(cx, |state, cx| {
+                if OpenCodeLanguageModelProvider::api_url(cx) != api_url {
+                    return;
+                }
+                let changed_active = Self::environment_key().is_none()
+                    && state.api_key(&api_url) != keys.active_secret();
+                state.saved_keys = Some((api_url, keys));
+                if changed_active {
+                    state.discovered_models.clear();
+                    state.fetch_models_errors.clear();
+                    state.restart_fetch_models_task(cx);
+                }
+                cx.notify();
+            })
         })
     }
 
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        let credentials_provider = self.credentials_provider.clone();
-        let api_url = OpenCodeLanguageModelProvider::api_url(cx);
-        let task = self.api_key_state.load_if_needed(
-            api_url,
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if result.is_ok() {
-                this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
-                    .ok();
+        if Self::environment_key().is_some() {
+            if self.refresh_models_task.is_none() {
+                self.restart_fetch_models_task(cx);
             }
-            result
+            return Task::ready(Ok(()));
+        }
+        self.load_saved_keys(cx)
+    }
+
+    fn load_saved_keys(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let credential_lock = self.credential_lock.clone();
+        let api_url = OpenCodeLanguageModelProvider::api_url(cx);
+        cx.spawn(async move |this, cx| {
+            let _guard = credential_lock.lock().await;
+            let needs_load = this.update(cx, |state, cx| {
+                OpenCodeLanguageModelProvider::api_url(cx) == api_url
+                    && state.keys_for_url(&api_url).is_none()
+            })?;
+            if needs_load {
+                let keys = SavedKeys::load(credentials_provider.as_ref(), &api_url, cx).await?;
+                this.update(cx, |state, cx| {
+                    if OpenCodeLanguageModelProvider::api_url(cx) == api_url {
+                        state.saved_keys = Some((api_url, keys));
+                        if state.refresh_models_task.is_none() {
+                            state.restart_fetch_models_task(cx);
+                        }
+                        cx.notify();
+                    }
+                })?;
+            }
+            Ok(())
         })
     }
 
@@ -143,7 +267,7 @@ impl State {
         self.fetch_models_task = None;
         self.refresh_models_task = None;
         let api_url = OpenCodeLanguageModelProvider::api_url(cx);
-        if self.api_key_state.key(&api_url).is_none() {
+        if self.api_key(&api_url).is_none() {
             self.fetch_models_task = None;
             cx.notify();
             return;
@@ -320,18 +444,20 @@ impl OpenCodeLanguageModelProvider {
                     let api_url = Self::api_url(cx);
                     if api_url != last_api_url {
                         last_api_url = api_url;
+                        this.saved_keys = None;
                         this.discovered_models.clear();
                         this.fetch_models_errors.clear();
                         this.fetch_models_task = None;
                         this.refresh_models_task = None;
-                        this.authenticate(cx).detach();
+                        this.authenticate(cx).detach_and_log_err(cx);
                     }
                     cx.notify();
                 }
             })
             .detach();
             State {
-                api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
+                saved_keys: None,
+                credential_lock: Arc::default(),
                 credentials_provider,
                 http_client: http_client.clone(),
                 discovered_models: HashMap::default(),
@@ -438,11 +564,15 @@ impl OpenCodeLanguageModelProvider {
             }
         }
 
-        // Combine base URL with subscription path suffix
         let base = self
             .state
             .read_with(cx, |_, cx| OpenCodeLanguageModelProvider::api_url(cx));
 
+        if base.trim_end_matches('/') == OPENCODE_API_URL
+            && let Some(url) = config.model.catalog_api_url()
+        {
+            return url.to_string().into();
+        }
         let suffix = subscription.api_path_suffix();
         let base_str = base.as_ref().trim_end_matches('/');
         format!("{}{}", base_str, suffix).into()
@@ -451,7 +581,7 @@ impl OpenCodeLanguageModelProvider {
     fn current_api_key(&self, cx: &AsyncApp) -> Option<Arc<str>> {
         self.state.read_with(cx, |state, cx| {
             let api_url = OpenCodeLanguageModelProvider::api_url(cx);
-            state.api_key_state.key(&api_url)
+            state.api_key(&api_url).map(Arc::from)
         })
     }
 
@@ -522,7 +652,7 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
     }
 
     fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+        self.state.read(cx).api_key(&Self::api_url(cx)).is_some()
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
@@ -536,7 +666,7 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
 
     fn usage(&self, cx: &mut App) -> Task<Option<ProviderUsage>> {
         let api_url = Self::api_url(cx);
-        let Some(api_key) = self.state.read(cx).api_key_state.key(&api_url) else {
+        let Some(api_key) = self.state.read(cx).api_key(&api_url).map(Arc::from) else {
             return Task::ready(None);
         };
         let http_client = self.http_client.clone();
@@ -860,12 +990,16 @@ struct ConfigurationView {
     api_key_editor: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
+    changing_key: bool,
+    credentials_error: Option<String>,
 }
 
 impl ConfigurationView {
     fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_key_editor = cx.new(|cx| {
-            InputField::new(window, cx, "sk-00000000000000000000000000000000").label("API key")
+            InputField::new(window, cx, "sk-00000000000000000000000000000000")
+                .label("API key")
+                .masked(true)
         });
 
         cx.observe(&state, |_, _, cx| {
@@ -876,10 +1010,11 @@ impl ConfigurationView {
         let load_credentials_task = Some(cx.spawn_in(window, {
             let state = state.clone();
             async move |this, cx| {
-                if let Some(task) = Some(state.update(cx, |state, cx| state.authenticate(cx))) {
-                    let _ = task.await;
-                }
+                let result = state
+                    .update(cx, |state, cx| state.load_saved_keys(cx))
+                    .await;
                 this.update(cx, |this, cx| {
+                    this.credentials_error = result.err().map(|error| error.to_string());
                     this.load_credentials_task = None;
                     cx.notify();
                 })
@@ -891,38 +1026,43 @@ impl ConfigurationView {
             api_key_editor,
             state,
             load_credentials_task,
+            changing_key: false,
+            credentials_error: None,
         }
     }
 
     fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
-        if api_key.is_empty() {
-            return;
+        if !api_key.is_empty() {
+            self.change_key(KeyChange::Add(api_key), window, cx);
         }
-
-        self.api_key_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
-                .await
-        })
-        .detach_and_log_err(cx);
     }
 
-    fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.api_key_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
-
+    fn change_key(&mut self, change: KeyChange, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changing_key {
+            return;
+        }
+        let is_add = matches!(&change, KeyChange::Add(_));
         let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(None, cx))
-                .await
+        self.credentials_error = None;
+        self.changing_key = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = state
+                .update(cx, |state, cx| state.change_key(change, cx))
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if is_add && result.is_ok() {
+                    this.api_key_editor
+                        .update(cx, |editor, cx| editor.clear(window, cx));
+                }
+                this.credentials_error = result.err().map(|error| error.to_string());
+                this.changing_key = false;
+                cx.notify();
+            })
+            .log_err();
         })
-        .detach_and_log_err(cx);
+        .detach();
+        cx.notify();
     }
 
     fn set_subscription_enabled(
@@ -947,72 +1087,95 @@ impl ConfigurationView {
             }
         });
     }
-
-    fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
-        !self.state.read(cx).is_authenticated()
-    }
 }
 
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
-        let configured_card_label = if env_var_set {
-            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
-        } else {
-            let api_url = OpenCodeLanguageModelProvider::api_url(cx);
-            if api_url == OPENCODE_API_URL {
-                "API key configured".to_string()
-            } else {
-                format!("API key configured for {}", api_url)
-            }
-        };
-
-        let is_editing = self.should_render_editor(cx);
-
-        let api_key_control = if is_editing {
-            self.api_key_editor.clone().into_any_element()
-        } else {
-            ConfiguredApiCard::new("opencode-reset-key", configured_card_label)
-                .disabled(env_var_set)
-                .when(env_var_set, |this| {
-                    this.tooltip_label(format!(
-                        "To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."
-                    ))
+        let environment_key_active = State::environment_key().is_some();
+        let api_url = OpenCodeLanguageModelProvider::api_url(cx);
+        let state = self.state.read(cx);
+        let saved_keys = state.keys_for_url(&api_url);
+        let key_rows = saved_keys
+            .into_iter()
+            .flat_map(|keys| {
+                keys.keys.iter().enumerate().map(move |(index, key)| {
+                    (index, key.id, keys.active == Some(key.id), keys.keys.len())
                 })
-                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
-                .into_any_element()
-        };
-
+            })
+            .collect::<Vec<_>>();
+        let busy = self.changing_key;
         let api_key_section = v_flex()
+            .gap_2()
             .on_action(cx.listener(Self::save_api_key))
-            .child(Label::new(
-                "To use OpenCode models in Lin, you need an API key:",
-            ).color(Color::Muted))
+            .child(Label::new("API keys"))
+            .child(Label::new("Zen and Go share one active API key.").color(Color::Muted))
             .child(
-                List::new()
-                    .child(
-                        ListBulletItem::new("")
-                            .child(Label::new("Sign in and get your key at").color(Color::Muted))
-                            .child(ButtonLink::new(
-                                "OpenCode Console",
-                                "https://opencode.ai/auth",
+                List::new().child(
+                    ListBulletItem::new("")
+                        .child(Label::new("Get your keys at").color(Color::Muted))
+                        .child(ButtonLink::new(
+                            "OpenCode Console",
+                            "https://opencode.ai/auth",
+                        )),
+                ),
+            )
+            .when(environment_key_active, |section| {
+                section.child(
+                    Label::new(format!(
+                        "{API_KEY_ENV_VAR_NAME} is active and overrides saved keys."
+                    ))
+                    .color(Color::Muted),
+                )
+            })
+            .children(key_rows.into_iter().map(|(index, id, selected, count)| {
+                h_flex()
+                    .gap_2()
+                    .child(Label::new(format!("API key {}", index + 1)))
+                    .when(selected && !environment_key_active, |row| {
+                        row.child(Label::new("Active").color(Color::Muted))
+                    })
+                    .when(!selected, |row| {
+                        row.child(
+                            Button::new(
+                                SharedString::from(format!("activate-opencode-key-{id}")),
+                                "Activate",
+                            )
+                            .disabled(busy || environment_key_active)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.change_key(KeyChange::Activate(id), window, cx);
+                                },
                             )),
+                        )
+                    })
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("remove-opencode-key-{id}")),
+                            "Remove",
+                        )
+                        .disabled(busy || (selected && count > 1))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.change_key(KeyChange::Remove(id), window, cx);
+                            },
+                        )),
                     )
-                    .when(is_editing, |this| {
-                        this.child(ListBulletItem::new(
-                            "Paste your API key below and hit enter to start using OpenCode",
-                        ).label_color(Color::Muted))
-                    }),
-            )
-            .child(api_key_control)
+            }))
+            .child(self.api_key_editor.clone())
             .child(
-                Label::new(format!(
-                    "You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted).mt_1p5(),
+                Button::new("add-opencode-api-key", "Add API Key")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_api_key(&menu::Confirm, window, cx);
+                    })),
             )
-            .into_any_element();
+            .when_some(self.credentials_error.as_deref(), |section, error| {
+                section.child(
+                    Banner::new()
+                        .severity(Severity::Error)
+                        .child(Label::new(error.to_string())),
+                )
+            });
 
         if self.load_credentials_task.is_some() {
             Label::new("Loading Credentials…").into_any_element()
@@ -1176,7 +1339,7 @@ mod tests {
             provider
                 .state
                 .update(cx, |state, cx| {
-                    state.set_api_key(Some("secret".to_string()), cx)
+                    state.change_key(KeyChange::Add("secret".to_string()), cx)
                 })
                 .await
                 .unwrap();
@@ -1257,46 +1420,85 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_credential_change_invalidates_discovery_before_storing_key(
+    async fn test_saved_keys_preserve_legacy_key_and_active_selection(
         cx: &mut gpui::TestAppContext,
     ) {
-        let provider = cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
+        use credentials_provider::test_support::FakeCredentialsProvider;
+
+        let credentials = Arc::new(FakeCredentialsProvider::default());
+        credentials
+            .state
+            .lock()
+            .keys
+            .insert(OPENCODE_API_URL.to_string(), b"legacy-key".to_vec());
+        let new_provider = |cx: &mut App| {
             OpenCodeLanguageModelProvider::new_with_cache(
                 FakeHttpClient::with_404_response(),
-                Arc::new(TestCredentialsProvider),
+                credentials.clone(),
                 FakeFs::new(cx.background_executor().clone()),
                 PathBuf::from("/cache/models.json"),
                 cx,
             )
+        };
+        let provider = cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            new_provider(cx)
         });
         provider
             .state
             .update(cx, |state, cx| {
-                state.set_api_key(Some("old-key".to_string()), cx)
+                state.change_key(KeyChange::Add("new-key".into()), cx)
             })
             .await
             .unwrap();
-        provider.state.update(cx, |state, _cx| {
-            state.discovered_models.insert(
-                OpenCodeSubscription::Zen,
-                vec![DiscoveredModel {
-                    model: test_model("old-model", ApiProtocol::Anthropic),
-                    supports_images: true,
-                    supports_thinking: false,
-                }],
-            );
+        let new_id = provider.state.read_with(cx, |state, _| {
+            let keys = state.keys_for_url(OPENCODE_API_URL).unwrap();
+            assert_eq!(keys.keys.len(), 2);
+            assert_eq!(keys.active_secret(), Some("legacy-key"));
+            assert!(state.keys_for_url("https://other.example").is_none());
+            keys.keys
+                .iter()
+                .find(|key| key.secret == "new-key")
+                .unwrap()
+                .id
         });
+        provider
+            .state
+            .update(cx, |state, cx| {
+                state.change_key(KeyChange::Activate(new_id), cx)
+            })
+            .await
+            .unwrap();
+        drop(provider);
 
-        let store_task = provider.state.update(cx, |state, cx| {
-            let task = state.set_api_key(Some("new-key".to_string()), cx);
-            assert!(state.fetch_models_task.is_none());
-            assert!(state.discovered_models.is_empty());
-            task
+        let provider = cx.update(new_provider);
+        provider
+            .state
+            .update(cx, |state, cx| state.load_saved_keys(cx))
+            .await
+            .unwrap();
+        provider.state.read_with(cx, |state, _| {
+            let keys = state.keys_for_url(OPENCODE_API_URL).unwrap();
+            assert_eq!(keys.keys.len(), 2);
+            assert_eq!(keys.active_secret(), Some("new-key"));
         });
-
-        store_task.await.unwrap();
+        assert!(
+            provider
+                .state
+                .update(cx, |state, cx| state
+                    .change_key(KeyChange::Remove(new_id), cx))
+                .await
+                .is_err()
+        );
+        for id in [0, new_id] {
+            provider
+                .state
+                .update(cx, |state, cx| state.change_key(KeyChange::Remove(id), cx))
+                .await
+                .unwrap();
+        }
+        assert!(!credentials.state.lock().keys.contains_key(OPENCODE_API_URL));
     }
 
     #[test]
@@ -1701,7 +1903,7 @@ mod tests {
             )
         });
         let store_key = provider.state.update(cx, |state, cx| {
-            state.set_api_key(Some("test-key".to_string()), cx)
+            state.change_key(KeyChange::Add("test-key".to_string()), cx)
         });
         store_key.await.unwrap();
         let model = add_discovered_model(
