@@ -1684,4 +1684,28 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  {
+    "context": "Infinity",
+    "bindings": {
+      "ctrl-enter": "agent::InfinitySend",
+      "ctrl-escape": "agent::InfinityStop",
+      "alt-1": "agent::InfinityConversation",
+      "alt-2": "agent::InfinityJobs",
+      "alt-3": "agent::InfinityContext",
+      "alt-t": "agent::InfinityToggleToolTraffic"
+    }
+  },
+  {
+    "context": "Infinity > Editor",
+    "bindings": {
+      "ctrl-enter": "agent::InfinitySend",
+      "ctrl-escape": "agent::InfinityStop"
+    }
+  },
+  {
+    "context": "Infinity > (Editor && mode == auto_height && !menu)",
+    "bindings": {
+      "enter": "agent::InfinitySend"
+    }
+  }
 ]

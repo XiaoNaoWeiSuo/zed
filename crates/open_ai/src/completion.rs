@@ -81,7 +81,7 @@ pub fn into_open_ai(
         ));
     }
 
-    let stream = !model_id.starts_with("o1-");
+    let stream = !request.non_streaming && !model_id.starts_with("o1-");
     let service_tier = service_tier_for(request.speed);
 
     let mut messages = Vec::new();
@@ -275,9 +275,10 @@ pub fn into_open_ai_response(
     compaction_state_owner: &LanguageModelProviderId,
 ) -> Result<ResponseRequest> {
     let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
-    let stream = !model_id.starts_with("o1-");
+    let stream = !request.non_streaming && !model_id.starts_with("o1-");
 
     let LanguageModelRequest {
+        non_streaming: _,
         thread_id,
         prompt_cache_key,
         prompt_id: _,
@@ -1950,6 +1951,7 @@ mod tests {
         let expected_image_url = user_image.to_base64_url();
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: Some("thread-123".into()),
             prompt_cache_key: None,
             prompt_id: None,
@@ -2158,6 +2160,7 @@ mod tests {
         };
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2253,6 +2256,7 @@ mod tests {
         };
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2346,6 +2350,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_reasoning_without_encrypted_content() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2428,6 +2433,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_omits_reasoning_when_thinking_is_disabled_and_none_is_unsupported() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2539,6 +2545,7 @@ mod tests {
             (Some(Speed::Fast), Some("priority")),
         ] {
             let request = LanguageModelRequest {
+                non_streaming: false,
                 thread_id: None,
                 prompt_cache_key: None,
                 prompt_id: None,
@@ -2593,6 +2600,7 @@ mod tests {
             (Some(Speed::Fast), Some("priority")),
         ] {
             let request = LanguageModelRequest {
+                non_streaming: false,
                 thread_id: None,
                 prompt_cache_key: None,
                 prompt_id: None,
@@ -2640,6 +2648,7 @@ mod tests {
     #[test]
     fn into_open_ai_can_send_max_tokens_parameter() -> Result<()> {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2718,6 +2727,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_sends_none_reasoning_when_thinking_is_disabled() -> Result<()> {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2761,6 +2771,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_uses_default_effort_when_selected_effort_is_none() -> Result<()> {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2806,6 +2817,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_assistant_phase() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2902,6 +2914,7 @@ mod tests {
             ]
         });
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2982,6 +2995,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_reasoning_details_but_not_thinking_text() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -4282,6 +4296,7 @@ mod tests {
             output: None,
         };
         let request = LanguageModelRequest {
+            non_streaming: false,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,

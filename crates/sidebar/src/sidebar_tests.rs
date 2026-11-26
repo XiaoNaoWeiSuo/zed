@@ -209,6 +209,7 @@ fn assert_remote_project_integration_sidebar_state(
                     title
                 );
             }
+            ListEntry::Infinity(_) => panic!("unexpected Infinity session"),
             ListEntry::Terminal(terminal) => {
                 panic!(
                     "unexpected sidebar terminal while simulating remote project integration flicker: title=`{}`",
@@ -665,6 +666,7 @@ fn visible_entries_as_strings(
                     ""
                 };
                 match entry {
+                    ListEntry::Infinity(row) => format!("  {}{selected}", row.title),
                     ListEntry::ProjectHeader { label, key, .. } => {
                         let icon = if sidebar.is_group_collapsed(key, cx) {
                             ">"
@@ -2227,6 +2229,55 @@ fn setup_sidebar_with_agent_panel(
     let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
     let panel = add_agent_panel(&workspace, cx);
     (sidebar, panel)
+}
+
+#[gpui::test]
+async fn infinity_sessions_are_independent_sidebar_items(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.open_infinity(window, cx);
+        panel.open_infinity(window, cx);
+    });
+    cx.run_until_parked();
+    let first = sidebar.read_with(cx, |sidebar, _| {
+        assert!(matches!(
+            sidebar.active_entry,
+            Some(ActiveEntry::Infinity { index: 1, .. })
+        ));
+        let rows = sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Infinity(row) => Some(row),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        rows.iter()
+            .find(|row| row.index == 0)
+            .expect("first Infinity")
+            .index
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let row = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Infinity(row) if row.index == first => Some(row.clone()),
+                _ => None,
+            })
+            .expect("session row");
+        sidebar.activate_infinity(&row, window, cx);
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _| {
+        assert_eq!(panel.active_infinity_index(), Some(0))
+    });
 }
 
 #[gpui::test]
@@ -5936,7 +5987,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Infinity(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -6022,7 +6075,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Infinity(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -6061,7 +6116,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Infinity(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -8158,6 +8215,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         title, worktree_name
                     );
                 }
+                ListEntry::Infinity(_) => panic!("unexpected Infinity session"),
                 ListEntry::Terminal(terminal) => {
                     panic!(
                         "unexpected sidebar terminal while opening linked worktree thread: title=`{}`",

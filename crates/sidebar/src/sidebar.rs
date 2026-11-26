@@ -147,6 +147,10 @@ enum ArchiveWorktreeOutcome {
 
 #[derive(Clone, Debug)]
 enum ActiveEntry {
+    Infinity {
+        workspace: Entity<Workspace>,
+        index: usize,
+    },
     Thread {
         thread_id: agent_ui::ThreadId,
         /// Stable remote identifier, used for matching when thread_id
@@ -164,9 +168,9 @@ enum ActiveEntry {
 impl ActiveEntry {
     fn workspace(&self) -> &Entity<Workspace> {
         match self {
-            ActiveEntry::Thread { workspace, .. } | ActiveEntry::Terminal { workspace, .. } => {
-                workspace
-            }
+            ActiveEntry::Thread { workspace, .. }
+            | ActiveEntry::Terminal { workspace, .. }
+            | ActiveEntry::Infinity { workspace, .. } => workspace,
         }
     }
 
@@ -180,6 +184,9 @@ impl ActiveEntry {
 
     fn matches_entry(&self, entry: &ListEntry) -> bool {
         match (self, entry) {
+            (Self::Infinity { workspace, index }, ListEntry::Infinity(row)) => {
+                workspace == &row.workspace && *index == row.index
+            }
             (
                 ActiveEntry::Thread {
                     thread_id,
@@ -398,7 +405,16 @@ impl ThreadEntry {
 }
 
 #[derive(Clone)]
+struct InfinityEntry {
+    workspace: Entity<Workspace>,
+    index: usize,
+    title: SharedString,
+    running: bool,
+}
+
+#[derive(Clone)]
 enum ListEntry {
+    Infinity(InfinityEntry),
     ProjectHeader {
         key: ProjectGroupKey,
         label: SharedString,
@@ -430,13 +446,14 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Infinity(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
 }
 
 #[derive(Clone)]
 enum ActivatableEntry {
+    Infinity(InfinityEntry),
     Thread {
         metadata: ThreadMetadata,
     },
@@ -449,6 +466,7 @@ enum ActivatableEntry {
 impl ActivatableEntry {
     fn from_list_entry(entry: &ListEntry) -> Option<Self> {
         match entry {
+            ListEntry::Infinity(row) => Some(Self::Infinity(row.clone())),
             ListEntry::Thread(thread) => Some(Self::Thread {
                 metadata: thread.metadata.clone(),
             }),
@@ -466,7 +484,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_) | ListEntry::Infinity(_) | ListEntry::ProjectHeader { .. } => {
+                None
+            }
         }
     }
 
@@ -476,6 +496,7 @@ impl ListEntry {
         cx: &'a App,
     ) -> Vec<Entity<Workspace>> {
         match self {
+            ListEntry::Infinity(row) => vec![row.workspace.clone()],
             ListEntry::Thread(thread) => match &thread.workspace {
                 ThreadEntryWorkspace::Open(ws) => vec![ws.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
@@ -517,6 +538,7 @@ struct SidebarContents {
 /// height-affecting state here.
 #[derive(Debug, PartialEq, Eq)]
 enum EntryShape {
+    Infinity(EntityId, usize),
     ProjectHeader {
         key: ProjectGroupKey,
         // Toggles the "No threads yet" empty-state row when not collapsed.
@@ -1277,6 +1299,17 @@ impl Sidebar {
         }
 
         let panel = agent_panel.read(cx);
+        if let Some(index) = panel.active_infinity_index() {
+            self.active_entry = Some(ActiveEntry::Infinity {
+                workspace: active_workspace,
+                index,
+            });
+            self.pending_thread_activation = None;
+            return true;
+        }
+        if matches!(self.active_entry, Some(ActiveEntry::Infinity { .. })) {
+            self.active_entry = None;
+        }
 
         if let Some(pending_thread_id) = self.pending_thread_activation {
             let panel_thread_id = panel
@@ -1919,7 +1952,27 @@ impl Sidebar {
                             thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
                         })
             };
-            let has_threads = has_visible_rows || has_stored_thread_rows;
+            let infinity_rows: Vec<_> = group_workspaces
+                .iter()
+                .filter_map(|workspace| {
+                    let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                    Some(
+                        panel
+                            .read(cx)
+                            .infinity_entries(cx)
+                            .map(|(index, title, running)| InfinityEntry {
+                                workspace: workspace.clone(),
+                                index,
+                                title,
+                                running,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten()
+                .collect();
+            let has_threads =
+                has_visible_rows || has_stored_thread_rows || !infinity_rows.is_empty();
 
             if !query.is_empty() {
                 let workspace_highlight_positions =
@@ -1977,7 +2030,18 @@ impl Sidebar {
                     }
                 }
 
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
+                let infinity_rows: Vec<_> = infinity_rows
+                    .into_iter()
+                    .filter(|row| {
+                        workspace_matched
+                            || fuzzy_match_positions(&query, row.title.as_ref()).is_some()
+                            || fuzzy_match_positions(&query, "Infinity").is_some()
+                    })
+                    .collect();
+                if matched_threads.is_empty()
+                    && matched_terminals.is_empty()
+                    && infinity_rows.is_empty()
+                    && !workspace_matched
                 {
                     continue;
                 }
@@ -2002,6 +2066,7 @@ impl Sidebar {
                     has_threads,
                 });
 
+                entries.extend(infinity_rows.into_iter().rev().map(ListEntry::Infinity));
                 Self::push_entries_by_display_time(
                     &mut entries,
                     matched_terminals,
@@ -2052,6 +2117,7 @@ impl Sidebar {
                     continue;
                 }
 
+                entries.extend(infinity_rows.into_iter().rev().map(ListEntry::Infinity));
                 Self::push_entries_by_display_time(
                     &mut entries,
                     terminals,
@@ -2176,6 +2242,7 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::Infinity(row) => EntryShape::Infinity(row.workspace.entity_id(), row.index),
         })
     }
 
@@ -2260,7 +2327,12 @@ impl Sidebar {
             .contents
             .entries
             .iter()
-            .position(|entry| matches!(entry, ListEntry::Thread(_) | ListEntry::Terminal(_)))
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Infinity(_)
+                )
+            })
             .or_else(|| {
                 if self.contents.entries.is_empty() {
                     None
@@ -2292,6 +2364,27 @@ impl Sidebar {
             .is_some_and(|active| active.matches_entry(entry));
 
         let rendered = match entry {
+            ListEntry::Infinity(row) => {
+                let row = row.clone();
+                ThreadItem::new(
+                    SharedString::from(format!("infinity-entry-{ix}")),
+                    row.title.clone(),
+                )
+                .base_bg(cx.theme().colors().panel_background)
+                .sidebar_compact(true)
+                .indent(px(18.))
+                .icon(IconName::Sparkle)
+                .status(if row.running {
+                    AgentThreadStatus::Running
+                } else {
+                    AgentThreadStatus::Completed
+                })
+                .selected(is_active || is_selected)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_infinity(&row, window, cx);
+                }))
+                .into_any_element()
+            }
             ListEntry::ProjectHeader {
                 key,
                 label,
@@ -3760,6 +3853,10 @@ impl Sidebar {
                     }
                 }
             }
+            ListEntry::Infinity(row) => {
+                let row = row.clone();
+                self.activate_infinity(&row, window, cx);
+            }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
@@ -4495,7 +4592,7 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Infinity(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4522,12 +4619,14 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Infinity(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
@@ -4653,6 +4752,10 @@ impl Sidebar {
                 });
                 self.activate_workspace(&workspace, window, cx);
                 Self::load_agent_thread_in_workspace(&workspace, metadata, true, window, cx);
+                true
+            }
+            ActivatableEntry::Infinity(row) => {
+                self.activate_infinity(row, window, cx);
                 true
             }
             ActivatableEntry::Terminal {
@@ -5860,6 +5963,27 @@ impl Sidebar {
         Ok(ArchiveWorktreeOutcome::Success)
     }
 
+    fn activate_infinity(
+        &mut self,
+        row: &InfinityEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_thread_activation = None;
+        self.activate_workspace(&row.workspace, window, cx);
+        row.workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.show_infinity(row.index, window, cx));
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            }
+        });
+        self.active_entry = Some(ActiveEntry::Infinity {
+            workspace: row.workspace.clone(),
+            index: row.index,
+        });
+        cx.notify();
+    }
+
     fn activate_workspace(
         &self,
         workspace: &Entity<Workspace>,
@@ -5962,7 +6086,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::Infinity(_) | ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
 
@@ -6066,6 +6190,7 @@ impl Sidebar {
                         timestamp,
                     }))
                 }
+                ListEntry::Infinity(_) => None,
                 ListEntry::Terminal(terminal) => {
                     let timestamp: SharedString =
                         format_history_entry_timestamp(terminal.metadata.created_at).into();
@@ -6266,6 +6391,18 @@ impl Sidebar {
                         }
                     }
                     match &original_active_entry {
+                        Some(ActiveEntry::Infinity { workspace, index }) => {
+                            this.activate_infinity(
+                                &InfinityEntry {
+                                    workspace: workspace.clone(),
+                                    index: *index,
+                                    title: SharedString::default(),
+                                    running: false,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
                         Some(ActiveEntry::Thread { .. }) => {
                             if let (Some(metadata), Some(original_ws)) =
                                 (&original_metadata, &original_workspace)
@@ -7246,14 +7383,12 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                (0..ix)
-                    .rev()
-                    .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-                        _ => None,
-                    })
-            }
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Infinity(_)) => (0..ix)
+                .rev()
+                .find_map(|i| match self.contents.entries.get(i) {
+                    Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -7378,7 +7513,7 @@ impl Sidebar {
             .iter()
             .enumerate()
             .filter_map(|(ix, entry)| match entry {
-                ListEntry::Thread(_) | ListEntry::Terminal(_) => Some(ix),
+                ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Infinity(_) => Some(ix),
                 _ => None,
             })
             .collect();
@@ -7429,6 +7564,10 @@ impl Sidebar {
                         );
                     }
                 }
+            }
+            ListEntry::Infinity(row) => {
+                let row = row.clone();
+                self.activate_infinity(&row, window, cx);
             }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();

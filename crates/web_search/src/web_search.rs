@@ -37,6 +37,11 @@ impl WebSearchRegistry {
         cx.global::<GlobalWebSearchRegistry>().0.read(cx)
     }
 
+    pub fn try_read_global(cx: &App) -> Option<&Self> {
+        cx.try_global::<GlobalWebSearchRegistry>()
+            .map(|registry| registry.0.read(cx))
+    }
+
     pub fn providers(&self) -> impl Iterator<Item = &Arc<dyn WebSearchProvider>> {
         self.providers.values()
     }

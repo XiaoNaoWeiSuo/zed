@@ -435,6 +435,40 @@ pub async fn non_streaming_completion(
     }
 }
 
+pub fn buffered_events(
+    mut response: Response,
+) -> BoxStream<'static, Result<Event, AnthropicError>> {
+    let blocks = std::mem::take(&mut response.content);
+    let delta = MessageDelta {
+        stop_reason: response.stop_reason.take(),
+        stop_sequence: response.stop_sequence.take(),
+    };
+    let mut events = vec![Ok(Event::MessageStart { message: response })];
+    for (index, mut content_block) in blocks.into_iter().enumerate() {
+        let arguments = match &mut content_block {
+            ResponseContent::ToolUse { input, .. } => Some(std::mem::take(input).to_string()),
+            _ => None,
+        };
+        events.push(Ok(Event::ContentBlockStart {
+            index,
+            content_block,
+        }));
+        if let Some(partial_json) = arguments {
+            events.push(Ok(Event::ContentBlockDelta {
+                index,
+                delta: ContentDelta::InputJsonDelta { partial_json },
+            }));
+        }
+        events.push(Ok(Event::ContentBlockStop { index }));
+    }
+    events.push(Ok(Event::MessageDelta {
+        delta,
+        usage: Usage::default(),
+    }));
+    events.push(Ok(Event::MessageStop));
+    futures::stream::iter(events).boxed()
+}
+
 /// Estimates input tokens without generating a message.
 ///
 /// Anthropic's estimate may differ slightly from usage reported during generation.
@@ -840,7 +874,11 @@ pub enum ResponseContent {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
     #[serde(rename = "tool_use")]

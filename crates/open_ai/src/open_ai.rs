@@ -1032,6 +1032,58 @@ where
     })
 }
 
+pub async fn buffered_chat_completion<RequestBody: Serialize + ?Sized>(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    extra_headers: &CustomHeaders,
+    request: &RequestBody,
+) -> Result<BoxStream<'static, Result<ChatCompletionStreamEvent, RequestError>>, RequestError> {
+    let mut value = non_streaming_chat_completion(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        extra_headers,
+        request,
+    )
+    .await?;
+    if let Some(choices) = value["choices"].as_array_mut() {
+        for choice in choices {
+            let Some(object) = choice.as_object_mut() else {
+                continue;
+            };
+            let Some(mut delta) = object.remove("message") else {
+                continue;
+            };
+            if let Some(calls) = delta["tool_calls"].as_array_mut() {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    if let Some(call) = call.as_object_mut() {
+                        call.entry("index")
+                            .or_insert_with(|| serde_json::json!(index));
+                    }
+                }
+            }
+            if delta
+                .get("refusal")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                object.insert("finish_reason".into(), serde_json::json!("content_filter"));
+            }
+            object.insert("delta".into(), delta);
+        }
+    }
+    let value = serde_json::value::to_raw_value(&value)
+        .map_err(|error| RequestError::Other(error.into()))?;
+    Ok(futures::stream::iter([
+        Ok(ChatCompletionStreamEvent::Data(value)),
+        Ok(ChatCompletionStreamEvent::Done),
+    ])
+    .boxed())
+}
+
 pub async fn non_streaming_completion(
     client: &dyn HttpClient,
     api_url: &str,
@@ -1145,15 +1197,27 @@ pub async fn stream_completion(
     BoxStream<'static, Result<ResponseStreamEvent, LanguageModelCompletionError>>,
     RequestError,
 > {
-    let events = stream_chat_completion(
-        client,
-        provider_name,
-        api_url,
-        api_key,
-        extra_headers,
-        &request,
-    )
-    .await?;
+    let events = if request.stream {
+        stream_chat_completion(
+            client,
+            provider_name,
+            api_url,
+            api_key,
+            extra_headers,
+            &request,
+        )
+        .await?
+    } else {
+        buffered_chat_completion(
+            client,
+            provider_name,
+            api_url,
+            api_key,
+            extra_headers,
+            &request,
+        )
+        .await?
+    };
     let provider_name =
         language_model_core::LanguageModelProviderName::from(provider_name.to_string());
     Ok(events

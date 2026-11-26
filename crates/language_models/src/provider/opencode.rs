@@ -568,6 +568,11 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
 }
 
 impl LanguageModelClient for OpenCodeLanguageModelProvider {
+    fn supports_non_streaming_completion(&self, model: &LanguageModel, cx: &App) -> bool {
+        self.config(model, cx)
+            .is_ok_and(|(config, _)| config.model.protocol() != ApiProtocol::Google)
+    }
+
     fn stream_completion(
         &self,
         model: &LanguageModel,

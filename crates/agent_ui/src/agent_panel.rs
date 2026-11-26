@@ -32,6 +32,7 @@ use crate::companion_window::{
     detached_thread_window, open_companion_window, render_conversation_title,
 };
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
+use crate::infinity_view::InfinityView;
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
@@ -43,9 +44,9 @@ use crate::{
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
-    ResetFastModeWarnings, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
-    ToggleOptionsMenu,
+    NewInfinity, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff,
+    RenameSelectedThread, ResetFastModeWarnings, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
+    ToggleNewThreadMenu, ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -358,6 +359,12 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| {
                             panel.new_thread_with_workspace(Some(workspace), window, cx)
                         });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &NewInfinity, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.open_infinity(window, cx));
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
                 })
@@ -1098,6 +1105,9 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
     base_view: BaseView,
+    infinity_sessions: Vec<Entity<InfinityView>>,
+    infinity_subscriptions: Vec<Subscription>,
+    active_infinity: Option<usize>,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1492,6 +1502,9 @@ impl AgentPanel {
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
+            infinity_sessions: Vec::new(),
+            infinity_subscriptions: Vec::new(),
+            active_infinity: None,
             project: project.clone(),
             fs: fs.clone(),
             language_registry,
@@ -1817,6 +1830,85 @@ impl AgentPanel {
         self.serialize(cx);
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         cx.notify();
+    }
+
+    pub fn open_infinity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+        let project = self.project.clone();
+        let view = cx.new(|cx| InfinityView::new(project, window, cx));
+        let index = self.infinity_sessions.len();
+        self.infinity_subscriptions.push(cx.subscribe(
+            &view,
+            |_, _, _: &crate::infinity_view::InfinityViewEvent, cx| {
+                cx.emit(AgentPanelEvent::EntryChanged);
+            },
+        ));
+        self.infinity_sessions.push(view);
+        self.show_infinity(index, window, cx);
+    }
+
+    pub fn infinity_entries<'a>(
+        &'a self,
+        cx: &'a App,
+    ) -> impl Iterator<Item = (usize, SharedString, bool)> + 'a {
+        self.infinity_sessions
+            .iter()
+            .enumerate()
+            .map(move |(index, view)| {
+                let view = view.read(cx);
+                (index, view.title(cx).into(), view.is_running(cx))
+            })
+    }
+
+    pub fn active_infinity_index(&self) -> Option<usize> {
+        self.active_infinity
+    }
+
+    pub fn show_infinity(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.infinity_sessions.get(index) {
+            self.active_infinity = Some(index);
+            view.focus_handle(cx).focus(window, cx);
+            cx.emit(AgentPanelEvent::ActiveViewChanged);
+            cx.notify();
+        }
+    }
+
+    fn close_infinity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_infinity = None;
+        self.ensure_thread_initialized(window, cx);
+        self.activation_focus_handle(cx).focus(window, cx);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
+    fn infinity_session_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let sessions: Vec<_> = self
+            .infinity_sessions
+            .iter()
+            .enumerate()
+            .map(|(index, view)| (index, view.read(cx).title(cx)))
+            .collect();
+        let panel = cx.weak_entity();
+        PopoverMenu::new("infinity-sessions")
+            .anchor(Anchor::TopRight)
+            .trigger(Button::new("infinity-session-picker", "Sessions"))
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                    sessions.iter().rev().fold(menu, |menu, (index, title)| {
+                        let panel = panel.clone();
+                        let index = *index;
+                        menu.entry(title.clone(), None, move |window, cx| {
+                            if let Err(error) =
+                                panel.update(cx, |panel, cx| panel.show_infinity(index, window, cx))
+                            {
+                                log::debug!("Agent panel closed: {error}");
+                            }
+                        })
+                    })
+                }))
+            })
     }
 
     pub fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
@@ -4419,6 +4511,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.active_infinity = None;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -5130,6 +5223,12 @@ impl Panel for AgentPanel {
     }
 
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some(view) = self
+            .active_infinity
+            .and_then(|index| self.infinity_sessions.get(index))
+        {
+            return view.focus_handle(cx);
+        }
         match self.visible_surface() {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => {
@@ -5246,7 +5345,7 @@ impl Panel for AgentPanel {
 
 impl AgentPanel {
     fn ensure_thread_initialized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.base_view, BaseView::Uninitialized) {
+        if self.active_infinity.is_none() && matches!(self.base_view, BaseView::Uninitialized) {
             if self.pending_terminal_spawn.is_some() {
                 return;
             }
@@ -5254,7 +5353,8 @@ impl AgentPanel {
                 let terminal_id = TerminalId::new();
                 self.pending_terminal_spawn = Some(terminal_id);
                 cx.defer_in(window, move |this, window, cx| {
-                    if matches!(this.base_view, BaseView::Uninitialized)
+                    if this.active_infinity.is_none()
+                        && matches!(this.base_view, BaseView::Uninitialized)
                         && this.pending_terminal_spawn == Some(terminal_id)
                         && this.should_create_terminal_for_new_entry(cx)
                     {
@@ -5346,7 +5446,10 @@ impl AgentPanel {
     }
 
     fn destination_has_meaningful_state(&self, cx: &App) -> bool {
-        if !self.retained_threads.is_empty() || !self.terminals.is_empty() {
+        if self.active_infinity.is_some()
+            || !self.retained_threads.is_empty()
+            || !self.terminals.is_empty()
+        {
             return true;
         }
 
@@ -5987,6 +6090,14 @@ impl AgentPanel {
                                     }
                                 }),
                         )
+                        .item(
+                            ContextMenuEntry::new("Infinity")
+                                .icon(IconName::Sparkle)
+                                .action(Box::new(NewInfinity))
+                                .handler(|window, cx| {
+                                    window.dispatch_action(NewInfinity.boxed_clone(), cx)
+                                }),
+                        )
                         .when(supports_terminal, |menu| {
                             menu.item(
                                 ContextMenuEntry::new("Terminal")
@@ -6557,6 +6668,60 @@ impl Render for AgentPanel {
         // - Font size works as expected and can be changed with cmd-+/cmd-
         // - Scrolling in all views works as expected
         // - Files can be dropped into the panel
+        if let Some(view) = self
+            .active_infinity
+            .and_then(|index| self.infinity_sessions.get(index))
+            .cloned()
+        {
+            return v_flex()
+                .size_full()
+                .key_context(self.key_context(cx))
+                .track_focus(&self.focus_handle)
+                .bg(cx.theme().colors().panel_background)
+                .on_action(cx.listener(|this, _: &NewThread, window, cx| {
+                    this.active_infinity = None;
+                    this.new_thread(&NewThread, window, cx);
+                    cx.notify();
+                }))
+                .on_action(cx.listener(Self::toggle_zoom))
+                .child(
+                    h_flex()
+                        .h(Tab::container_height(cx))
+                        .px_2()
+                        .gap_2()
+                        .bg(cx.theme().colors().tab_bar_background)
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(Icon::new(IconName::Sparkle).color(Color::Accent))
+                        .child(Label::new("Infinity"))
+                        .child(div().flex_1())
+                        .child(self.infinity_session_menu(cx))
+                        .child(Button::new("new-infinity-session", "New").on_click(
+                            cx.listener(|this, _, window, cx| this.open_infinity(window, cx)),
+                        ))
+                        .child(
+                            IconButton::new(
+                                "zoom-infinity",
+                                if self.is_zoomed(window, cx) {
+                                    IconName::Minimize
+                                } else {
+                                    IconName::Maximize
+                                },
+                            )
+                            .tooltip(|_, cx| {
+                                Tooltip::for_action("Toggle Full Screen", &ToggleZoom, cx)
+                            })
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.toggle_zoom(&ToggleZoom, window, cx),
+                            )),
+                        )
+                        .child(Button::new("back-from-infinity", "Back").on_click(
+                            cx.listener(|this, _, window, cx| this.close_infinity(window, cx)),
+                        )),
+                )
+                .child(view)
+                .into_any();
+        }
         let content = v_flex()
             .key_context(self.key_context(cx))
             .relative()
@@ -9930,6 +10095,50 @@ mod tests {
         }
         text.push(' ');
         text
+    }
+
+    #[gpui::test]
+    async fn infinity_opens_independent_sessions_and_returns_to_the_original_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        let original = panel.read_with(&cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .expect("original thread")
+                .clone()
+        });
+
+        cx.dispatch_action(NewInfinity);
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.active_infinity, Some(0));
+            assert_eq!(panel.active_conversation_view(), Some(&original));
+        });
+
+        if cfg!(debug_assertions) {
+            let context_tab = cx
+                .debug_bounds("infinity-context-tab")
+                .expect("Context tab renders");
+            cx.simulate_click(context_tab.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("infinity-context-inspector").is_some());
+        }
+
+        cx.dispatch_action(NewInfinity);
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(panel.active_infinity, Some(1));
+            assert_eq!(panel.infinity_sessions.len(), 2);
+            assert_ne!(panel.infinity_sessions[0], panel.infinity_sessions[1]);
+            panel.close_infinity(window, cx);
+            assert_eq!(panel.active_infinity, None);
+            assert_eq!(panel.active_conversation_view(), Some(&original));
+        });
     }
 
     #[gpui::test]

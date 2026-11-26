@@ -40,6 +40,7 @@ pub async fn stream_completion(
     config: CompletionConfig<'_>,
     mut request: LanguageModelRequest,
 ) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+    let non_streaming = request.non_streaming;
     let model = &config.model.model;
     let api_url = config.api_url.trim_end_matches('/');
     match model.protocol() {
@@ -63,15 +64,29 @@ pub async fn stream_completion(
             {
                 *block_binding = None;
             }
-            let stream = anthropic::stream_completion(
-                client,
-                api_url,
-                config.api_key,
-                request,
-                None,
-                config.custom_headers,
-            )
-            .await?;
+            let stream = if non_streaming {
+                anthropic::buffered_events(
+                    anthropic::non_streaming_completion(
+                        client,
+                        api_url,
+                        config.api_key,
+                        request,
+                        None,
+                        config.custom_headers,
+                    )
+                    .await?,
+                )
+            } else {
+                anthropic::stream_completion(
+                    client,
+                    api_url,
+                    config.api_key,
+                    request,
+                    None,
+                    config.custom_headers,
+                )
+                .await?
+            };
             Ok(
                 AnthropicEventMapper::new(config.provider_name, config.provider_id)
                     .map_stream(stream.boxed())

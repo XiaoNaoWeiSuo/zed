@@ -280,6 +280,7 @@ dependencies = [
  "http_proxy",
  "indoc",
  "itertools 0.14.0",
+ "jsonschema",
  "language",
  "language_model",
  "language_models",

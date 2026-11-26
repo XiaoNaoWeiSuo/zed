@@ -396,6 +396,10 @@ impl Default for IconOrSvg {
 
 /// Sends requests to a provider's models.
 pub trait LanguageModelClient: 'static {
+    fn supports_non_streaming_completion(&self, _model: &LanguageModel, _cx: &App) -> bool {
+        false
+    }
+
     /// Streams a completion of `request` from `model`, which must be one of
     /// this provider's models.
     fn stream_completion(

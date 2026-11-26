@@ -4589,6 +4589,7 @@ impl GitPanel {
                 );
 
                 let request = LanguageModelRequest {
+                    non_streaming: false,
                     thread_id: None,
                     prompt_cache_key: None,
                     prompt_id: None,

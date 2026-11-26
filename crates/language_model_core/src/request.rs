@@ -468,6 +468,8 @@ pub enum CompletionIntent {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_streaming: bool,
     pub thread_id: Option<String>,
     /// Provider cache affinity, independent of conversation and transport session identity.
     ///

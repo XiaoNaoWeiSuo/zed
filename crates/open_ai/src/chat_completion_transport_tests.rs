@@ -316,3 +316,63 @@ fn non_streaming_transport_supports_custom_envelopes_and_provider_errors() {
         error => panic!("unexpected transport error: {error}"),
     }
 }
+
+#[test]
+fn buffered_worker_sends_stream_false_and_preserves_complete_tool_arguments() {
+    let client = FakeHttpClient::create(|mut request| async move {
+        let mut body = String::new();
+        request.body_mut().read_to_string(&mut body).await?;
+        let body: Value = serde_json::from_str(&body)?;
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+        Ok(Response::builder().status(200).body(AsyncBody::from(
+            json!({
+                "id":"buffered-response",
+                "model":"gpt-6.2-sol",
+                "choices":[{"index":0,"finish_reason":"tool_calls","message":{
+                    "role":"assistant","content":null,"tool_calls":[{"id":"ready","type":"function",
+                    "function":{"name":"submit_findings","arguments":"{\"findings\":[]}"}}]
+                }}],
+                "usage":{"prompt_tokens":12,"completion_tokens":6,"total_tokens":18}
+            })
+            .to_string(),
+        ))?)
+    });
+    block_on(async {
+        let wire = completion::into_open_ai(
+            language_model_core::LanguageModelRequest {
+                non_streaming: true,
+                ..Default::default()
+            },
+            "gpt-6.2-sol",
+            true,
+            true,
+            Some(1024),
+            completion::ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+            None,
+            false,
+        )
+        .expect("worker wire");
+        let events = stream_completion(
+            client.as_ref(),
+            "test",
+            "https://example.invalid/v1",
+            "test",
+            wire,
+            &CustomHeaders::default(),
+        )
+        .await
+        .expect("buffered result");
+        let events = language_model_core::chat_completion::ChatCompletionEventMapper::new()
+            .map_stream(events)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("mapped response");
+        assert!(events.iter().any(|event| match event {
+            language_model_core::LanguageModelCompletionEvent::ToolUse(call) => {
+                call.is_input_complete && call.raw_input == r#"{"findings":[]}"#
+            }
+            _ => false,
+        }));
+    });
+}

@@ -1,4 +1,5 @@
 mod db;
+pub mod infinity;
 mod legacy_thread;
 mod native_agent_server;
 pub mod outline;

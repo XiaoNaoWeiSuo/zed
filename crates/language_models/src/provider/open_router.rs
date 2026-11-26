@@ -372,6 +372,10 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
 }
 
 impl LanguageModelClient for OpenRouterLanguageModelProvider {
+    fn supports_non_streaming_completion(&self, _: &LanguageModel, _: &App) -> bool {
+        true
+    }
+
     fn stream_completion(
         &self,
         model: &LanguageModel,
@@ -607,7 +611,7 @@ pub fn into_open_router(
     Ok(open_router::Request {
         model: model.id().into(),
         messages,
-        stream: true,
+        stream: !request.non_streaming,
         session_id,
         stop: request.stop,
         temperature: request.temperature.unwrap_or(0.4),
@@ -850,6 +854,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,
@@ -1093,6 +1098,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,
@@ -1161,6 +1167,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,

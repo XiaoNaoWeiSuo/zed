@@ -89,6 +89,9 @@ impl LanguageModelProvider for FakeLanguageModelProvider {
 }
 
 impl LanguageModelClient for FakeLanguageModelProvider {
+    fn supports_non_streaming_completion(&self, _: &LanguageModel, _: &App) -> bool {
+        true
+    }
     fn stream_completion(
         &self,
         model: &LanguageModel,

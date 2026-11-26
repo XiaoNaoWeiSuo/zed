@@ -559,10 +559,13 @@ impl AnthropicEventMapper {
                 ResponseContent::Text { text } => {
                     vec![Ok(LanguageModelCompletionEvent::Text(text))]
                 }
-                ResponseContent::Thinking { thinking } => {
+                ResponseContent::Thinking {
+                    thinking,
+                    signature,
+                } => {
                     vec![Ok(LanguageModelCompletionEvent::Thinking {
                         text: thinking,
-                        signature: None,
+                        signature,
                     })]
                 }
                 ResponseContent::RedactedThinking { data } => {
@@ -895,6 +898,7 @@ mod tests {
     #[test]
     fn test_caching_uses_top_level_auto_and_long_lived_prefix() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 LanguageModelRequestMessage {
                     role: Role::System,
@@ -1010,6 +1014,7 @@ mod tests {
     #[test]
     fn test_legacy_caching_marks_last_message_content_block() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 LanguageModelRequestMessage {
                     role: Role::System,
@@ -1092,6 +1097,7 @@ mod tests {
     #[test]
     fn test_xhigh_effort_is_serialized_for_adaptive_thinking() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hi".to_string())],
@@ -1146,6 +1152,7 @@ mod tests {
             ("claude-opus-5", false),
         ] {
             let request = LanguageModelRequest {
+                non_streaming: false,
                 messages: vec![LanguageModelRequestMessage {
                     role: Role::User,
                     content: vec![MessageContent::Text("Hi".to_string())],
@@ -1218,6 +1225,7 @@ mod tests {
             ("claude-fable-5", false),
         ] {
             let request = LanguageModelRequest {
+                non_streaming: false,
                 messages: vec![LanguageModelRequestMessage {
                     role: Role::User,
                     content: vec![MessageContent::Text("Hi".to_string())],
@@ -1281,6 +1289,7 @@ mod tests {
         // Claude Sonnet 5.5 thinks by default but rejects `disabled`, so
         // suppressing thinking must send its lowest setting instead.
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hi".to_string())],
@@ -1332,6 +1341,7 @@ mod tests {
     #[test]
     fn test_no_cache_control_when_caching_disabled() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 LanguageModelRequestMessage {
                     role: Role::System,
@@ -1391,6 +1401,7 @@ mod tests {
 
     fn request_with_assistant_content(assistant_content: Vec<MessageContent>) -> crate::Request {
         let mut request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hello".to_string())],

@@ -239,6 +239,7 @@ impl AnthropicLanguageModelProvider {
         config: &anthropic::Model,
         request: anthropic::Request,
         cx: &AsyncApp,
+        non_streaming: bool,
     ) -> BoxFuture<
         'static,
         Result<
@@ -264,6 +265,18 @@ impl AnthropicLanguageModelProvider {
                     provider: PROVIDER_NAME,
                 });
             };
+            if non_streaming {
+                let response = anthropic::non_streaming_completion(
+                    http_client.as_ref(),
+                    &api_url,
+                    &api_key,
+                    request,
+                    beta_headers,
+                    &extra_headers,
+                )
+                .await?;
+                return Ok(anthropic::buffered_events(response));
+            }
             let request = anthropic::stream_completion(
                 http_client.as_ref(),
                 &api_url,
@@ -387,6 +400,10 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
 }
 
 impl LanguageModelClient for AnthropicLanguageModelProvider {
+    fn supports_non_streaming_completion(&self, _: &LanguageModel, _: &App) -> bool {
+        true
+    }
+
     fn stream_completion(
         &self,
         model: &LanguageModel,
@@ -399,6 +416,7 @@ impl LanguageModelClient for AnthropicLanguageModelProvider {
             Err(error) => return async move { Err(error) }.boxed(),
         };
         let request_limiter = self.request_limiters.for_model(&model.id);
+        let non_streaming = request.non_streaming;
         let has_tools = !request.tools.is_empty();
         let request_id = config.request_id(has_tools).to_string();
         let mut request = match into_anthropic(
@@ -416,7 +434,7 @@ impl LanguageModelClient for AnthropicLanguageModelProvider {
         if !config.supports_speed {
             request.speed = None;
         }
-        let request = self.stream_anthropic_request(&config, request, cx);
+        let request = self.stream_anthropic_request(&config, request, cx, non_streaming);
         let executor = cx.background_executor().clone();
         let future = request_limiter.stream(async move {
             let response = request.await?;
@@ -515,7 +533,7 @@ impl LanguageModelClient for AnthropicLanguageModelProvider {
         if !config.supports_speed {
             request.speed = None;
         }
-        let request = self.stream_anthropic_request(&config, request, cx);
+        let request = self.stream_anthropic_request(&config, request, cx, false);
         let executor = cx.background_executor().clone();
         let future = request_limiter.run(async move {
             let response = request.await?;

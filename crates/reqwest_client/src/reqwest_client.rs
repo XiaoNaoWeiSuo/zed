@@ -63,6 +63,19 @@ impl ReqwestClient {
         Ok(client.into())
     }
 
+    /// Uses a caller-owned proxy as the only route, including when NO_PROXY is set.
+    pub fn strict_proxy(proxy: Url) -> anyhow::Result<Self> {
+        let client = Self::builder(Some(Duration::from_secs(15)))
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(proxy.clone())?)
+            .redirect_policy(redirect::Policy::none())
+            .use_preconfigured_tls(http_client_tls::tls_config())
+            .build()?;
+        let mut client = Self::from(client);
+        client.proxy = Some(proxy);
+        Ok(client)
+    }
+
     pub fn proxy_and_user_agent(proxy: Option<Url>, user_agent: &str) -> anyhow::Result<Self> {
         Self::proxy_user_agent_and_read_timeout(proxy, user_agent, None)
     }

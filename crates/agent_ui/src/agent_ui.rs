@@ -16,6 +16,7 @@ pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
 mod favorite_models;
+mod infinity_view;
 mod inline_assistant;
 mod inline_prompt_editor;
 mod language_model_selector;
@@ -302,6 +303,20 @@ actions!(
     [
         /// Toggles the menu to create new agent threads.
         ToggleNewThreadMenu,
+        /// Opens the Infinity harness.
+        NewInfinity,
+        /// Sends the Infinity composer.
+        InfinitySend,
+        /// Stops the current Infinity turn.
+        InfinityStop,
+        /// Opens Infinity conversation.
+        InfinityConversation,
+        /// Opens Infinity jobs.
+        InfinityJobs,
+        /// Opens Infinity context.
+        InfinityContext,
+        /// Toggles the main request tool-traffic filter.
+        InfinityToggleToolTraffic,
         /// Toggles the options menu for agent settings and preferences.
         ToggleOptionsMenu,
         /// Toggles the profile or mode selector for switching between agent profiles.

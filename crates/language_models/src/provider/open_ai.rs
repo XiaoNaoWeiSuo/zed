@@ -380,6 +380,10 @@ impl LanguageModelProvider for OpenAiLanguageModelProvider {
 }
 
 impl LanguageModelClient for OpenAiLanguageModelProvider {
+    fn supports_non_streaming_completion(&self, _: &LanguageModel, _: &App) -> bool {
+        true
+    }
+
     fn stream_completion(
         &self,
         model: &LanguageModel,

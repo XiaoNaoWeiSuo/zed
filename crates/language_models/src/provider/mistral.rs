@@ -841,6 +841,7 @@ mod tests {
     #[test]
     fn test_into_mistral_basic_conversion() {
         let request = |max_output_tokens| LanguageModelRequest {
+            non_streaming: false,
             messages: vec![
                 LanguageModelRequestMessage {
                     role: Role::System,
@@ -905,6 +906,7 @@ mod tests {
     #[test]
     fn test_into_mistral_reasoning_effort() {
         let request = |thinking_allowed| LanguageModelRequest {
+            non_streaming: false,
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hello".into())],
@@ -977,6 +979,7 @@ mod tests {
     #[test]
     fn test_into_mistral_with_image() {
         let request = LanguageModelRequest {
+            non_streaming: false,
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![
